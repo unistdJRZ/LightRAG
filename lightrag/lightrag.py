@@ -1787,7 +1787,7 @@ class LightRAG:
                     first_stage_tasks = []
                     entity_relation_task = None
 
-                    async with semaphore:
+                    async with semaphore:# 用信号量限制该函数并发数
                         nonlocal processed_count
                         # Initialize to prevent UnboundLocalError in error handling
                         first_stage_tasks = []
