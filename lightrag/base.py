@@ -15,6 +15,7 @@ from typing import (
     Dict,
     List,
     AsyncIterator,
+    NotRequired,
 )
 from .utils import EmbeddingFunc
 from .types import KnowledgeGraph
@@ -76,6 +77,15 @@ class TextChunkSchema(TypedDict):
     content: str
     full_doc_id: str
     chunk_order_index: int
+    file_path: NotRequired[str]
+    page_id: NotRequired[int]
+    bbox: NotRequired[list[float]]
+    page_size: NotRequired[list[float]]
+    content_type: NotRequired[str]
+    ocr_chunk_id: NotRequired[str | int]
+    segment_order_index: NotRequired[int]
+    llm_cache_list: NotRequired[list[str]]
+    translated_cn: NotRequired[str]
 
 
 T = TypeVar("T")
@@ -863,13 +873,13 @@ class QueryResult:
     is_streaming: bool = False
 
     @property
-    def reference_list(self) -> List[Dict[str, str]]:
+    def reference_list(self) -> List[Dict[str, Any]]:
         """
         Convenient property to extract reference list from raw_data.
 
         Returns:
-            List[Dict[str, str]]: Reference list in format:
-            [{"reference_id": "1", "file_path": "/path/to/file.pdf"}, ...]
+            List[Dict[str, Any]]: Reference list in format:
+            [{"reference_id": "1", "file_path": "/path/to/file.pdf", "file_id": "optional-id"}, ...]
         """
         if self.raw_data:
             return self.raw_data.get("data", {}).get("references", [])
@@ -902,6 +912,6 @@ class QueryContextResult:
     raw_data: Dict[str, Any]
 
     @property
-    def reference_list(self) -> List[Dict[str, str]]:
+    def reference_list(self) -> List[Dict[str, Any]]:
         """Convenient property to extract reference list from raw_data."""
         return self.raw_data.get("data", {}).get("references", [])

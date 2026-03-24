@@ -3,17 +3,27 @@ This module contains all query-related routes for the LightRAG API.
 """
 
 import json
-from typing import Any, Dict, List, Literal, Optional
+from contextvars import ContextVar
+from typing import Any, Dict, List, Literal, Mapping, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from lightrag.base import QueryParam
-from lightrag.api.utils_api import get_combined_auth_dependency
-from lightrag.utils import logger
+from lightrag.api.utils_api import (
+    get_combined_auth_dependency,
+    WorkspaceObjectProxy,
+    create_workspace_scope_dependency,
+)
+from lightrag.utils import get_content_summary, logger
 from pydantic import BaseModel, Field, field_validator
 
 router = APIRouter(tags=["query"])
 
 
 class QueryRequest(BaseModel):
+    workspace: Optional[str] = Field(
+        default=None,
+        description="Target workspace for this request. If omitted, falls back to query/header/default routing.",
+    )
+
     query: str = Field(
         min_length=3,
         description="The query text",
@@ -100,11 +110,6 @@ class QueryRequest(BaseModel):
         description="If True, includes reference list in responses. Affects /query and /query/stream endpoints. /query/data always includes references.",
     )
 
-    include_chunk_content: Optional[bool] = Field(
-        default=False,
-        description="If True, includes actual chunk text content in references. Only applies when include_references=True. Useful for evaluation and debugging.",
-    )
-
     stream: Optional[bool] = Field(
         default=True,
         description="If True, enables streaming output for real-time responses. Only affects /query/stream endpoint.",
@@ -133,9 +138,7 @@ class QueryRequest(BaseModel):
         """Converts a QueryRequest instance into a QueryParam instance."""
         # Use Pydantic's `.model_dump(exclude_none=True)` to remove None values automatically
         # Exclude API-level parameters that don't belong in QueryParam
-        request_data = self.model_dump(
-            exclude_none=True, exclude={"query", "include_chunk_content"}
-        )
+        request_data = self.model_dump(exclude_none=True, exclude={"query", "workspace"})
 
         # Ensure `mode` and `stream` are set explicitly
         param = QueryParam(**request_data)
@@ -147,11 +150,19 @@ class ReferenceItem(BaseModel):
     """A single reference item in query responses."""
 
     reference_id: str = Field(description="Unique reference identifier")
+    chunk_id: str = Field(description="Referenced chunk identifier")
     file_path: str = Field(description="Path to the source file")
-    content: Optional[List[str]] = Field(
-        default=None,
-        description="List of chunk contents from this file (only present when include_chunk_content=True)",
+    file_id: Optional[str] = Field(
+        default=None, description="File ID from document metadata when available"
     )
+    page_id: Optional[int] = Field(
+        default=None, description="Page index of the referenced chunk when available"
+    )
+    bbox: Optional[List[float]] = Field(
+        default=None,
+        description="Bounding box of the referenced chunk when available",
+    )
+    content: str = Field(description="Preview text of the referenced chunk")
 
 
 class QueryResponse(BaseModel):
@@ -178,7 +189,7 @@ class QueryDataResponse(BaseModel):
 class StreamChunkResponse(BaseModel):
     """Response model for streaming chunks in NDJSON format"""
 
-    references: Optional[List[Dict[str, str]]] = Field(
+    references: Optional[List[Dict[str, Any]]] = Field(
         default=None,
         description="Reference list (only in first chunk when include_references=True)",
     )
@@ -190,8 +201,136 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
+def _enrich_references_with_chunk_preview(
+    references: List[Dict[str, Any]], chunks: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Attach chunk preview text to references using reference_id mapping."""
+    if not references:
+        return references
+
+    ref_id_to_preview: Dict[str, str] = {}
+    for chunk in chunks:
+        ref_id = str(chunk.get("reference_id", "")).strip()
+        content = chunk.get("content", "")
+        if ref_id and content and ref_id not in ref_id_to_preview:
+            ref_id_to_preview[ref_id] = get_content_summary(str(content))
+
+    enriched_references: List[Dict[str, Any]] = []
+    for ref in references:
+        ref_copy = ref.copy()
+        ref_id = str(ref.get("reference_id", "")).strip()
+        ref_copy["content"] = ref_id_to_preview.get(ref_id, "")
+        enriched_references.append(ref_copy)
+
+    return enriched_references
+
+
+def _normalize_chunk_level_references(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Normalize references to chunk-level shape for API responses."""
+    references = data.get("references", []) or []
+    chunks = data.get("chunks", []) or []
+
+    chunk_metadata_by_chunk_id: Dict[str, Dict[str, Any]] = {}
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        chunk_id = str(chunk.get("chunk_id", "")).strip()
+        if not chunk_id:
+            continue
+        chunk_metadata_by_chunk_id[chunk_id] = {
+            "page_id": chunk.get("page_id"),
+            "bbox": chunk.get("bbox"),
+        }
+
+    if references and all(
+        isinstance(ref, dict) and str(ref.get("chunk_id", "")).strip()
+        for ref in references
+    ):
+        normalized_references: List[Dict[str, Any]] = []
+        for ref in references:
+            ref_copy = ref.copy()
+            chunk_meta = chunk_metadata_by_chunk_id.get(
+                str(ref_copy.get("chunk_id", "")).strip()
+            )
+            if chunk_meta:
+                if ref_copy.get("page_id") is None and chunk_meta.get("page_id") is not None:
+                    ref_copy["page_id"] = chunk_meta["page_id"]
+                if ref_copy.get("bbox") is None and chunk_meta.get("bbox") is not None:
+                    ref_copy["bbox"] = chunk_meta["bbox"]
+            normalized_references.append(ref_copy)
+        return normalized_references
+
+    file_id_by_reference_id: Dict[str, Any] = {}
+    for ref in references:
+        if isinstance(ref, dict):
+            ref_id = str(ref.get("reference_id", "")).strip()
+            if ref_id:
+                file_id_by_reference_id[ref_id] = ref.get("file_id")
+
+    normalized: List[Dict[str, Any]] = []
+    seen_reference_ids: set[str] = set()
+    for chunk in chunks:
+        ref_id = str(chunk.get("reference_id", "")).strip()
+        chunk_id = str(chunk.get("chunk_id", "")).strip()
+        if not ref_id or not chunk_id or ref_id in seen_reference_ids:
+            continue
+
+        normalized.append(
+            {
+                "reference_id": ref_id,
+                "chunk_id": chunk_id,
+                "file_path": chunk.get("file_path", "unknown_source"),
+                "file_id": file_id_by_reference_id.get(ref_id),
+                "page_id": chunk.get("page_id"),
+                "bbox": chunk.get("bbox"),
+            }
+        )
+        seen_reference_ids.add(ref_id)
+
+    if normalized:
+        return normalized
+
+    # Final fallback for old cached structures with no chunk_id.
+    fallback: List[Dict[str, Any]] = []
+    for ref in references:
+        if not isinstance(ref, dict):
+            continue
+        ref_copy = ref.copy()
+        ref_copy.setdefault("chunk_id", "")
+        fallback.append(ref_copy)
+    return fallback
+
+
+def create_query_routes(
+    rag_by_workspace: dict[str, Any],
+    api_key: Optional[str] = None,
+    top_k: int = 60,
+    workspace: str = "",
+    workspace_aliases: Mapping[str, str] | None = None,
+):
+    if not rag_by_workspace:
+        raise ValueError("rag_by_workspace cannot be empty")
+
+    default_workspace = workspace.strip() or next(iter(rag_by_workspace.keys()))
+    if default_workspace not in rag_by_workspace:
+        raise ValueError(
+            f"Default workspace '{default_workspace}' not found in rag_by_workspace"
+        )
+
+    workspace_context: ContextVar[str] = ContextVar(
+        "query_workspace", default=default_workspace
+    )
+    rag = WorkspaceObjectProxy(
+        rag_by_workspace, default_workspace=default_workspace, workspace_context=workspace_context
+    )
+    workspace_scope = create_workspace_scope_dependency(
+        rag_by_workspace,
+        workspace_context=workspace_context,
+        default_workspace=default_workspace,
+        workspace_aliases=workspace_aliases,
+    )
     combined_auth = get_combined_auth_dependency(api_key)
+    router = APIRouter(tags=["query"], dependencies=[Depends(workspace_scope)])
 
     @router.post(
         "/query",
@@ -215,11 +354,17 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                         "type": "object",
                                         "properties": {
                                             "reference_id": {"type": "string"},
+                                            "chunk_id": {"type": "string"},
                                             "file_path": {"type": "string"},
-                                            "content": {
+                                            "file_id": {"type": "string"},
+                                            "page_id": {"type": "integer"},
+                                            "bbox": {
                                                 "type": "array",
-                                                "items": {"type": "string"},
-                                                "description": "List of chunk contents from this file (only included when include_chunk_content=True)",
+                                                "items": {"type": "number"},
+                                            },
+                                            "content": {
+                                                "type": "string",
+                                                "description": "Preview text from the referenced chunk",
                                             },
                                         },
                                     },
@@ -237,35 +382,44 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                     "references": [
                                         {
                                             "reference_id": "1",
+                                            "chunk_id": "chunk-1",
                                             "file_path": "/documents/ai_overview.pdf",
+                                            "page_id": 0,
+                                            "bbox": [10.0, 20.0, 120.0, 60.0],
+                                            "content": "Artificial Intelligence (AI) represents a transformative field in computer science focused on creating systems that can perform tasks requiring human-like intelligence....",
                                         },
                                         {
                                             "reference_id": "2",
+                                            "chunk_id": "chunk-2",
                                             "file_path": "/documents/machine_learning.txt",
+                                            "page_id": 1,
+                                            "bbox": [15.0, 80.0, 150.0, 120.0],
+                                            "content": "Machine learning is a subset of AI that enables computers to learn and improve from experience without being explicitly programmed....",
                                         },
                                     ],
                                 },
                             },
-                            "with_chunk_content": {
-                                "summary": "Response with chunk content",
-                                "description": "Example response when include_references=True and include_chunk_content=True. Note: content is an array of chunks from the same file.",
+                            "with_reference_previews": {
+                                "summary": "Response with reference previews",
+                                "description": "Example response when include_references=True. Each reference always includes a preview string from the retrieved chunk.",
                                 "value": {
                                     "response": "Artificial Intelligence (AI) is a branch of computer science that aims to create intelligent machines capable of performing tasks that typically require human intelligence, such as learning, reasoning, and problem-solving.",
                                     "references": [
                                         {
                                             "reference_id": "1",
+                                            "chunk_id": "chunk-1",
                                             "file_path": "/documents/ai_overview.pdf",
-                                            "content": [
-                                                "Artificial Intelligence (AI) represents a transformative field in computer science focused on creating systems that can perform tasks requiring human-like intelligence. These tasks include learning from experience, understanding natural language, recognizing patterns, and making decisions.",
-                                                "AI systems can be categorized into narrow AI, which is designed for specific tasks, and general AI, which aims to match human cognitive abilities across a wide range of domains.",
-                                            ],
+                                            "page_id": 0,
+                                            "bbox": [10.0, 20.0, 120.0, 60.0],
+                                            "content": "Artificial Intelligence (AI) represents a transformative field in computer science focused on creating systems that can perform tasks requiring human-like intelligence. These tasks include learning from experience, understanding natural language, recognizing patterns, and making decisions....",
                                         },
                                         {
                                             "reference_id": "2",
+                                            "chunk_id": "chunk-2",
                                             "file_path": "/documents/machine_learning.txt",
-                                            "content": [
-                                                "Machine learning is a subset of AI that enables computers to learn and improve from experience without being explicitly programmed. It focuses on the development of algorithms that can access data and use it to learn for themselves."
-                                            ],
+                                            "page_id": 1,
+                                            "bbox": [15.0, 80.0, 150.0, 120.0],
+                                            "content": "Machine learning is a subset of AI that enables computers to learn and improve from experience without being explicitly programmed. It focuses on the development of algorithms that can access data and use it to learn for themselves.",
                                         },
                                     ],
                                 },
@@ -414,35 +568,17 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             # Extract LLM response and references from unified result
             llm_response = result.get("llm_response", {})
             data = result.get("data", {})
-            references = data.get("references", [])
+            references = _normalize_chunk_level_references(data)
 
             # Get the non-streaming response content
             response_content = llm_response.get("content", "")
             if not response_content:
                 response_content = "No relevant context found for the query."
 
-            # Enrich references with chunk content if requested
-            if request.include_references and request.include_chunk_content:
-                chunks = data.get("chunks", [])
-                # Create a mapping from reference_id to chunk content
-                ref_id_to_content = {}
-                for chunk in chunks:
-                    ref_id = chunk.get("reference_id", "")
-                    content = chunk.get("content", "")
-                    if ref_id and content:
-                        # Collect chunk content; join later to avoid quadratic string concatenation
-                        ref_id_to_content.setdefault(ref_id, []).append(content)
-
-                # Add content to references
-                enriched_references = []
-                for ref in references:
-                    ref_copy = ref.copy()
-                    ref_id = ref.get("reference_id", "")
-                    if ref_id in ref_id_to_content:
-                        # Keep content as a list of chunks (one file may have multiple chunks)
-                        ref_copy["content"] = ref_id_to_content[ref_id]
-                    enriched_references.append(ref_copy)
-                references = enriched_references
+            if request.include_references:
+                references = _enrich_references_with_chunk_preview(
+                    references, data.get("chunks", [])
+                )
 
             # Return response with or without references based on request
             if request.include_references:
@@ -473,10 +609,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                 "description": "Multiple NDJSON lines when stream=True and include_references=True. First line contains references, subsequent lines contain response chunks.",
                                 "value": '{"references": [{"reference_id": "1", "file_path": "/documents/ai_overview.pdf"}, {"reference_id": "2", "file_path": "/documents/ml_basics.txt"}]}\n{"response": "Artificial Intelligence (AI) is a branch of computer science"}\n{"response": " that aims to create intelligent machines capable of performing"}\n{"response": " tasks that typically require human intelligence, such as learning,"}\n{"response": " reasoning, and problem-solving."}',
                             },
-                            "streaming_with_chunk_content": {
-                                "summary": "Streaming mode with chunk content (stream=true, include_chunk_content=true)",
-                                "description": "Multiple NDJSON lines when stream=True, include_references=True, and include_chunk_content=True. First line contains references with content arrays (one file may have multiple chunks), subsequent lines contain response chunks.",
-                                "value": '{"references": [{"reference_id": "1", "file_path": "/documents/ai_overview.pdf", "content": ["Artificial Intelligence (AI) represents a transformative field...", "AI systems can be categorized into narrow AI and general AI..."]}, {"reference_id": "2", "file_path": "/documents/ml_basics.txt", "content": ["Machine learning is a subset of AI that enables computers to learn..."]}]}\n{"response": "Artificial Intelligence (AI) is a branch of computer science"}\n{"response": " that aims to create intelligent machines capable of performing"}\n{"response": " tasks that typically require human intelligence."}',
+                            "streaming_with_reference_previews": {
+                                "summary": "Streaming mode with reference previews (stream=true)",
+                                "description": "Multiple NDJSON lines when stream=True and include_references=True. The first line contains references with preview text, followed by response chunks.",
+                                "value": "{\"references\": [{\"reference_id\": \"1\", \"file_path\": \"/documents/ai_overview.pdf\", \"content\": \"Artificial Intelligence (AI) represents a transformative field...\"}, {\"reference_id\": \"2\", \"file_path\": \"/documents/ml_basics.txt\", \"content\": \"Machine learning is a subset of AI that enables computers to learn...\"}]}\n{\"response\": \"Artificial Intelligence (AI) is a branch of computer science\"}\n{\"response\": \" that aims to create intelligent machines capable of performing\"}\n{\"response\": \" tasks that typically require human intelligence.\"}",
                             },
                             "streaming_without_references": {
                                 "summary": "Streaming mode without references (stream=true)",
@@ -486,7 +622,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                             "non_streaming_with_references": {
                                 "summary": "Non-streaming mode with references (stream=false)",
                                 "description": "Single NDJSON line when stream=False and include_references=True. Complete response with references in one message.",
-                                "value": '{"references": [{"reference_id": "1", "file_path": "/documents/neural_networks.pdf"}], "response": "Neural networks are computational models inspired by biological neural networks that consist of interconnected nodes (neurons) organized in layers. They are fundamental to deep learning and can learn complex patterns from data through training processes."}',
+                                "value": '{"references": [{"reference_id": "1", "file_path": "/documents/neural_networks.pdf", "content": "Neural networks are computational models inspired by biological neural networks..."}], "response": "Neural networks are computational models inspired by biological neural networks that consist of interconnected nodes (neurons) organized in layers. They are fundamental to deep learning and can learn complex patterns from data through training processes."}',
                             },
                             "non_streaming_without_references": {
                                 "summary": "Non-streaming mode without references (stream=false)",
@@ -496,7 +632,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                             "error_response": {
                                 "summary": "Error during streaming",
                                 "description": "Error handling in NDJSON format when an error occurs during processing.",
-                                "value": '{"references": [{"reference_id": "1", "file_path": "/documents/ai.pdf"}]}\n{"response": "Artificial Intelligence is"}\n{"error": "LLM service temporarily unavailable"}',
+                                "value": '{"references": [{"reference_id": "1", "file_path": "/documents/ai.pdf", "content": "Artificial Intelligence is a field of computer science..."}]}\n{"response": "Artificial Intelligence is"}\n{"error": "LLM service temporarily unavailable"}',
                             },
                         },
                     }
@@ -671,32 +807,14 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             async def stream_generator():
                 # Extract references and LLM response from unified result
-                references = result.get("data", {}).get("references", [])
+                data = result.get("data", {})
+                references = _normalize_chunk_level_references(data)
                 llm_response = result.get("llm_response", {})
 
-                # Enrich references with chunk content if requested
-                if request.include_references and request.include_chunk_content:
-                    data = result.get("data", {})
-                    chunks = data.get("chunks", [])
-                    # Create a mapping from reference_id to chunk content
-                    ref_id_to_content = {}
-                    for chunk in chunks:
-                        ref_id = chunk.get("reference_id", "")
-                        content = chunk.get("content", "")
-                        if ref_id and content:
-                            # Collect chunk content
-                            ref_id_to_content.setdefault(ref_id, []).append(content)
-
-                    # Add content to references
-                    enriched_references = []
-                    for ref in references:
-                        ref_copy = ref.copy()
-                        ref_id = ref.get("reference_id", "")
-                        if ref_id in ref_id_to_content:
-                            # Keep content as a list of chunks (one file may have multiple chunks)
-                            ref_copy["content"] = ref_id_to_content[ref_id]
-                        enriched_references.append(ref_copy)
-                    references = enriched_references
+                if request.include_references:
+                    references = _enrich_references_with_chunk_preview(
+                        references, data.get("chunks", [])
+                    )
 
                 if llm_response.get("is_streaming"):
                     # Streaming mode: send references first, then stream response chunks

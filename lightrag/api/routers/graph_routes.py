@@ -2,18 +2,27 @@
 This module contains all graph-related routes for the LightRAG API.
 """
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Mapping
+from contextvars import ContextVar
 import traceback
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field
 
 from lightrag.utils import logger
-from ..utils_api import get_combined_auth_dependency
+from ..utils_api import (
+    get_combined_auth_dependency,
+    WorkspaceObjectProxy,
+    create_workspace_scope_dependency,
+)
 
 router = APIRouter(tags=["graph"])
 
 
 class EntityUpdateRequest(BaseModel):
+    workspace: Optional[str] = Field(
+        default=None,
+        description="Target workspace for this request.",
+    )
     entity_name: str
     updated_data: Dict[str, Any]
     allow_rename: bool = False
@@ -21,12 +30,20 @@ class EntityUpdateRequest(BaseModel):
 
 
 class RelationUpdateRequest(BaseModel):
+    workspace: Optional[str] = Field(
+        default=None,
+        description="Target workspace for this request.",
+    )
     source_id: str
     target_id: str
     updated_data: Dict[str, Any]
 
 
 class EntityMergeRequest(BaseModel):
+    workspace: Optional[str] = Field(
+        default=None,
+        description="Target workspace for this request.",
+    )
     entities_to_change: list[str] = Field(
         ...,
         description="List of entity names to be merged and deleted. These are typically duplicate or misspelled entities.",
@@ -42,6 +59,10 @@ class EntityMergeRequest(BaseModel):
 
 
 class EntityCreateRequest(BaseModel):
+    workspace: Optional[str] = Field(
+        default=None,
+        description="Target workspace for this request.",
+    )
     entity_name: str = Field(
         ...,
         description="Unique name for the new entity",
@@ -61,6 +82,10 @@ class EntityCreateRequest(BaseModel):
 
 
 class RelationCreateRequest(BaseModel):
+    workspace: Optional[str] = Field(
+        default=None,
+        description="Target workspace for this request.",
+    )
     source_entity: str = Field(
         ...,
         description="Name of the source entity. This entity must already exist in the knowledge graph.",
@@ -86,8 +111,35 @@ class RelationCreateRequest(BaseModel):
     )
 
 
-def create_graph_routes(rag, api_key: Optional[str] = None):
+def create_graph_routes(
+    rag_by_workspace: dict[str, Any],
+    api_key: Optional[str] = None,
+    workspace: str = "",
+    workspace_aliases: Mapping[str, str] | None = None,
+):
+    if not rag_by_workspace:
+        raise ValueError("rag_by_workspace cannot be empty")
+
+    default_workspace = workspace.strip() or next(iter(rag_by_workspace.keys()))
+    if default_workspace not in rag_by_workspace:
+        raise ValueError(
+            f"Default workspace '{default_workspace}' not found in rag_by_workspace"
+        )
+
+    workspace_context: ContextVar[str] = ContextVar(
+        "graph_workspace", default=default_workspace
+    )
+    rag = WorkspaceObjectProxy(
+        rag_by_workspace, default_workspace=default_workspace, workspace_context=workspace_context
+    )
+    workspace_scope = create_workspace_scope_dependency(
+        rag_by_workspace,
+        workspace_context=workspace_context,
+        default_workspace=default_workspace,
+        workspace_aliases=workspace_aliases,
+    )
     combined_auth = get_combined_auth_dependency(api_key)
+    router = APIRouter(tags=["graph"], dependencies=[Depends(workspace_scope)])
 
     @router.get("/graph/label/list", dependencies=[Depends(combined_auth)])
     async def get_graph_labels():

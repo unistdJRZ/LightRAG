@@ -22,6 +22,7 @@ function App() {
   const message = useBackendState.use.message()
   const enableHealthCheck = useSettingsStore.use.enableHealthCheck()
   const currentTab = useSettingsStore.use.currentTab()
+  const workspace = useSettingsStore.use.workspace()
   const [apiKeyAlertOpen, setApiKeyAlertOpen] = useState(false)
   const [initializing, setInitializing] = useState(true) // Add initializing state
   const versionCheckRef = useRef(false); // Prevent duplicate calls in Vite dev mode
@@ -203,7 +204,7 @@ function App() {
               onValueChange={handleTabChange}
             >
               <SiteHeader />
-              <div className="relative grow">
+              <div className="relative grow" key={`workspace-${workspace ?? 'default'}`}>
                 <TabsContent value="documents" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
                   <DocumentManager />
                 </TabsContent>

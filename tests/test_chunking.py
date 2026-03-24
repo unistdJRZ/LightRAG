@@ -1,6 +1,9 @@
+import asyncio
+
 import pytest
 
 from lightrag.exceptions import ChunkTokenLimitExceededError
+from lightrag.lightrag import LightRAG, _normalize_enqueue_document
 from lightrag.operate import chunking_by_token_size
 from lightrag.utils import Tokenizer, TokenizerInterface
 
@@ -1064,3 +1067,128 @@ def test_decode_preserves_content():
         tokens = tokenizer.encode(original)
         decoded = tokenizer.decode(tokens)
         assert decoded == original, f"Failed to decode: {original}"
+
+
+@pytest.mark.offline
+def test_structured_segments_do_not_cross_chunk_boundaries():
+    tokenizer = make_tokenizer()
+
+    chunks = chunking_by_token_size(
+        tokenizer,
+        [
+            {"content": "alpha beta", "page_id": 0, "bbox": [0, 0, 10, 10]},
+            {"content": "gamma delta", "page_id": 1, "bbox": [10, 10, 20, 20]},
+        ],
+        chunk_token_size=6,
+        chunk_overlap_token_size=0,
+    )
+
+    assert [chunk["content"] for chunk in chunks] == [
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+    ]
+    assert [chunk["page_id"] for chunk in chunks] == [0, 0, 1, 1]
+    assert chunks[0]["bbox"] == [0, 0, 10, 10]
+    assert chunks[2]["bbox"] == [10, 10, 20, 20]
+    assert [chunk["chunk_order_index"] for chunk in chunks] == [0, 1, 2, 3]
+
+
+@pytest.mark.offline
+def test_structured_segments_preserve_split_by_character_per_segment():
+    tokenizer = make_tokenizer()
+
+    chunks = chunking_by_token_size(
+        tokenizer,
+        [
+            {"content": "a\n\nb", "page_id": 2},
+            {"content": "c\n\nd", "page_id": 3},
+        ],
+        split_by_character="\n\n",
+        split_by_character_only=True,
+        chunk_token_size=2,
+    )
+
+    assert [chunk["content"] for chunk in chunks] == ["a", "b", "c", "d"]
+    assert [chunk["page_id"] for chunk in chunks] == [2, 2, 3, 3]
+    assert [chunk["chunk_order_index"] for chunk in chunks] == [0, 1, 2, 3]
+
+
+@pytest.mark.offline
+def test_normalize_enqueue_document_accepts_full_content_with_segments():
+    normalized = _normalize_enqueue_document(
+        {
+            "content": "# Title\n\nBody text",
+            "content_segments": [
+                {
+                    "content": "body text",
+                    "page_id": 1,
+                    "bbox": [1, 2, 3, 4],
+                    "page_size": [612, 792],
+                    "content_type": "text",
+                    "chunk_id": 10,
+                }
+            ],
+        }
+    )
+
+    assert normalized == {
+        "content": "# Title\n\nBody text",
+        "content_segments": [
+            {
+                "content": "body text",
+                "page_id": 1,
+                "bbox": [1.0, 2.0, 3.0, 4.0],
+                "page_size": [612.0, 792.0],
+                "content_type": "text",
+                "ocr_chunk_id": 10,
+            }
+        ],
+    }
+
+
+@pytest.mark.offline
+def test_chunk_document_content_keeps_image_segment_as_single_chunk():
+    rag = LightRAG.__new__(LightRAG)
+    rag.tokenizer = make_tokenizer()
+    rag.chunking_func = chunking_by_token_size
+    rag.chunk_overlap_token_size = 0
+    rag.chunk_token_size = 6
+
+    chunks = asyncio.run(
+        rag._chunk_document_content(
+            "",
+            [
+                {
+                    "content": "alpha beta",
+                    "page_id": 1,
+                    "bbox": [0, 0, 10, 10],
+                    "content_type": "text",
+                },
+                {
+                    "content": "YmFzZTY0LWltYWdl",
+                    "page_id": 2,
+                    "bbox": [10, 10, 20, 20],
+                    "page_size": [612, 792],
+                    "content_type": "image",
+                    "ocr_chunk_id": 99,
+                },
+            ],
+            None,
+            False,
+        )
+    )
+
+    assert [chunk["content"] for chunk in chunks] == [
+        "alpha",
+        "beta",
+        "YmFzZTY0LWltYWdl",
+    ]
+    assert [chunk["chunk_order_index"] for chunk in chunks] == [0, 1, 2]
+    assert chunks[2]["content_type"] == "image"
+    assert chunks[2]["tokens"] == 0
+    assert chunks[2]["page_id"] == 2
+    assert chunks[2]["bbox"] == [10, 10, 20, 20]
+    assert chunks[2]["page_size"] == [612, 792]
+    assert chunks[2]["ocr_chunk_id"] == 99

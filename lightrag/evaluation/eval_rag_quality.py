@@ -311,7 +311,6 @@ class RAGEvaluator:
                 "query": question,
                 "mode": "mix",
                 "include_references": True,
-                "include_chunk_content": True,  # NEW: Request chunk content in references
                 "response_type": "Multiple Paragraphs",
                 "top_k": int(os.getenv("EVAL_QUERY_TOP_K", "10")),
             }
@@ -324,7 +323,7 @@ class RAGEvaluator:
             if api_key:
                 headers["X-API-Key"] = api_key
 
-            # Single optimized API call - gets both answer AND chunk content
+            # Single optimized API call - gets both answer and reference previews
             response = await client.post(
                 f"{self.rag_api_url}/query",
                 json=payload,

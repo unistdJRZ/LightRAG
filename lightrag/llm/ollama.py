@@ -1,6 +1,8 @@
 from collections.abc import AsyncIterator
 import os
 import re
+import hashlib
+from urllib.parse import urlparse
 
 import pipmaster as pm
 
@@ -51,6 +53,61 @@ def _coerce_host_for_cloud_model(host: Optional[str], model: object) -> Optional
     return host
 
 
+def _resolve_trust_env_for_ollama(
+    host: Optional[str], explicit_value: object = None
+) -> bool:
+    """Resolve whether Ollama HTTP client should trust proxy env vars.
+
+    Priority:
+    1. explicit `trust_env` value from kwargs
+    2. `OLLAMA_TRUST_ENV` environment variable
+    3. automatic default:
+       - False for localhost/127.0.0.1/::1 (prefer direct local connection)
+       - True otherwise
+    """
+    if explicit_value is not None:
+        return bool(explicit_value)
+
+    env_value = os.getenv("OLLAMA_TRUST_ENV")
+    if env_value is not None:
+        return env_value.strip().lower() in {"1", "true", "yes", "on"}
+
+    normalized_host = host or ""
+    try:
+        parsed = urlparse(
+            normalized_host
+            if "://" in normalized_host
+            else f"http://{normalized_host}"
+        )
+        hostname = (parsed.hostname or "").lower()
+    except Exception:
+        hostname = normalized_host.lower()
+
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    return hostname not in local_hosts and not hostname.startswith("127.")
+
+
+def _summarize_texts_for_error(
+    texts: list[str], max_items: int = 3, preview_chars: int = 160
+) -> list[dict[str, object]]:
+    """Build compact diagnostics for embedding input texts."""
+    summaries: list[dict[str, object]] = []
+    for idx, text in enumerate(texts[:max_items]):
+        preview = (text or "").replace("\n", "\\n")
+        if len(preview) > preview_chars:
+            preview = preview[:preview_chars] + "...(truncated)"
+        text_hash = hashlib.sha1((text or "").encode("utf-8", errors="ignore")).hexdigest()  # noqa: S324
+        summaries.append(
+            {
+                "index": idx,
+                "char_len": len(text or ""),
+                "sha1": text_hash,
+                "preview": preview,
+            }
+        )
+    return summaries
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -74,6 +131,9 @@ async def _ollama_model_if_cache(
     # kwargs.pop("response_format", None) # allow json
     host = kwargs.pop("host", None)
     timeout = kwargs.pop("timeout", None)
+    trust_env = _resolve_trust_env_for_ollama(
+        host, explicit_value=kwargs.pop("trust_env", None)
+    )
     if timeout == 0:
         timeout = None
     kwargs.pop("hashing_kv", None)
@@ -90,7 +150,9 @@ async def _ollama_model_if_cache(
 
     host = _coerce_host_for_cloud_model(host, model)
 
-    ollama_client = ollama.AsyncClient(host=host, timeout=timeout, headers=headers)
+    ollama_client = ollama.AsyncClient(
+        host=host, timeout=timeout, headers=headers, trust_env=trust_env
+    )
 
     try:
         messages = []
@@ -215,10 +277,15 @@ async def ollama_embed(
 
     host = kwargs.pop("host", None)
     timeout = kwargs.pop("timeout", None)
+    trust_env = _resolve_trust_env_for_ollama(
+        host, explicit_value=kwargs.pop("trust_env", None)
+    )
 
     host = _coerce_host_for_cloud_model(host, embed_model)
 
-    ollama_client = ollama.AsyncClient(host=host, timeout=timeout, headers=headers)
+    ollama_client = ollama.AsyncClient(
+        host=host, timeout=timeout, headers=headers, trust_env=trust_env
+    )
     try:
         options = kwargs.pop("options", {})
         data = await ollama_client.embed(
@@ -226,7 +293,20 @@ async def ollama_embed(
         )
         return np.array(data["embeddings"])
     except Exception as e:
-        logger.error(f"Error in ollama_embed: {str(e)}")
+        options_keys = (
+            sorted(options.keys()) if isinstance(options, dict) else str(type(options))
+        )
+        text_summaries = _summarize_texts_for_error(texts)
+        logger.error(
+            "Error in ollama_embed: host=%s model=%s texts=%d trust_env=%s options_keys=%s text_summaries=%s error=%r",
+            host,
+            embed_model,
+            len(texts),
+            trust_env,
+            options_keys,
+            text_summaries,
+            e,
+        )
         try:
             await ollama_client._client.aclose()
             logger.debug("Successfully closed Ollama client after exception in embed")

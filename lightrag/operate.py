@@ -44,6 +44,7 @@ from lightrag.base import (
     BaseGraphStorage,
     BaseKVStorage,
     BaseVectorStorage,
+    DocStatusStorage,
     TextChunkSchema,
     QueryParam,
     QueryResult,
@@ -96,7 +97,7 @@ def _truncate_entity_identifier(
     return display_value
 
 
-def chunking_by_token_size(
+def _chunk_text_content(
     tokenizer: Tokenizer,
     content: str,
     split_by_character: str | None = None,
@@ -106,6 +107,7 @@ def chunking_by_token_size(
 ) -> list[dict[str, Any]]:
     tokens = tokenizer.encode(content)
     results: list[dict[str, Any]] = []
+
     if split_by_character:
         raw_chunks = content.split(split_by_character)
         new_chunks = []
@@ -147,19 +149,97 @@ def chunking_by_token_size(
                     "chunk_order_index": index,
                 }
             )
-    else:
-        for index, start in enumerate(
-            range(0, len(tokens), chunk_token_size - chunk_overlap_token_size)
-        ):
-            chunk_content = tokenizer.decode(tokens[start : start + chunk_token_size])
-            results.append(
-                {
-                    "tokens": min(chunk_token_size, len(tokens) - start),
-                    "content": chunk_content.strip(),
-                    "chunk_order_index": index,
-                }
-            )
+        return results
+
+    for index, start in enumerate(
+        range(0, len(tokens), chunk_token_size - chunk_overlap_token_size)
+    ):
+        chunk_content = tokenizer.decode(tokens[start : start + chunk_token_size])
+        results.append(
+            {
+                "tokens": min(chunk_token_size, len(tokens) - start),
+                "content": chunk_content.strip(),
+                "chunk_order_index": index,
+            }
+        )
     return results
+
+
+def chunking_by_token_size(
+    tokenizer: Tokenizer,
+    content: str | list[dict[str, Any]],
+    split_by_character: str | None = None,
+    split_by_character_only: bool = False,
+    chunk_overlap_token_size: int = 100,
+    chunk_token_size: int = 1200,
+) -> list[dict[str, Any]]:
+    if isinstance(content, list):
+        results: list[dict[str, Any]] = []
+        global_chunk_index = 0
+
+        for segment_index, segment in enumerate(content):
+            if not isinstance(segment, dict):
+                continue
+
+            segment_content = str(segment.get("content") or "").strip()
+            if not segment_content:
+                continue
+
+            content_type = str(segment.get("content_type") or "").strip().lower()
+            if content_type == "image":
+                image_chunk = {
+                    "tokens": 0,
+                    "content": segment_content,
+                    "chunk_order_index": global_chunk_index,
+                    "segment_order_index": segment_index,
+                    "content_type": content_type,
+                }
+                if segment.get("page_id") is not None:
+                    image_chunk["page_id"] = segment["page_id"]
+                if segment.get("bbox") is not None:
+                    image_chunk["bbox"] = segment["bbox"]
+                if segment.get("page_size") is not None:
+                    image_chunk["page_size"] = segment["page_size"]
+                if segment.get("ocr_chunk_id") is not None:
+                    image_chunk["ocr_chunk_id"] = segment["ocr_chunk_id"]
+                results.append(image_chunk)
+                global_chunk_index += 1
+                continue
+
+            segment_chunks = _chunk_text_content(
+                tokenizer,
+                segment_content,
+                split_by_character,
+                split_by_character_only,
+                chunk_overlap_token_size,
+                chunk_token_size,
+            )
+            for chunk in segment_chunks:
+                chunk["chunk_order_index"] = global_chunk_index
+                chunk["segment_order_index"] = segment_index
+                if segment.get("page_id") is not None:
+                    chunk["page_id"] = segment["page_id"]
+                if segment.get("bbox") is not None:
+                    chunk["bbox"] = segment["bbox"]
+                if segment.get("page_size") is not None:
+                    chunk["page_size"] = segment["page_size"]
+                if content_type:
+                    chunk["content_type"] = content_type
+                if segment.get("ocr_chunk_id") is not None:
+                    chunk["ocr_chunk_id"] = segment["ocr_chunk_id"]
+                results.append(chunk)
+                global_chunk_index += 1
+
+        return results
+
+    return _chunk_text_content(
+        tokenizer,
+        content,
+        split_by_character,
+        split_by_character_only,
+        chunk_overlap_token_size,
+        chunk_token_size,
+    )
 
 
 async def _handle_entity_relation_summary(
@@ -1864,6 +1944,15 @@ async def _merge_nodes_then_upsert(
             entity_name=entity_name,
             max_retries=3,
             retry_delay=0.1,
+            failure_context={
+                "entity_vdb_id": entity_vdb_id,
+                "entity_name": entity_name,
+                "entity_type": entity_type,
+                "source_id": source_id,
+                "file_path": file_path,
+                "content_length": len(entity_content),
+                "content_preview": entity_content[:500],
+            },
         )
     return node_data
 
@@ -2785,16 +2874,23 @@ async def extract_entities(
     ordered_chunks = list(chunks.items())
     # add language and example number params to prompt
     language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
-    entity_types = global_config["addon_params"].get(
+    entity_types_raw = global_config["addon_params"].get(
         "entity_types", DEFAULT_ENTITY_TYPES
     )
+
+    if isinstance(entity_types_raw, dict):
+        entity_types_str = "\n".join(
+            [f"{k}: {v}" for k, v in entity_types_raw.items()]
+        )
+    else:
+        entity_types_str = ", ".join(entity_types_raw)
 
     examples = "\n".join(PROMPTS["entity_extraction_examples"])
 
     example_context_base = dict(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
-        entity_types=", ".join(entity_types),
+        entity_types=entity_types_str,
         language=language,
     )
     # add example's format
@@ -2803,7 +2899,7 @@ async def extract_entities(
     context_base = dict(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
-        entity_types=",".join(entity_types),
+        entity_types=entity_types_str,
         examples=examples,
         language=language,
     )
@@ -3021,6 +3117,7 @@ async def kg_query(
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
     chunks_vdb: BaseVectorStorage = None,
+    doc_status_db: DocStatusStorage | None = None,
 ) -> QueryResult | None:
     """
     Execute knowledge graph query and return unified QueryResult object.
@@ -3036,6 +3133,7 @@ async def kg_query(
         hashing_kv: Cache storage
         system_prompt: System prompt
         chunks_vdb: Document chunks vector database
+        doc_status_db: Optional document status storage for resolving reference file_id
 
     Returns:
         QueryResult | None: Unified query result object containing:
@@ -3095,6 +3193,7 @@ async def kg_query(
         text_chunks_db,
         query_param,
         chunks_vdb,
+        doc_status_db,
     )
 
     if context_result is None:
@@ -3404,6 +3503,9 @@ async def _get_vector_context(
                     "content": result["content"],
                     "created_at": result.get("created_at", None),
                     "file_path": result.get("file_path", "unknown_source"),
+                    "full_doc_id": result.get("full_doc_id"),
+                    "page_id": result.get("page_id"),
+                    "bbox": result.get("bbox"),
                     "source_type": "vector",  # Mark the source type
                     "chunk_id": result.get("id"),  # Add chunk_id for deduplication
                 }
@@ -3528,7 +3630,7 @@ async def _perform_kg_search(
         if i < len(local_entities):
             entity = local_entities[i]
             entity_name = entity.get("entity_name")
-            if entity_name and entity_name not in seen_entities:
+            if entity_name and entity_name not in seen_entities:#remove duplicates entities
                 final_entities.append(entity)
                 seen_entities.add(entity_name)
 
@@ -3541,7 +3643,7 @@ async def _perform_kg_search(
                 seen_entities.add(entity_name)
 
     # Round-robin merge relations
-    final_relations = []
+    final_relations = []#store relations recalled
     seen_relations = set()
     max_len = max(len(local_relations), len(global_relations))
     for i in range(max_len):
@@ -3822,6 +3924,9 @@ async def _merge_all_chunks(
                     {
                         "content": chunk["content"],
                         "file_path": chunk.get("file_path", "unknown_source"),
+                        "full_doc_id": chunk.get("full_doc_id"),
+                        "page_id": chunk.get("page_id"),
+                        "bbox": chunk.get("bbox"),
                         "chunk_id": chunk_id,
                     }
                 )
@@ -3836,6 +3941,9 @@ async def _merge_all_chunks(
                     {
                         "content": chunk["content"],
                         "file_path": chunk.get("file_path", "unknown_source"),
+                        "full_doc_id": chunk.get("full_doc_id"),
+                        "page_id": chunk.get("page_id"),
+                        "bbox": chunk.get("bbox"),
                         "chunk_id": chunk_id,
                     }
                 )
@@ -3850,6 +3958,9 @@ async def _merge_all_chunks(
                     {
                         "content": chunk["content"],
                         "file_path": chunk.get("file_path", "unknown_source"),
+                        "full_doc_id": chunk.get("full_doc_id"),
+                        "page_id": chunk.get("page_id"),
+                        "bbox": chunk.get("bbox"),
                         "chunk_id": chunk_id,
                     }
                 )
@@ -3868,6 +3979,7 @@ async def _build_context_str(
     query: str,
     query_param: QueryParam,
     global_config: dict[str, str],
+    doc_status_db: DocStatusStorage | None = None,
     chunk_tracking: dict = None,
     entity_id_to_original: dict = None,
     relation_id_to_original: dict = None,
@@ -3956,9 +4068,9 @@ async def _build_context_str(
         chunk_token_limit=available_chunk_tokens,  # Pass dynamic limit
     )
 
-    # Generate reference list from truncated chunks using the new common function
-    reference_list, truncated_chunks = generate_reference_list_from_chunks(
-        truncated_chunks
+    # Generate chunk-level reference list from truncated chunks
+    reference_entries, truncated_chunks = await generate_reference_list_from_chunks(
+        truncated_chunks, doc_status_storage=doc_status_db
     )
 
     # Rebuild chunks_context with truncated chunks
@@ -3976,8 +4088,8 @@ async def _build_context_str(
         json.dumps(text_unit, ensure_ascii=False) for text_unit in chunks_context
     )
     reference_list_str = "\n".join(
-        f"[{ref['reference_id']}] {ref['file_path']}"
-        for ref in reference_list
+        f"[{ref['reference_id']}] {ref.get('chunk_id')} | {ref['file_path']} | file_id: {ref.get('file_id')}"
+        for ref in reference_entries
         if ref["reference_id"]
     )
 
@@ -4032,7 +4144,7 @@ async def _build_context_str(
         entities_context,
         relations_context,
         truncated_chunks,
-        reference_list,
+        reference_entries,
         query_param.mode,
         entity_id_to_original,
         relation_id_to_original,
@@ -4051,9 +4163,10 @@ async def _build_query_context(
     knowledge_graph_inst: BaseGraphStorage,
     entities_vdb: BaseVectorStorage,
     relationships_vdb: BaseVectorStorage,
-    text_chunks_db: BaseKVStorage,
+    text_chunks_db: BaseKVStorage,# it seems independent storage the original content rather than in the graph
     query_param: QueryParam,
     chunks_vdb: BaseVectorStorage = None,
+    doc_status_db: DocStatusStorage | None = None,
 ) -> QueryContextResult | None:
     """
     Main query context building function using the new 4-stage architecture:
@@ -4123,6 +4236,7 @@ async def _build_query_context(
         query=query,
         query_param=query_param,
         global_config=text_chunks_db.global_config,
+        doc_status_db=doc_status_db,
         chunk_tracking=search_result["chunk_tracking"],
         entity_id_to_original=truncation_result["entity_id_to_original"],
         relation_id_to_original=truncation_result["relation_id_to_original"],
@@ -4207,7 +4321,7 @@ async def _get_node_data(
         if n is not None
     ]
 
-    use_relations = await _find_most_related_edges_from_entities(
+    use_relations = await _find_most_related_edges_from_entities(#filter edge of certain entities
         node_datas,
         query_param,
         knowledge_graph_inst,
@@ -4306,7 +4420,7 @@ async def _find_related_text_unit_from_entities(
         if entity.get("source_id"):
             chunks = split_string_by_multi_markers(
                 entity["source_id"], [GRAPH_FIELD_SEP]
-            )
+            )#一个实体关联多个文本块（实体提取过程中的多射问题），entitt_id是concat的，现在需要拆分
             if chunks:
                 entities_with_chunks.append(
                     {
@@ -4328,7 +4442,7 @@ async def _find_related_text_unit_from_entities(
     )
 
     # Step 2: Count chunk occurrences and deduplicate (keep chunks from earlier positioned entities)
-    chunk_occurrence_count = {}
+    chunk_occurrence_count = {}#去重范围是跨实体的
     for entity_info in entities_with_chunks:
         deduplicated_chunks = []
         for chunk_id in entity_info["chunks"]:
@@ -4337,17 +4451,17 @@ async def _find_related_text_unit_from_entities(
             )
 
             # If this is the first occurrence (count == 1), keep it; otherwise skip (duplicate from later position)
-            if chunk_occurrence_count[chunk_id] == 1:
+            if chunk_occurrence_count[chunk_id] == 1:#在一个chunk_id首次出现时即对其进行记录，以此去重
                 deduplicated_chunks.append(chunk_id)
             # count > 1 means this chunk appeared in an earlier entity, so skip it
 
         # Update entity's chunks to deduplicated chunks
-        entity_info["chunks"] = deduplicated_chunks
+        entity_info["chunks"] = deduplicated_chunks#记录每个实体对应的去重后涉及的chunk_id列表
 
     # Step 3: Sort chunks for each entity by occurrence count (higher count = higher priority)
     total_entity_chunks = 0
     for entity_info in entities_with_chunks:
-        sorted_chunks = sorted(
+        sorted_chunks = sorted(#排前的id所设计的chunks频率更高更重要，因此优先取回
             entity_info["chunks"],
             key=lambda chunk_id: chunk_occurrence_count.get(chunk_id, 0),
             reverse=True,
@@ -4480,7 +4594,7 @@ async def _get_edge_data(
 
     # Relations maintain vector search order (sorted by similarity)
 
-    use_entities = await _find_most_related_entities_from_relationships(
+    use_entities = await _find_most_related_entities_from_relationships(# filter nodes of certain relations
         edge_datas,
         query_param,
         knowledge_graph_inst,
@@ -4737,6 +4851,7 @@ async def naive_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    doc_status_db: DocStatusStorage | None = None,
     return_raw_data: Literal[True] = True,
 ) -> dict[str, Any]: ...
 
@@ -4749,6 +4864,7 @@ async def naive_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    doc_status_db: DocStatusStorage | None = None,
     return_raw_data: Literal[False] = False,
 ) -> str | AsyncIterator[str]: ...
 
@@ -4760,6 +4876,7 @@ async def naive_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    doc_status_db: DocStatusStorage | None = None,
 ) -> QueryResult | None:
     """
     Execute naive query and return unified QueryResult object.
@@ -4771,6 +4888,7 @@ async def naive_query(
         global_config: Global configuration
         hashing_kv: Cache storage
         system_prompt: System prompt
+        doc_status_db: Optional document status storage for resolving reference file_id
 
     Returns:
         QueryResult | None: Unified query result object containing:
@@ -4854,9 +4972,9 @@ async def naive_query(
         chunk_token_limit=available_chunk_tokens,  # Pass dynamic limit
     )
 
-    # Generate reference list from processed chunks using the new common function
-    reference_list, processed_chunks_with_ref_ids = generate_reference_list_from_chunks(
-        processed_chunks
+    # Generate chunk-level reference list from processed chunks
+    reference_entries, processed_chunks_with_ref_ids = await generate_reference_list_from_chunks(
+        processed_chunks, doc_status_storage=doc_status_db
     )
 
     logger.info(f"Final context: {len(processed_chunks_with_ref_ids)} chunks")
@@ -4866,7 +4984,7 @@ async def naive_query(
         [],  # naive mode has no entities
         [],  # naive mode has no relationships
         processed_chunks_with_ref_ids,
-        reference_list,
+        reference_entries,
         "naive",
     )
 
@@ -4896,8 +5014,8 @@ async def naive_query(
         json.dumps(text_unit, ensure_ascii=False) for text_unit in chunks_context
     )
     reference_list_str = "\n".join(
-        f"[{ref['reference_id']}] {ref['file_path']}"
-        for ref in reference_list
+        f"[{ref['reference_id']}] {ref.get('chunk_id')} | {ref['file_path']} | file_id: {ref.get('file_id')}"
+        for ref in reference_entries
         if ref["reference_id"]
     )
 

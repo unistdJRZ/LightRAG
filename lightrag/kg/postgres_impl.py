@@ -986,6 +986,95 @@ class PostgreSQLDB:
                 f"Failed to add llm_cache_list column to LIGHTRAG_DOC_CHUNKS: {e}"
             )
 
+    async def _migrate_full_docs_add_content_segments(self):
+        """Add content_segments column to LIGHTRAG_DOC_FULL table if it doesn't exist"""
+        try:
+            check_column_sql = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'lightrag_doc_full'
+            AND column_name = 'content_segments'
+            """
+
+            column_info = await self.query(check_column_sql)
+            if not column_info:
+                logger.info("Adding content_segments column to LIGHTRAG_DOC_FULL table")
+                add_column_sql = """
+                ALTER TABLE LIGHTRAG_DOC_FULL
+                ADD COLUMN content_segments JSONB NULL
+                """
+                await self.execute(add_column_sql)
+                logger.info(
+                    "Successfully added content_segments column to LIGHTRAG_DOC_FULL table"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to add content_segments column to LIGHTRAG_DOC_FULL: {e}"
+            )
+
+    async def _migrate_text_chunks_add_layout_metadata(self):
+        """Add page_id and bbox columns to LIGHTRAG_DOC_CHUNKS table if needed"""
+        columns_to_add = (
+            ("page_id", "INTEGER NULL"),
+            ("bbox", "JSONB NULL"),
+        )
+        for column_name, column_type in columns_to_add:
+            try:
+                check_column_sql = f"""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'lightrag_doc_chunks'
+                AND column_name = '{column_name}'
+                """
+
+                column_info = await self.query(check_column_sql)
+                if not column_info:
+                    logger.info(
+                        "Adding %s column to LIGHTRAG_DOC_CHUNKS table", column_name
+                    )
+                    add_column_sql = f"""
+                    ALTER TABLE LIGHTRAG_DOC_CHUNKS
+                    ADD COLUMN {column_name} {column_type}
+                    """
+                    await self.execute(add_column_sql)
+                    logger.info(
+                        "Successfully added %s column to LIGHTRAG_DOC_CHUNKS table",
+                        column_name,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to add %s column to LIGHTRAG_DOC_CHUNKS: %s",
+                    column_name,
+                    e,
+                )
+
+    async def _migrate_text_chunks_add_translated_cn(self):
+        """Add translated_cn column to LIGHTRAG_DOC_CHUNKS table if needed"""
+        try:
+            check_column_sql = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'lightrag_doc_chunks'
+            AND column_name = 'translated_cn'
+            """
+
+            column_info = await self.query(check_column_sql)
+            if not column_info:
+                logger.info("Adding translated_cn column to LIGHTRAG_DOC_CHUNKS table")
+                add_column_sql = """
+                ALTER TABLE LIGHTRAG_DOC_CHUNKS
+                ADD COLUMN translated_cn TEXT NULL
+                """
+                await self.execute(add_column_sql)
+                logger.info(
+                    "Successfully added translated_cn column to LIGHTRAG_DOC_CHUNKS table"
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to add translated_cn column to LIGHTRAG_DOC_CHUNKS: %s",
+                e,
+            )
+
     async def _migrate_doc_status_add_track_id(self):
         """Add track_id column to LIGHTRAG_DOC_STATUS table if it doesn't exist and create index"""
         try:
@@ -1371,6 +1460,27 @@ class PostgreSQLDB:
         except Exception as e:
             logger.error(
                 f"PostgreSQL, Failed to migrate text chunks llm_cache_list field: {e}"
+            )
+
+        try:
+            await self._migrate_full_docs_add_content_segments()
+        except Exception as e:
+            logger.error(
+                f"PostgreSQL, Failed to migrate full docs content_segments field: {e}"
+            )
+
+        try:
+            await self._migrate_text_chunks_add_layout_metadata()
+        except Exception as e:
+            logger.error(
+                f"PostgreSQL, Failed to migrate text chunks layout metadata fields: {e}"
+            )
+
+        try:
+            await self._migrate_text_chunks_add_translated_cn()
+        except Exception as e:
+            logger.error(
+                f"PostgreSQL, Failed to migrate text chunks translated_cn field: {e}"
             )
 
         # Migrate field lengths for entity_name, source_id, target_id, and file_path
@@ -1915,10 +2025,27 @@ class PGKVStorage(BaseKVStorage):
                 except json.JSONDecodeError:
                     llm_cache_list = []
             response["llm_cache_list"] = llm_cache_list
+            bbox = response.get("bbox")
+            if isinstance(bbox, str):
+                try:
+                    bbox = json.loads(bbox)
+                except json.JSONDecodeError:
+                    bbox = None
+            response["bbox"] = bbox
+            response["translated_cn"] = response.get("translated_cn")
             create_time = response.get("create_time", 0)
             update_time = response.get("update_time", 0)
             response["create_time"] = create_time
             response["update_time"] = create_time if update_time == 0 else update_time
+
+        if response and is_namespace(self.namespace, NameSpace.KV_STORE_FULL_DOCS):
+            content_segments = response.get("content_segments")
+            if isinstance(content_segments, str):
+                try:
+                    content_segments = json.loads(content_segments)
+                except json.JSONDecodeError:
+                    content_segments = None
+            response["content_segments"] = content_segments
 
         # Special handling for LLM cache to ensure compatibility with _get_cached_extraction_results
         if response and is_namespace(
@@ -2049,10 +2176,28 @@ class PGKVStorage(BaseKVStorage):
                     except json.JSONDecodeError:
                         llm_cache_list = []
                 result["llm_cache_list"] = llm_cache_list
+                bbox = result.get("bbox")
+                if isinstance(bbox, str):
+                    try:
+                        bbox = json.loads(bbox)
+                    except json.JSONDecodeError:
+                        bbox = None
+                result["bbox"] = bbox
+                result["translated_cn"] = result.get("translated_cn")
                 create_time = result.get("create_time", 0)
                 update_time = result.get("update_time", 0)
                 result["create_time"] = create_time
                 result["update_time"] = create_time if update_time == 0 else update_time
+
+        if results and is_namespace(self.namespace, NameSpace.KV_STORE_FULL_DOCS):
+            for result in results:
+                content_segments = result.get("content_segments")
+                if isinstance(content_segments, str):
+                    try:
+                        content_segments = json.loads(content_segments)
+                    except json.JSONDecodeError:
+                        content_segments = None
+                result["content_segments"] = content_segments
 
         # Special handling for LLM cache to ensure compatibility with _get_cached_extraction_results
         if results and is_namespace(
@@ -2190,7 +2335,12 @@ class PGKVStorage(BaseKVStorage):
                     "full_doc_id": v["full_doc_id"],
                     "content": v["content"],
                     "file_path": v["file_path"],
+                    "page_id": v.get("page_id"),
+                    "bbox": json.dumps(v.get("bbox"))
+                    if v.get("bbox") is not None
+                    else None,
                     "llm_cache_list": json.dumps(v.get("llm_cache_list", [])),
+                    "translated_cn": v.get("translated_cn"),
                     "create_time": current_time,
                     "update_time": current_time,
                 }
@@ -2201,6 +2351,9 @@ class PGKVStorage(BaseKVStorage):
                 _data = {
                     "id": k,
                     "content": v["content"],
+                    "content_segments": json.dumps(v.get("content_segments"))
+                    if v.get("content_segments") is not None
+                    else None,
                     "doc_name": v.get("file_path", ""),  # Map file_path to doc_name
                     "workspace": self.workspace,
                 }
@@ -2865,8 +3018,10 @@ class PGVectorStorage(BaseVectorStorage):
                 item["content"],  # $6
                 item["__vector__"],  # $7 - numpy array, handled by pgvector codec
                 item["file_path"],  # $8
-                current_time,  # $9
-                current_time,  # $10
+                item.get("page_id"),  # $9
+                json.dumps(item.get("bbox")) if item.get("bbox") is not None else None,  # $10
+                current_time,  # $11
+                current_time,  # $12
             )
         except Exception as e:
             logger.error(
@@ -3015,6 +3170,14 @@ class PGVectorStorage(BaseVectorStorage):
             "top_k": top_k,
         }
         results = await self.db.query(sql, params=list(params.values()), multirows=True)
+        for result in results or []:
+            bbox = result.get("bbox")
+            if isinstance(bbox, str):
+                try:
+                    bbox = json.loads(bbox)
+                except json.JSONDecodeError:
+                    bbox = None
+            result["bbox"] = bbox
         return results
 
     async def index_done_callback(self) -> None:
@@ -5403,6 +5566,7 @@ TABLES = {
                     workspace VARCHAR(255),
                     doc_name VARCHAR(1024),
                     content TEXT,
+                    content_segments JSONB NULL,
                     meta JSONB,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
@@ -5418,6 +5582,9 @@ TABLES = {
                     tokens INTEGER,
                     content TEXT,
                     file_path TEXT NULL,
+                    page_id INTEGER NULL,
+                    bbox JSONB NULL,
+                    translated_cn TEXT NULL,
                     llm_cache_list JSONB NULL DEFAULT '[]'::jsonb,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
@@ -5434,6 +5601,8 @@ TABLES = {
                     content TEXT,
                     content_vector VECTOR(dimension),
                     file_path TEXT NULL,
+                    page_id INTEGER NULL,
+                    bbox JSONB NULL,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
 	                CONSTRAINT LIGHTRAG_VDB_CHUNKS_PK PRIMARY KEY (workspace, id)
@@ -5550,11 +5719,12 @@ TABLES = {
 SQL_TEMPLATES = {
     # SQL for KVStorage
     "get_by_id_full_docs": """SELECT id, COALESCE(content, '') as content,
+                                content_segments,
                                 COALESCE(doc_name, '') as file_path
                                 FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id=$2
                             """,
     "get_by_id_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
-                                chunk_order_index, full_doc_id, file_path,
+                                chunk_order_index, full_doc_id, file_path, page_id, bbox, translated_cn,
                                 COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
@@ -5566,11 +5736,12 @@ SQL_TEMPLATES = {
                                 FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND id=$2
                                """,
     "get_by_ids_full_docs": """SELECT id, COALESCE(content, '') as content,
+                                 content_segments,
                                  COALESCE(doc_name, '') as file_path
                                  FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id = ANY($2)
                             """,
     "get_by_ids_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
-                                  chunk_order_index, full_doc_id, file_path,
+                                  chunk_order_index, full_doc_id, file_path, page_id, bbox, translated_cn,
                                   COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
                                   EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                   EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
@@ -5622,11 +5793,12 @@ SQL_TEMPLATES = {
                                  FROM LIGHTRAG_RELATION_CHUNKS WHERE workspace=$1 AND id = ANY($2)
                                 """,
     "filter_keys": "SELECT id FROM {table_name} WHERE workspace=$1 AND id IN ({ids})",
-    "upsert_doc_full": """INSERT INTO LIGHTRAG_DOC_FULL (id, content, doc_name, workspace)
-                        VALUES ($1, $2, $3, $4)
+    "upsert_doc_full": """INSERT INTO LIGHTRAG_DOC_FULL (id, content, content_segments, doc_name, workspace)
+                        VALUES ($1, $2, $3, $4, $5)
                         ON CONFLICT (workspace,id) DO UPDATE
                            SET content = $2,
-                               doc_name = $3,
+                               content_segments = $3,
+                               doc_name = $4,
                                update_time = CURRENT_TIMESTAMP
                        """,
     "upsert_llm_response_cache": """INSERT INTO LIGHTRAG_LLM_CACHE(workspace,id,original_prompt,return_value,chunk_id,cache_type,queryparam)
@@ -5640,16 +5812,19 @@ SQL_TEMPLATES = {
                                       update_time = CURRENT_TIMESTAMP
                                      """,
     "upsert_text_chunk": """INSERT INTO LIGHTRAG_DOC_CHUNKS (workspace, id, tokens,
-                      chunk_order_index, full_doc_id, content, file_path, llm_cache_list,
-                      create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                      chunk_order_index, full_doc_id, content, file_path, page_id, bbox, llm_cache_list,
+                      translated_cn, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET tokens=EXCLUDED.tokens,
                       chunk_order_index=EXCLUDED.chunk_order_index,
                       full_doc_id=EXCLUDED.full_doc_id,
                       content = EXCLUDED.content,
                       file_path=EXCLUDED.file_path,
+                      page_id=EXCLUDED.page_id,
+                      bbox=EXCLUDED.bbox,
                       llm_cache_list=EXCLUDED.llm_cache_list,
+                      translated_cn=EXCLUDED.translated_cn,
                       update_time = EXCLUDED.update_time
                      """,
     "upsert_full_entities": """INSERT INTO LIGHTRAG_FULL_ENTITIES (workspace, id, entity_names, count,
@@ -5686,9 +5861,9 @@ SQL_TEMPLATES = {
                      """,
     # SQL for VectorStorage
     "upsert_chunk": """INSERT INTO {table_name} (workspace, id, tokens,
-                      chunk_order_index, full_doc_id, content, content_vector, file_path,
+                      chunk_order_index, full_doc_id, content, content_vector, file_path, page_id, bbox,
                       create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET tokens=EXCLUDED.tokens,
                       chunk_order_index=EXCLUDED.chunk_order_index,
@@ -5696,6 +5871,8 @@ SQL_TEMPLATES = {
                       content = EXCLUDED.content,
                       content_vector=EXCLUDED.content_vector,
                       file_path=EXCLUDED.file_path,
+                      page_id=EXCLUDED.page_id,
+                      bbox=EXCLUDED.bbox,
                       update_time = EXCLUDED.update_time
                      """,
     "upsert_entity": """INSERT INTO {table_name} (workspace, id, entity_name, content,
@@ -5744,6 +5921,9 @@ SQL_TEMPLATES = {
               SELECT c.id,
                      c.content,
                      c.file_path,
+                     c.full_doc_id,
+                     c.page_id,
+                     c.bbox,
                      EXTRACT(EPOCH FROM c.create_time)::BIGINT AS created_at
               FROM {table_name} c
               WHERE c.workspace = $1

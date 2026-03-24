@@ -99,84 +99,113 @@ Based on the last extraction task, identify and extract any **missed or incorrec
 <Output>
 """
 
-PROMPTS["entity_extraction_examples"] = [
-    """<Entity_types>
-["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]
+PROMPTS["entity_extraction_examples"] = [# changed to adapt to neuclar
+"""<Entity_types>
+["Person","Organization","Project","Document","Standard","Location","Time","ResearchTopic","DomainConcept","Method","ExperimentalMethod","SimulationMethod","Algorithm","Model","Equation","Material","Substance","Property","Composition","Microstructure","Degradation","FailureMode","ReactorType","System","Component","CoreComponent","Fuel","Coolant","AccidentType","SafetyFunction","Condition","PhysicalQuantity","Parameter","Phenomenon","Mechanism","Result","Metric","Dataset","Software","Instrument","Sensor","Nuclide","RadiationEffect"]
 
 <Input Text>
 ```
-while Alex clenched his jaw, the buzz of frustration dull against the backdrop of Taylor's authoritarian certainty. It was this competitive undercurrent that kept him alert, the sense that his and Jordan's shared commitment to discovery was an unspoken rebellion against Cruz's narrowing vision of control and order.
+To investigate the thermal-hydraulic response during the early stage of a loss-of-coolant accident (LOCA) in a pressurized water reactor (PWR), a transient analysis model of the primary loop system was established using RELAP5/MOD3.4. The coolant inlet temperature was set to 290 °C, and the system pressure was set to 15.5 MPa. Two boundary conditions were considered: coolant flow reduction and coolant loss.
 
-Then Taylor did something unexpected. They paused beside Jordan and, for a moment, observed the device with something akin to reverence. "If this tech can be understood..." Taylor said, their voice quieter, "It could change the game for us. For all of us."
-
-The underlying dismissal earlier seemed to falter, replaced by a glimpse of reluctant respect for the gravity of what lay in their hands. Jordan looked up, and for a fleeting heartbeat, their eyes locked with Taylor's, a wordless clash of wills softening into an uneasy truce.
-
-It was a small transformation, barely perceptible, but one that Alex noted with an inward nod. They had all been brought here by different paths
+The results show that under rapid coolant discharge conditions, the core outlet temperature increases significantly, and early boiling phenomena occur in local regions. The cladding surface temperature reaches its peak at 12 seconds. The study further indicates that the coupling effect of pressure drop and flow reduction is the primary mechanism leading to critical heat transfer deterioration. The model results are generally consistent with experimental loop data, with a peak cladding temperature deviation of less than 5%.
 ```
 
 <Output>
-entity{tuple_delimiter}Alex{tuple_delimiter}person{tuple_delimiter}Alex is a character who experiences frustration and is observant of the dynamics among other characters.
-entity{tuple_delimiter}Taylor{tuple_delimiter}person{tuple_delimiter}Taylor is portrayed with authoritarian certainty and shows a moment of reverence towards a device, indicating a change in perspective.
-entity{tuple_delimiter}Jordan{tuple_delimiter}person{tuple_delimiter}Jordan shares a commitment to discovery and has a significant interaction with Taylor regarding a device.
-entity{tuple_delimiter}Cruz{tuple_delimiter}person{tuple_delimiter}Cruz is associated with a vision of control and order, influencing the dynamics among other characters.
-entity{tuple_delimiter}The Device{tuple_delimiter}equipment{tuple_delimiter}The Device is central to the story, with potential game-changing implications, and is revered by Taylor.
-relation{tuple_delimiter}Alex{tuple_delimiter}Taylor{tuple_delimiter}power dynamics, observation{tuple_delimiter}Alex observes Taylor's authoritarian behavior and notes changes in Taylor's attitude toward the device.
-relation{tuple_delimiter}Alex{tuple_delimiter}Jordan{tuple_delimiter}shared goals, rebellion{tuple_delimiter}Alex and Jordan share a commitment to discovery, which contrasts with Cruz's vision.)
-relation{tuple_delimiter}Taylor{tuple_delimiter}Jordan{tuple_delimiter}conflict resolution, mutual respect{tuple_delimiter}Taylor and Jordan interact directly regarding the device, leading to a moment of mutual respect and an uneasy truce.
-relation{tuple_delimiter}Jordan{tuple_delimiter}Cruz{tuple_delimiter}ideological conflict, rebellion{tuple_delimiter}Jordan's commitment to discovery is in rebellion against Cruz's vision of control and order.
-relation{tuple_delimiter}Taylor{tuple_delimiter}The Device{tuple_delimiter}reverence, technological significance{tuple_delimiter}Taylor shows reverence towards the device, indicating its importance and potential impact.
+entity{tuple_delimiter}thermal-hydraulic response during early-stage LOCA in PWR{tuple_delimiter}ResearchTopic{tuple_delimiter}The study focuses on thermal-hydraulic behavior during the early stage of a loss-of-coolant accident in a pressurized water reactor.
+entity{tuple_delimiter}pressurized water reactor{tuple_delimiter}ReactorType{tuple_delimiter}A pressurized water reactor is a reactor type using high-pressure water as coolant and moderator.
+entity{tuple_delimiter}loss-of-coolant accident{tuple_delimiter}AccidentType{tuple_delimiter}A loss-of-coolant accident is a critical design-basis accident involving coolant loss.
+entity{tuple_delimiter}RELAP5/MOD3.4{tuple_delimiter}Software{tuple_delimiter}RELAP5/MOD3.4 is a software tool for transient thermal-hydraulic analysis of reactor systems.
+entity{tuple_delimiter}primary loop transient analysis model{tuple_delimiter}Model{tuple_delimiter}A model used to simulate transient thermal-hydraulic behavior of the primary loop under accident conditions.
+entity{tuple_delimiter}coolant inlet temperature 290 °C{tuple_delimiter}Parameter{tuple_delimiter}A key boundary parameter representing coolant inlet temperature.
+entity{tuple_delimiter}system pressure 15.5 MPa{tuple_delimiter}Parameter{tuple_delimiter}A critical operating parameter representing system pressure.
+entity{tuple_delimiter}coolant flow reduction condition{tuple_delimiter}Condition{tuple_delimiter}A boundary condition describing reduced coolant flow.
+entity{tuple_delimiter}coolant loss condition{tuple_delimiter}Condition{tuple_delimiter}A boundary condition representing rapid coolant discharge.
+entity{tuple_delimiter}early boiling phenomenon{tuple_delimiter}Phenomenon{tuple_delimiter}A thermal-hydraulic phenomenon where boiling occurs prematurely in local regions.
+entity{tuple_delimiter}critical heat transfer deterioration{tuple_delimiter}Phenomenon{tuple_delimiter}A phenomenon associated with degradation of heat transfer under accident conditions.
+entity{tuple_delimiter}coupling of pressure drop and flow reduction{tuple_delimiter}Mechanism{tuple_delimiter}The combined effect identified as the main cause of heat transfer deterioration.
+entity{tuple_delimiter}peak cladding temperature{tuple_delimiter}Result{tuple_delimiter}The cladding surface temperature reaches a maximum value during the transient process.
+entity{tuple_delimiter}peak cladding temperature deviation < 5%{tuple_delimiter}Metric{tuple_delimiter}Indicates strong agreement between simulation and experimental results.
+entity{tuple_delimiter}experimental loop data{tuple_delimiter}Dataset{tuple_delimiter}Experimental data used to validate the simulation model.
+relation{tuple_delimiter}thermal-hydraulic response during early-stage LOCA in PWR{tuple_delimiter}loss-of-coolant accident{tuple_delimiter}research focus, accident analysis{tuple_delimiter}The study analyzes thermal-hydraulic response under LOCA conditions.
+relation{tuple_delimiter}RELAP5/MOD3.4{tuple_delimiter}primary loop transient analysis model{tuple_delimiter}modeling tool, simulation support{tuple_delimiter}RELAP5/MOD3.4 is used to build the transient analysis model.
+relation{tuple_delimiter}primary loop transient analysis model{tuple_delimiter}coolant inlet temperature 290 °C{tuple_delimiter}parameter setting, boundary condition{tuple_delimiter}The model sets coolant inlet temperature as a key boundary parameter.
+relation{tuple_delimiter}primary loop transient analysis model{tuple_delimiter}system pressure 15.5 MPa{tuple_delimiter}parameter setting, operating condition{tuple_delimiter}The model sets system pressure as a key operating parameter.
+relation{tuple_delimiter}coolant loss condition{tuple_delimiter}early boiling phenomenon{tuple_delimiter}condition-induced, thermal phenomenon{tuple_delimiter}Coolant loss leads to early boiling in local regions.
+relation{tuple_delimiter}coupling of pressure drop and flow reduction{tuple_delimiter}critical heat transfer deterioration{tuple_delimiter}mechanism, causation{tuple_delimiter}The coupling effect is identified as the main cause of heat transfer deterioration.
+relation{tuple_delimiter}experimental loop data{tuple_delimiter}peak cladding temperature deviation < 5%{tuple_delimiter}model validation, consistency evaluation{tuple_delimiter}Experimental data validates the model with less than 5% deviation.
 {completion_delimiter}
 
 """,
     """<Entity_types>
-["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]
+["Person","Organization","Project","Document","Standard","Location","Time","ResearchTopic","DomainConcept","Method","ExperimentalMethod","SimulationMethod","Algorithm","Model","Equation","Material","Substance","Property","Composition","Microstructure","Degradation","FailureMode","ReactorType","System","Component","CoreComponent","Fuel","Coolant","AccidentType","SafetyFunction","Condition","PhysicalQuantity","Parameter","Phenomenon","Mechanism","Result","Metric","Dataset","Software","Instrument","Sensor","Nuclide","RadiationEffect"]
 
 <Input Text>
 ```
-Stock markets faced a sharp downturn today as tech giants saw significant declines, with the global tech index dropping by 3.4% in midday trading. Analysts attribute the selloff to investor concerns over rising interest rates and regulatory uncertainty.
+To evaluate the service reliability of steam generator tubes in pressurized water reactors under borated high-temperature water environments, Alloy 690 was selected as the study material. Scanning electron microscopy, X-ray diffraction, and slow strain rate tensile tests were conducted to characterize its corrosion behavior. The test temperature was set to 330 °C, and lithium concentration was maintained at 2.2 mg/L.
 
-Among the hardest hit, nexon technologies saw its stock plummet by 7.8% after reporting lower-than-expected quarterly earnings. In contrast, Omega Energy posted a modest 2.1% gain, driven by rising oil prices.
-
-Meanwhile, commodity markets reflected a mixed sentiment. Gold futures rose by 1.5%, reaching $2,080 per ounce, as investors sought safe-haven assets. Crude oil prices continued their rally, climbing to $87.60 per barrel, supported by supply constraints and strong demand.
-
-Financial experts are closely watching the Federal Reserve's next move, as speculation grows over potential rate hikes. The upcoming policy announcement is expected to influence investor confidence and overall market stability.
+Results show that a dense oxide film mainly composed of Cr2O3 forms on the surface. However, intergranular crack initiation is observed in regions with stress concentration. The study suggests that oxide film rupture, corrosive medium penetration, and grain boundary weakening collectively promote stress corrosion cracking. Compared to untreated samples, heat-treated Alloy 690 exhibits lower crack growth rates and improved corrosion resistance.
 ```
 
 <Output>
-entity{tuple_delimiter}Global Tech Index{tuple_delimiter}category{tuple_delimiter}The Global Tech Index tracks the performance of major technology stocks and experienced a 3.4% decline today.
-entity{tuple_delimiter}Nexon Technologies{tuple_delimiter}organization{tuple_delimiter}Nexon Technologies is a tech company that saw its stock decline by 7.8% after disappointing earnings.
-entity{tuple_delimiter}Omega Energy{tuple_delimiter}organization{tuple_delimiter}Omega Energy is an energy company that gained 2.1% in stock value due to rising oil prices.
-entity{tuple_delimiter}Gold Futures{tuple_delimiter}product{tuple_delimiter}Gold futures rose by 1.5%, indicating increased investor interest in safe-haven assets.
-entity{tuple_delimiter}Crude Oil{tuple_delimiter}product{tuple_delimiter}Crude oil prices rose to $87.60 per barrel due to supply constraints and strong demand.
-entity{tuple_delimiter}Market Selloff{tuple_delimiter}category{tuple_delimiter}Market selloff refers to the significant decline in stock values due to investor concerns over interest rates and regulations.
-entity{tuple_delimiter}Federal Reserve Policy Announcement{tuple_delimiter}category{tuple_delimiter}The Federal Reserve's upcoming policy announcement is expected to impact investor confidence and market stability.
-entity{tuple_delimiter}3.4% Decline{tuple_delimiter}category{tuple_delimiter}The Global Tech Index experienced a 3.4% decline in midday trading.
-relation{tuple_delimiter}Global Tech Index{tuple_delimiter}Market Selloff{tuple_delimiter}market performance, investor sentiment{tuple_delimiter}The decline in the Global Tech Index is part of the broader market selloff driven by investor concerns.
-relation{tuple_delimiter}Nexon Technologies{tuple_delimiter}Global Tech Index{tuple_delimiter}company impact, index movement{tuple_delimiter}Nexon Technologies' stock decline contributed to the overall drop in the Global Tech Index.
-relation{tuple_delimiter}Gold Futures{tuple_delimiter}Market Selloff{tuple_delimiter}market reaction, safe-haven investment{tuple_delimiter}Gold prices rose as investors sought safe-haven assets during the market selloff.
-relation{tuple_delimiter}Federal Reserve Policy Announcement{tuple_delimiter}Market Selloff{tuple_delimiter}interest rate impact, financial regulation{tuple_delimiter}Speculation over Federal Reserve policy changes contributed to market volatility and investor selloff.
+entity{tuple_delimiter}steam generator tube service reliability in PWR{tuple_delimiter}ResearchTopic{tuple_delimiter}The study focuses on reliability of steam generator tubes in pressurized water reactors.
+entity{tuple_delimiter}steam generator tube{tuple_delimiter}Component{tuple_delimiter}A key heat transfer component in nuclear power plants.
+entity{tuple_delimiter}Alloy 690{tuple_delimiter}Material{tuple_delimiter}A nickel-based alloy widely used for corrosion-resistant components.
+entity{tuple_delimiter}borated high-temperature water environment{tuple_delimiter}Condition{tuple_delimiter}A typical chemical environment in PWR primary circuits.
+entity{tuple_delimiter}scanning electron microscopy{tuple_delimiter}Instrument{tuple_delimiter}Used to observe surface morphology and crack features.
+entity{tuple_delimiter}X-ray diffraction{tuple_delimiter}ExperimentalMethod{tuple_delimiter}Used to analyze phase structure and oxide composition.
+entity{tuple_delimiter}slow strain rate tensile test{tuple_delimiter}ExperimentalMethod{tuple_delimiter}Used to evaluate stress corrosion susceptibility.
+entity{tuple_delimiter}330 °C{tuple_delimiter}Parameter{tuple_delimiter}The test temperature condition.
+entity{tuple_delimiter}lithium concentration 2.2 mg/L{tuple_delimiter}Parameter{tuple_delimiter}A key chemical environment parameter.
+entity{tuple_delimiter}Cr2O3 dense oxide film{tuple_delimiter}Microstructure{tuple_delimiter}A protective oxide layer formed on the material surface.
+entity{tuple_delimiter}intergranular crack initiation{tuple_delimiter}Phenomenon{tuple_delimiter}Crack formation along grain boundaries under stress.
+entity{tuple_delimiter}stress corrosion cracking{tuple_delimiter}FailureMode{tuple_delimiter}A critical degradation mode in nuclear materials.
+entity{tuple_delimiter}oxide film rupture, medium penetration, grain boundary weakening{tuple_delimiter}Mechanism{tuple_delimiter}Combined mechanism leading to crack initiation and propagation.
+entity{tuple_delimiter}heat-treated Alloy 690{tuple_delimiter}Material{tuple_delimiter}A modified material state with improved performance.
+entity{tuple_delimiter}lower crack growth rate{tuple_delimiter}Result{tuple_delimiter}Indicates reduced crack propagation speed.
+entity{tuple_delimiter}improved corrosion resistance{tuple_delimiter}Property{tuple_delimiter}Enhanced resistance to corrosion degradation.
+relation{tuple_delimiter}steam generator tube service reliability in PWR{tuple_delimiter}Alloy 690{tuple_delimiter}study object, material focus{tuple_delimiter}Alloy 690 is selected as the main material for reliability study.
+relation{tuple_delimiter}Alloy 690{tuple_delimiter}borated high-temperature water environment{tuple_delimiter}service condition, corrosion environment{tuple_delimiter}The material is tested under borated high-temperature water conditions.
+relation{tuple_delimiter}scanning electron microscopy{tuple_delimiter}intergranular crack initiation{tuple_delimiter}observation method, crack detection{tuple_delimiter}SEM is used to observe crack initiation behavior.
+relation{tuple_delimiter}X-ray diffraction{tuple_delimiter}Cr2O3 dense oxide film{tuple_delimiter}structure analysis, phase identification{tuple_delimiter}XRD identifies oxide film composition.
+relation{tuple_delimiter}oxide film rupture, medium penetration, grain boundary weakening{tuple_delimiter}stress corrosion cracking{tuple_delimiter}failure mechanism, causation{tuple_delimiter}These combined effects promote stress corrosion cracking.
+relation{tuple_delimiter}heat-treated Alloy 690{tuple_delimiter}lower crack growth rate{tuple_delimiter}treatment effect, crack suppression{tuple_delimiter}Heat treatment reduces crack growth rate.
+relation{tuple_delimiter}heat-treated Alloy 690{tuple_delimiter}improved corrosion resistance{tuple_delimiter}treatment effect, performance improvement{tuple_delimiter}Heat treatment improves corrosion resistance.
 {completion_delimiter}
 
 """,
     """<Entity_types>
-["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]
+["Person","Organization","Project","Document","Standard","Location","Time","ResearchTopic","DomainConcept","Method","ExperimentalMethod","SimulationMethod","Algorithm","Model","Equation","Material","Substance","Property","Composition","Microstructure","Degradation","FailureMode","ReactorType","System","Component","CoreComponent","Fuel","Coolant","AccidentType","SafetyFunction","Condition","PhysicalQuantity","Parameter","Phenomenon","Mechanism","Result","Metric","Dataset","Software","Instrument","Sensor","Nuclide","RadiationEffect"]
 
 <Input Text>
 ```
-At the World Athletics Championship in Tokyo, Noah Carter broke the 100m sprint record using cutting-edge carbon-fiber spikes.
+
+To improve neutron flux monitoring accuracy in a PWR core, an online measurement method based on compensated ionization chamber signal fusion was proposed. The method integrates a Kalman filtering algorithm to separate neutron current signals from gamma interference, and the processing workflow was validated on the Matlab platform.
+
+Results indicate that under a 20% load perturbation condition, the proposed method reduces flux measurement error from 4.8% to 1.6%, while significantly enhancing dynamic response stability. The study concludes that detector structure design and filter parameter optimization jointly determine system noise resistance performance.
+
 ```
 
 <Output>
-entity{tuple_delimiter}World Athletics Championship{tuple_delimiter}event{tuple_delimiter}The World Athletics Championship is a global sports competition featuring top athletes in track and field.
-entity{tuple_delimiter}Tokyo{tuple_delimiter}location{tuple_delimiter}Tokyo is the host city of the World Athletics Championship.
-entity{tuple_delimiter}Noah Carter{tuple_delimiter}person{tuple_delimiter}Noah Carter is a sprinter who set a new record in the 100m sprint at the World Athletics Championship.
-entity{tuple_delimiter}100m Sprint Record{tuple_delimiter}category{tuple_delimiter}The 100m sprint record is a benchmark in athletics, recently broken by Noah Carter.
-entity{tuple_delimiter}Carbon-Fiber Spikes{tuple_delimiter}equipment{tuple_delimiter}Carbon-fiber spikes are advanced sprinting shoes that provide enhanced speed and traction.
-entity{tuple_delimiter}World Athletics Federation{tuple_delimiter}organization{tuple_delimiter}The World Athletics Federation is the governing body overseeing the World Athletics Championship and record validations.
-relation{tuple_delimiter}World Athletics Championship{tuple_delimiter}Tokyo{tuple_delimiter}event location, international competition{tuple_delimiter}The World Athletics Championship is being hosted in Tokyo.
-relation{tuple_delimiter}Noah Carter{tuple_delimiter}100m Sprint Record{tuple_delimiter}athlete achievement, record-breaking{tuple_delimiter}Noah Carter set a new 100m sprint record at the championship.
-relation{tuple_delimiter}Noah Carter{tuple_delimiter}Carbon-Fiber Spikes{tuple_delimiter}athletic equipment, performance boost{tuple_delimiter}Noah Carter used carbon-fiber spikes to enhance performance during the race.
-relation{tuple_delimiter}Noah Carter{tuple_delimiter}World Athletics Championship{tuple_delimiter}athlete participation, competition{tuple_delimiter}Noah Carter is competing at the World Athletics Championship.
+entity{tuple_delimiter}neutron flux monitoring accuracy improvement in PWR core{tuple_delimiter}ResearchTopic{tuple_delimiter}The study focuses on improving neutron flux monitoring accuracy in reactor cores.
+entity{tuple_delimiter}PWR core{tuple_delimiter}CoreComponent{tuple_delimiter}The reactor core where neutron flux distribution is monitored.
+entity{tuple_delimiter}compensated ionization chamber signal fusion method{tuple_delimiter}Method{tuple_delimiter}A method combining detector signals for improved measurement accuracy.
+entity{tuple_delimiter}compensated ionization chamber{tuple_delimiter}Sensor{tuple_delimiter}A detector used for neutron flux measurement.
+entity{tuple_delimiter}Kalman filtering algorithm{tuple_delimiter}Algorithm{tuple_delimiter}An algorithm for signal separation and noise filtering.
+entity{tuple_delimiter}neutron current signal{tuple_delimiter}PhysicalQuantity{tuple_delimiter}Represents detector response to neutron flux.
+entity{tuple_delimiter}gamma interference component{tuple_delimiter}Substance{tuple_delimiter}Represents gamma radiation interference in measurement signals.
+entity{tuple_delimiter}Matlab platform{tuple_delimiter}Software{tuple_delimiter}Used for algorithm validation and data processing.
+entity{tuple_delimiter}20% load perturbation condition{tuple_delimiter}Condition{tuple_delimiter}A dynamic operating condition used for testing system performance.
+entity{tuple_delimiter}flux measurement error reduced from 4.8% to 1.6%{tuple_delimiter}Result{tuple_delimiter}Indicates improved measurement accuracy.
+entity{tuple_delimiter}enhanced dynamic response stability{tuple_delimiter}Metric{tuple_delimiter}Indicates improved system performance under dynamic conditions.
+entity{tuple_delimiter}detector design and filter parameter optimization{tuple_delimiter}Mechanism{tuple_delimiter}Joint factors influencing noise resistance performance.
+entity{tuple_delimiter}noise resistance performance{tuple_delimiter}Property{tuple_delimiter}The ability of the system to resist signal interference.
+relation{tuple_delimiter}neutron flux monitoring accuracy improvement in PWR core{tuple_delimiter}compensated ionization chamber signal fusion method{tuple_delimiter}problem solving, method proposal{tuple_delimiter}The method is proposed to improve monitoring accuracy.
+relation{tuple_delimiter}compensated ionization chamber signal fusion method{tuple_delimiter}compensated ionization chamber{tuple_delimiter}method basis, sensing support{tuple_delimiter}The method relies on ionization chamber signals.
+relation{tuple_delimiter}Kalman filtering algorithm{tuple_delimiter}neutron current signal{tuple_delimiter}signal processing, extraction{tuple_delimiter}Kalman filtering extracts useful neutron signal components.
+relation{tuple_delimiter}Kalman filtering algorithm{tuple_delimiter}gamma interference component{tuple_delimiter}noise suppression, separation{tuple_delimiter}Kalman filtering separates gamma interference.
+relation{tuple_delimiter}Matlab platform{tuple_delimiter}compensated ionization chamber signal fusion method{tuple_delimiter}validation platform, implementation{tuple_delimiter}Matlab is used to validate the method.
+relation{tuple_delimiter}20% load perturbation condition{tuple_delimiter}flux measurement error reduced from 4.8% to 1.6%{tuple_delimiter}condition validation, performance evaluation{tuple_delimiter}The method improves accuracy under perturbation conditions.
+relation{tuple_delimiter}detector design and filter parameter optimization{tuple_delimiter}noise resistance performance{tuple_delimiter}performance determinant, system optimization{tuple_delimiter}Design and parameter optimization determine system noise resistance.
 {completion_delimiter}
 
 """,

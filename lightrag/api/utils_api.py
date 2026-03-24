@@ -4,7 +4,8 @@ Utility functions for the LightRAG API.
 
 import os
 import argparse
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Any, Mapping
+from contextvars import ContextVar
 import sys
 import time
 import logging
@@ -14,7 +15,7 @@ from lightrag import __version__ as core_version
 from lightrag.constants import (
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
 )
-from fastapi import HTTPException, Security, Request, Response, status
+from fastapi import HTTPException, Security, Request, Response, status, Query
 from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from starlette.status import HTTP_403_FORBIDDEN
 from .auth import auth_handler
@@ -37,6 +38,8 @@ _TOKEN_RENEWAL_SKIP_PATHS = [
     "/health",
     "/documents/paginated",
     "/documents/pipeline_status",
+    "/api/documents/paginated",
+    "/api/documents/pipeline_status",
 ]
 
 
@@ -75,6 +78,113 @@ for path in whitelist_paths:
 
 # Global authentication configuration
 auth_configured = bool(auth_handler.accounts)
+
+
+class WorkspaceObjectProxy:
+    """Proxy object that resolves target instance by current request workspace."""
+
+    def __init__(
+        self,
+        objects_by_workspace: Mapping[str, Any],
+        default_workspace: str,
+        workspace_context: ContextVar[str],
+    ):
+        if not objects_by_workspace:
+            raise ValueError("objects_by_workspace cannot be empty")
+        self._objects = dict(objects_by_workspace)
+        self._default_workspace = default_workspace
+        self._workspace_context = workspace_context
+
+    def resolve_current(self) -> Any:
+        workspace = self._workspace_context.get(self._default_workspace)
+        return self._objects.get(workspace) or self._objects[self._default_workspace]
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self.resolve_current(), item)
+
+
+def create_workspace_scope_dependency(
+    objects_by_workspace: Mapping[str, Any],
+    workspace_context: ContextVar[str],
+    default_workspace: str,
+    workspace_aliases: Mapping[str, str] | None = None,
+):
+    """Create request dependency that selects workspace from query/body/header."""
+
+    async def _workspace_from_body(request: Request) -> Optional[str]:
+        content_type = request.headers.get("content-type", "").lower()
+        body_workspace: Any = None
+
+        if "application/json" in content_type:
+            try:
+                payload = await request.json()
+            except Exception:
+                return None
+
+            if not isinstance(payload, dict):
+                return None
+            body_workspace = payload.get("workspace")
+        elif (
+            "application/x-www-form-urlencoded" in content_type
+            or "multipart/form-data" in content_type
+        ):
+            try:
+                form = await request.form()
+            except Exception:
+                return None
+            body_workspace = form.get("workspace")
+        else:
+            return None
+
+        if body_workspace is None:
+            return None
+
+        if isinstance(body_workspace, str):
+            body_workspace = body_workspace.strip()
+            return body_workspace or None
+
+        body_workspace = str(body_workspace).strip()
+        return body_workspace or None
+
+    async def workspace_scope(
+        request: Request,
+        workspace: Optional[str] = Query(
+            default=None,
+            description="Target workspace. Priority: query param > request body workspace > LIGHTRAG-WORKSPACE header > default workspace.",
+        ),
+    ):
+        requested = (workspace or "").strip()
+        if not requested:
+            requested = await _workspace_from_body(request) or ""
+        if not requested:
+            requested = request.headers.get("LIGHTRAG-WORKSPACE", "").strip()
+        if not requested:
+            requested = default_workspace
+
+        if requested not in objects_by_workspace and workspace_aliases:
+            requested = workspace_aliases.get(requested, requested)
+
+        if requested not in objects_by_workspace:
+            supported_items = [name or "default" for name in sorted(objects_by_workspace.keys())]
+            if workspace_aliases:
+                supported_items.extend(
+                    f"{alias} -> {target or 'default'}"
+                    for alias, target in sorted(workspace_aliases.items())
+                )
+            supported = ", ".join(supported_items)
+            requested_display = requested or "default"
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown workspace '{requested_display}'. Available workspaces: {supported}",
+            )
+
+        token = workspace_context.set(requested)
+        try:
+            yield requested
+        finally:
+            workspace_context.reset(token)
+
+    return workspace_scope
 
 
 def get_combined_auth_dependency(api_key: Optional[str] = None):

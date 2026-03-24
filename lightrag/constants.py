@@ -24,19 +24,78 @@ DEFAULT_SUMMARY_LENGTH_RECOMMENDED = 600
 # Maximum token size sent to LLM for summary
 DEFAULT_SUMMARY_CONTEXT_SIZE = 12000
 # Default entities to extract if ENTITY_TYPES is not specified in .env
-DEFAULT_ENTITY_TYPES = [
-    "Person",
-    "Creature",
-    "Organization",
-    "Location",
-    "Event",
-    "Concept",
-    "Method",
-    "Content",
-    "Data",
-    "Artifact",
-    "NaturalObject",
-]
+# DEFAULT_ENTITY_TYPES = [
+#     "Person",
+#     "Creature",
+#     "Organization",
+#     "Location",
+#     "Event",
+#     "Concept",
+#     "Method",
+#     "Content",
+#     "Data",
+#     "Artifact",
+#     "NaturalObject",
+# ]
+
+DEFAULT_ENTITY_TYPES = {
+    # ===== 文献与元数据层 =====
+    "Person": "论文作者、研究人员或相关专家个体",
+    "Organization": "高校、研究机构、核电企业、实验室等组织",
+    "Project": "科研项目、计划或课题名称",
+    "Document": "论文、报告、专利、技术文档等",
+    "Standard": "标准、规范、导则或法规文件",
+    "Location": "实验地点、机构所在地或工程场址",
+    "Time": "时间信息，如年份、实验周期或运行阶段",
+
+    # ===== 科技论文核心语义层 =====
+    "ResearchTopic": "论文研究的核心问题或主题",
+    "DomainConcept": "领域内的专业术语或理论概念",
+    "Method": "通用研究方法或技术路线",
+    "ExperimentalMethod": "实验或测试方法",
+    "SimulationMethod": "数值模拟或计算方法（如CFD、蒙特卡洛）",
+    "Algorithm": "用于计算、优化或反演的算法",
+    "Model": "理论模型、物理模型或经验模型",
+    "Equation": "数学方程、控制方程或经验公式",
+
+    # ===== 材料与化学层 =====
+    "Material": "工程材料或功能材料（如锆合金、不锈钢）",
+    "Substance": "具体物质、元素、同位素或化合物",
+    "Property": "材料或介质的物理或化学性质",
+    "Composition": "材料成分、配比或浓度信息",
+    "Microstructure": "材料微观结构（晶粒、析出相等）",
+    "Degradation": "材料性能退化过程（如腐蚀、疲劳、蠕变）",
+    "FailureMode": "材料或部件的失效形式（如断裂、开裂）",
+
+    # ===== 核电工程层 =====
+    "ReactorType": "核反应堆类型（如压水堆、沸水堆）",
+    "System": "核电厂系统（如一回路、安注系统）",
+    "Component": "设备或部件（如蒸汽发生器、管道）",
+    "CoreComponent": "堆芯关键部件（如燃料组件、控制棒）",
+    "Fuel": "核燃料类型或形式",
+    "Coolant": "反应堆冷却剂",
+    "AccidentType": "事故类型（如失水事故LOCA）",
+    "SafetyFunction": "核安全功能（如停堆、余热导出）",
+
+    # ===== 工况与物理量 =====
+    "Condition": "运行工况或边界条件",
+    "PhysicalQuantity": "物理量（如温度、压力、流量）",
+    "Parameter": "模型或实验中的关键参数",
+    "Phenomenon": "物理或化学现象（如沸腾、空化）",
+    "Mechanism": "现象或过程背后的作用机理",
+    "Result": "实验或仿真得到的结果或结论",
+    "Metric": "评价指标或性能指标",
+    "Dataset": "实验或仿真数据集合",
+
+    # ===== 工具与检测 =====
+    "Software": "仿真软件、计算平台或代码系统",
+    "Instrument": "实验或测量仪器设备",
+    "Sensor": "传感器或检测元件",
+
+    # ===== 核物理与辐射 =====
+    "Nuclide": "核素或同位素",
+    "RadiationEffect": "辐照效应或辐射相关影响"
+}
 
 # Separator for: description, source_id and relation-key fields(Can not be changed after data inserted)
 GRAPH_FIELD_SEP = "<SEP>"

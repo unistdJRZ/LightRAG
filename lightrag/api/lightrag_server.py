@@ -5,6 +5,7 @@ LightRAG FastAPI Server
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.openapi.docs import (
     get_swagger_ui_html,
     get_swagger_ui_oauth2_redirect_html,
@@ -13,6 +14,10 @@ import os
 import logging
 import logging.config
 import sys
+import subprocess
+import shutil
+from typing import Any
+import numpy as np
 import uvicorn
 import pipmaster as pm
 from fastapi.staticfiles import StaticFiles
@@ -53,7 +58,7 @@ from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
 
-from lightrag.utils import logger, set_verbose_debug
+from lightrag.utils import logger, remove_think_tags, set_verbose_debug
 from lightrag.kg.shared_storage import (
     get_namespace_data,
     get_default_workspace,
@@ -62,7 +67,15 @@ from lightrag.kg.shared_storage import (
     finalize_share_data,
 )
 from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel, Field
 from lightrag.api.auth import auth_handler
+from lightrag.workspace_config import (
+    WorkspaceDefinition,
+    build_workspace_alias_map,
+    display_workspace_id,
+    load_workspace_config,
+    parse_workspace_csv,
+)
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -79,6 +92,84 @@ config.read("config.ini")
 
 # Global authentication configuration
 auth_configured = bool(auth_handler.accounts)
+
+
+class ChunkContentRequest(BaseModel):
+    chunk_id: str = Field(min_length=1, description="Chunk identifier to fetch")
+    workspace: str | None = Field(
+        default=None,
+        description="Optional workspace id or alias. If omitted, falls back to query/header/default workspace routing.",
+    )
+
+
+class ChunkContentResponse(BaseModel):
+    content: str = Field(description="Full text content of the requested chunk")
+
+
+class TranslateChunkRequest(BaseModel):
+    chunk_id: str = Field(min_length=1, description="Chunk identifier to translate")
+    workspace: str | None = Field(
+        default=None,
+        description="Optional workspace id or alias. If omitted, falls back to query/header/default workspace routing.",
+    )
+
+
+class TranslateChunkResponse(BaseModel):
+    chunk_id: str = Field(description="Chunk identifier")
+    translated_cn: str = Field(description="Chinese translation of the chunk content")
+    cached: bool = Field(
+        description="Whether translated_cn already existed on the chunk"
+    )
+
+
+TRANSLATE_TO_CN_SYSTEM_PROMPT = """You are a professional translator.
+Translate the user's text into Simplified Chinese.
+Requirements:
+- Keep the original meaning accurate and complete.
+- Preserve Markdown structure when present.
+- Preserve proper nouns, product names, code, URLs, numbers, and file paths when translation would be inappropriate.
+- Return only the translated Chinese text without explanations or extra commentary."""
+
+
+async def translate_chunk_to_cn(
+    rag: LightRAG,
+    chunk_id: str,
+) -> tuple[str, bool]:
+    """Translate a stored chunk to Chinese and persist translated_cn if needed."""
+    if not callable(getattr(rag, "llm_model_func", None)):
+        raise ValueError("LLM model function is not configured")
+
+    chunk_data = await rag.text_chunks.get_by_id(chunk_id)
+    if not chunk_data or "content" not in chunk_data:
+        raise KeyError(f"Chunk '{chunk_id}' not found")
+
+    existing_translation = chunk_data.get("translated_cn")
+    if isinstance(existing_translation, str) and existing_translation.strip():
+        return existing_translation, True
+
+    content_type = str(chunk_data.get("content_type") or "").strip().lower()
+    if content_type == "image":
+        raise ValueError("Image chunks do not support translation")
+
+    source_content = str(chunk_data.get("content") or "").strip()
+    if not source_content:
+        raise ValueError("Chunk content is empty")
+
+    translated = await rag.llm_model_func(
+        source_content,
+        system_prompt=TRANSLATE_TO_CN_SYSTEM_PROMPT,
+        history_messages=[],
+        enable_cot=False,
+        _priority=3,
+    )
+    translated_text = remove_think_tags(str(translated or "")).strip()
+    if not translated_text:
+        raise ValueError("Translation returned empty content")
+
+    chunk_data["translated_cn"] = translated_text
+    await rag.text_chunks.upsert({chunk_id: chunk_data})
+
+    return translated_text, False
 
 
 class LLMConfigCache:
@@ -284,9 +375,86 @@ def check_frontend_build():
         return (True, False)  # Assume assets exist and up-to-date on error
 
 
+def get_webui_dev_public_url(args) -> str:
+    """Resolve the browser-facing URL for WebUI dev server redirects."""
+    if getattr(args, "webui_dev_public_url", None):
+        return str(args.webui_dev_public_url).rstrip("/")
+
+    host = str(getattr(args, "webui_dev_host", "127.0.0.1")).strip()
+    if host in ("0.0.0.0", "::", ""):
+        host = "localhost"
+    port = int(getattr(args, "webui_dev_port", 5173))
+    return f"http://{host}:{port}/webui"
+
+
+def start_webui_dev_server(args) -> subprocess.Popen | None:
+    """Start WebUI dev server via command line (`bun run dev`)."""
+    if not getattr(args, "webui_dev", False):
+        return None
+
+    if "LIGHTRAG_GUNICORN_MODE" in os.environ or "GUNICORN_CMD_ARGS" in os.environ:
+        logger.warning(
+            "WEBUI_DEV is enabled but server is running under Gunicorn; skip launching WebUI dev process."
+        )
+        return None
+
+    webui_source_dir = Path(__file__).parent.parent.parent / "lightrag_webui"
+    if not webui_source_dir.exists():
+        raise RuntimeError(
+            f"WEBUI_DEV enabled but WebUI source directory not found: {webui_source_dir}"
+        )
+
+    bun_path = shutil.which("bun")
+    if not bun_path:
+        raise RuntimeError(
+            "WEBUI_DEV enabled but `bun` is not available in PATH. Install Bun first."
+        )
+
+    host = str(getattr(args, "webui_dev_host", "127.0.0.1")).strip() or "127.0.0.1"
+    port = int(getattr(args, "webui_dev_port", 5173))
+    command = [bun_path, "run", "dev", "--", "--host", host, "--port", str(port)]
+
+    logger.info(
+        f"Starting WebUI dev server with command: {' '.join(command)} (cwd={webui_source_dir})"
+    )
+    process = subprocess.Popen(command, cwd=str(webui_source_dir))
+    logger.info(
+        f"WebUI dev server started (pid={process.pid}), public URL: {get_webui_dev_public_url(args)}"
+    )
+    return process
+
+
+def stop_webui_dev_server(process: subprocess.Popen | None):
+    """Stop WebUI dev server process if it's still running."""
+    if process is None:
+        return
+    if process.poll() is not None:
+        return
+
+    try:
+        process.terminate()
+        process.wait(timeout=8)
+        logger.info("WebUI dev server process terminated")
+    except subprocess.TimeoutExpired:
+        process.kill()
+        logger.warning("WebUI dev server did not exit in time; process was killed")
+    except Exception as e:
+        logger.warning(f"Failed to stop WebUI dev server process cleanly: {e}")
+
+
 def create_app(args):
-    # Check frontend build first and get status
-    webui_assets_exist, is_frontend_outdated = check_frontend_build()
+    webui_dev_enabled = bool(getattr(args, "webui_dev", False))
+    webui_dev_public_url = get_webui_dev_public_url(args)
+
+    # In WEBUI_DEV mode, disable static WebUI mounting and use external Vite dev server.
+    webui_assets_exist = False
+    is_frontend_outdated = False
+    if not webui_dev_enabled:
+        webui_assets_exist, is_frontend_outdated = check_frontend_build()
+    else:
+        logger.info(
+            "WEBUI_DEV is enabled. Static WebUI mount is disabled and requests will be redirected to dev server."
+        )
 
     # Create unified API version display with warning symbol if frontend is outdated
     api_version_display = (
@@ -343,30 +511,74 @@ def create_app(args):
     # Check if API key is provided either through env var or args
     api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
 
-    # Initialize document manager with workspace support for data isolation
-    doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
+    workspace_config_path = os.getenv("LIGHTRAG_WORKSPACE_CONFIG", "").strip()
+    workspace_config: dict[str, Any] | None = None
+    if workspace_config_path:
+        config_file = Path(workspace_config_path)
+        if config_file.exists():
+            try:
+                workspace_config = load_workspace_config(config_file)
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to load workspace config from {config_file}: {exc}"
+                )
+
+    workspace_definitions: list[WorkspaceDefinition] = parse_workspace_csv(args.workspace)
+    if workspace_config and workspace_config.get("workspaces"):
+        configured_definitions = {
+            item.id: item for item in workspace_config["workspaces"]
+        }
+        workspace_definitions = [
+            configured_definitions.get(item.id, item) for item in workspace_definitions
+        ]
+
+    workspace_names = [item.id for item in workspace_definitions]
+    default_workspace_name = workspace_names[0]
+    workspace_aliases = build_workspace_alias_map(workspace_definitions)
+    workspace_metadata = {
+        item.id: {
+            "id": display_workspace_id(item.id),
+            "alias": item.alias,
+        }
+        for item in workspace_definitions
+    }
+    workspace_rags: dict[str, LightRAG] = {}
+    workspace_doc_managers: dict[str, DocumentManager] = {}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Lifespan context manager for startup and shutdown events"""
         # Store background tasks
         app.state.background_tasks = set()
+        webui_dev_process: subprocess.Popen | None = None
 
         try:
-            # Initialize database connections
-            # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
-            await rag.initialize_storages()
+            if webui_dev_enabled:
+                webui_dev_process = start_webui_dev_server(args)
 
-            # Data migration regardless of storage implementation
-            await rag.check_and_migrate_data()
+            # Initialize all workspace-bound LightRAG instances.
+            for workspace_name, rag_instance in workspace_rags.items():
+                logger.info(
+                    f"Initializing storages for workspace '{workspace_name or 'default'}'"
+                )
+                await rag_instance.initialize_storages()
+
+                # Data migration regardless of storage implementation
+                await rag_instance.check_and_migrate_data()
 
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             yield
 
         finally:
-            # Clean up database connections
-            await rag.finalize_storages()
+            # Clean up all workspace-bound LightRAG instances.
+            for workspace_name, rag_instance in workspace_rags.items():
+                try:
+                    await rag_instance.finalize_storages()
+                except Exception as e:
+                    logger.error(
+                        f"Failed to finalize storages for workspace '{workspace_name or 'default'}': {e}"
+                    )
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
@@ -377,6 +589,9 @@ def create_app(args):
                 logger.debug(
                     "Gunicorn Mode: postpone shared storage finalization to master process"
                 )
+
+            if webui_dev_enabled:
+                stop_webui_dev_server(webui_dev_process)
 
     # Initialize FastAPI
     base_description = (
@@ -405,6 +620,15 @@ def create_app(args):
     }
 
     app = FastAPI(**app_kwargs)
+
+    def _suggest_api_prefixed_path(path: str) -> str | None:
+        """Suggest `/api`-prefixed path for common API roots when missing."""
+        api_roots = ("/documents", "/query", "/graphs", "/graph")
+        if path.startswith("/api/"):
+            return None
+        if any(path.startswith(root) for root in api_roots):
+            return f"/api{path}"
+        return None
 
     # Add custom validation error handler for /query/data endpoint
     @app.exception_handler(RequestValidationError)
@@ -435,14 +659,60 @@ def create_app(args):
             # For other endpoints, return the default FastAPI validation error
             return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+        """Return richer error payload for HTTP errors such as 404/405."""
+        path = request.url.path
+        query = request.url.query
+        suggestion = _suggest_api_prefixed_path(path) if exc.status_code == 404 else None
+
+        response_body: dict[str, Any] = {
+            "detail": exc.detail if exc.detail is not None else "HTTP error",
+            "status_code": exc.status_code,
+            "method": request.method,
+            "path": path,
+            "query": query,
+        }
+        if suggestion:
+            response_body["hint"] = f"Route not found. Did you mean '{suggestion}'?"
+
+        log_message = (
+            f"HTTP {exc.status_code} {request.method} {path}"
+            + (f"?{query}" if query else "")
+        )
+        if suggestion:
+            logger.warning(f"{log_message} | hint={suggestion}")
+        elif exc.status_code >= 500:
+            logger.error(log_message)
+        else:
+            logger.warning(log_message)
+
+        return JSONResponse(status_code=exc.status_code, content=response_body)
+
     def get_cors_origins():
         """Get allowed origins from global_args
-        Returns a list of allowed origins, defaults to ["*"] if not set
+        Returns a normalized list of allowed origins.
         """
-        origins_str = global_args.cors_origins
-        if origins_str == "*":
+        origins_value = global_args.cors_origins
+        if isinstance(origins_value, (list, tuple, set)):
+            origins = [
+                str(origin).strip()
+                for origin in origins_value
+                if str(origin).strip()
+            ]
+        else:
+            origins_str = str(origins_value or "").strip()
+            if not origins_str:
+                return []
+            origins = [
+                origin.strip()
+                for origin in origins_str.replace(";", ",").split(",")
+                if origin.strip()
+            ]
+
+        if "*" in origins:
             return ["*"]
-        return [origin.strip() for origin in origins_str.split(",")]
+        return origins
 
     # Add CORS middleware
     app.add_middleware(
@@ -461,11 +731,12 @@ def create_app(args):
 
     def get_workspace_from_request(request: Request) -> str | None:
         """
-        Extract workspace from HTTP request header or use default.
+        Extract workspace from request query/header.
 
-        This enables multi-workspace API support by checking the custom
-        'LIGHTRAG-WORKSPACE' header. If not present, falls back to the
-        server's default workspace configuration.
+        Priority:
+        1. `workspace` query parameter
+        2. `LIGHTRAG-WORKSPACE` header
+        3. fallback to default workspace in caller
 
         Args:
             request: FastAPI Request object
@@ -473,8 +744,11 @@ def create_app(args):
         Returns:
             Workspace identifier (may be empty string for global namespace)
         """
-        # Check custom header first
-        workspace = request.headers.get("LIGHTRAG-WORKSPACE", "").strip()
+        workspace = request.query_params.get("workspace", "").strip()
+        if not workspace:
+            workspace = request.headers.get("LIGHTRAG-WORKSPACE", "").strip()
+        if workspace and workspace not in workspace_rags:
+            workspace = workspace_aliases.get(workspace, workspace)
 
         if not workspace:
             workspace = None
@@ -725,6 +999,27 @@ def create_app(args):
         final_embedding_dim = (
             args.embedding_dim if args.embedding_dim else provider_embedding_dim
         )
+        fallback_embedding_dim = final_embedding_dim or provider_embedding_dim or 1024
+
+        def _sanitize_embedding_output(raw_result: Any, texts_count: int) -> np.ndarray:
+            """Convert embedding output to ndarray and replace non-finite values with 0."""
+            arr = np.asarray(raw_result, dtype=np.float32)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+
+            non_finite_mask = ~np.isfinite(arr)
+            non_finite_count = int(np.count_nonzero(non_finite_mask))
+            if non_finite_count > 0:
+                logger.warning(
+                    "Embedding output contains %d non-finite values (binding=%s, model=%s, texts=%d); replaced with 0",
+                    non_finite_count,
+                    binding,
+                    model,
+                    texts_count,
+                )
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+            return arr
 
         # Step 3: Create optimized embedding function (calls underlying function directly)
         # Note: When model is None, each binding will use its own default model
@@ -741,7 +1036,10 @@ def create_app(args):
                     )
                     # lollms embed_model is not used (server uses configured vectorizer)
                     # Only pass base_url and api_key
-                    return await actual_func(texts, base_url=host, api_key=api_key)
+                    raw_result = await actual_func(
+                        texts, base_url=host, api_key=api_key
+                    )
+                    return _sanitize_embedding_output(raw_result, len(texts))
                 elif binding == "ollama":
                     from lightrag.llm.ollama import ollama_embed
 
@@ -769,7 +1067,8 @@ def create_app(args):
                     }
                     if model:
                         kwargs["embed_model"] = model
-                    return await actual_func(**kwargs)
+                    raw_result = await actual_func(**kwargs)
+                    return _sanitize_embedding_output(raw_result, len(texts))
                 elif binding == "azure_openai":
                     from lightrag.llm.azure_openai import azure_openai_embed
 
@@ -782,7 +1081,8 @@ def create_app(args):
                     kwargs = {"texts": texts, "api_key": api_key}
                     if model:
                         kwargs["model"] = model
-                    return await actual_func(**kwargs)
+                    raw_result = await actual_func(**kwargs)
+                    return _sanitize_embedding_output(raw_result, len(texts))
                 elif binding == "aws_bedrock":
                     from lightrag.llm.bedrock import bedrock_embed
 
@@ -795,7 +1095,8 @@ def create_app(args):
                     kwargs = {"texts": texts}
                     if model:
                         kwargs["model"] = model
-                    return await actual_func(**kwargs)
+                    raw_result = await actual_func(**kwargs)
+                    return _sanitize_embedding_output(raw_result, len(texts))
                 elif binding == "jina":
                     from lightrag.llm.jina import jina_embed
 
@@ -813,7 +1114,8 @@ def create_app(args):
                     }
                     if model:
                         kwargs["model"] = model
-                    return await actual_func(**kwargs)
+                    raw_result = await actual_func(**kwargs)
+                    return _sanitize_embedding_output(raw_result, len(texts))
                 elif binding == "gemini":
                     from lightrag.llm.gemini import gemini_embed
 
@@ -843,7 +1145,8 @@ def create_app(args):
                     }
                     if model:
                         kwargs["model"] = model
-                    return await actual_func(**kwargs)
+                    raw_result = await actual_func(**kwargs)
+                    return _sanitize_embedding_output(raw_result, len(texts))
                 else:  # openai and compatible
                     from lightrag.llm.openai import openai_embed
 
@@ -861,9 +1164,25 @@ def create_app(args):
                     }
                     if model:
                         kwargs["model"] = model
-                    return await actual_func(**kwargs)
+                    raw_result = await actual_func(**kwargs)
+                    return _sanitize_embedding_output(raw_result, len(texts))
             except ImportError as e:
                 raise Exception(f"Failed to import {binding} embedding: {e}")
+            except Exception as e:
+                # Ollama may fail with HTTP 500 "unsupported value: NaN" on its side.
+                # Fallback to zero vectors to keep indexing pipeline alive.
+                if binding == "ollama" and "unsupported value: NaN" in str(e):
+                    logger.warning(
+                        "Ollama embedding failed with NaN serialization error; fallback to zero vectors (texts=%d, dim=%d, model=%s, host=%s)",
+                        len(texts),
+                        fallback_embedding_dim,
+                        model,
+                        host,
+                    )
+                    return np.zeros(
+                        (len(texts), fallback_embedding_dim), dtype=np.float32
+                    )
+                raise
 
         # Step 4: Wrap in EmbeddingFunc and return
         embedding_func_instance = EmbeddingFunc(
@@ -1047,58 +1366,88 @@ def create_app(args):
         name=args.simulated_model_name, tag=args.simulated_model_tag
     )
 
-    # Initialize RAG with unified configuration
+    # Initialize one LightRAG instance per workspace.
     try:
-        rag = LightRAG(
-            working_dir=args.working_dir,
-            workspace=args.workspace,
-            llm_model_func=create_llm_model_func(args.llm_binding),
-            llm_model_name=args.llm_model,
-            llm_model_max_async=args.max_async,
-            summary_max_tokens=args.summary_max_tokens,
-            summary_context_size=args.summary_context_size,
-            chunk_token_size=int(args.chunk_size),
-            chunk_overlap_token_size=int(args.chunk_overlap_size),
-            llm_model_kwargs=create_llm_model_kwargs(
-                args.llm_binding, args, llm_timeout
-            ),
-            embedding_func=embedding_func,
-            default_llm_timeout=llm_timeout,
-            default_embedding_timeout=embedding_timeout,
-            kv_storage=args.kv_storage,
-            graph_storage=args.graph_storage,
-            vector_storage=args.vector_storage,
-            doc_status_storage=args.doc_status_storage,
-            vector_db_storage_cls_kwargs={
-                "cosine_better_than_threshold": args.cosine_threshold
-            },
-            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
-            enable_llm_cache=args.enable_llm_cache,
-            rerank_model_func=rerank_model_func,
-            max_parallel_insert=args.max_parallel_insert,
-            max_graph_nodes=args.max_graph_nodes,
-            addon_params={
-                "language": args.summary_language,
-                "entity_types": args.entity_types,
-            },
-            ollama_server_infos=ollama_server_infos,
-        )
+        for workspace_name in workspace_names:
+            rag_instance = LightRAG(
+                working_dir=args.working_dir,
+                workspace=workspace_name,
+                llm_model_func=create_llm_model_func(args.llm_binding),
+                llm_model_name=args.llm_model,
+                llm_model_max_async=args.max_async,
+                summary_max_tokens=args.summary_max_tokens,
+                summary_context_size=args.summary_context_size,
+                chunk_token_size=int(args.chunk_size),
+                chunk_overlap_token_size=int(args.chunk_overlap_size),
+                llm_model_kwargs=create_llm_model_kwargs(
+                    args.llm_binding, args, llm_timeout
+                ),
+                embedding_func=embedding_func,
+                default_llm_timeout=llm_timeout,
+                default_embedding_timeout=embedding_timeout,
+                kv_storage=args.kv_storage,
+                graph_storage=args.graph_storage,
+                vector_storage=args.vector_storage,
+                doc_status_storage=args.doc_status_storage,
+                vector_db_storage_cls_kwargs={
+                    "cosine_better_than_threshold": args.cosine_threshold
+                },
+                enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
+                enable_llm_cache=args.enable_llm_cache,
+                rerank_model_func=rerank_model_func,
+                max_parallel_insert=args.max_parallel_insert,
+                max_graph_nodes=args.max_graph_nodes,
+                addon_params={
+                    "language": args.summary_language,
+                    "entity_types": args.entity_types,
+                },
+                ollama_server_infos=ollama_server_infos,
+            )
+            workspace_rags[workspace_name] = rag_instance
+            workspace_doc_managers[workspace_name] = DocumentManager(
+                args.input_dir, workspace=workspace_name
+            )
+
+            logger.info(
+                f"Workspace '{workspace_name or 'default'}' initialized for dynamic workspace routing"
+            )
     except Exception as e:
-        logger.error(f"Failed to initialize LightRAG: {e}")
+        logger.error(f"Failed to initialize LightRAG instances: {e}")
         raise
 
-    # Add routes
+    # Register a single route set under /api and dispatch by workspace parameter/header.
     app.include_router(
         create_document_routes(
-            rag,
-            doc_manager,
+            workspace_rags,
+            workspace_doc_managers,
             api_key,
-        )
+            workspace=default_workspace_name,
+            workspace_aliases=workspace_aliases,
+        ),
+        prefix="/api",
     )
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
-    app.include_router(create_graph_routes(rag, api_key))
+    app.include_router(
+        create_query_routes(
+            workspace_rags,
+            api_key,
+            args.top_k,
+            workspace=default_workspace_name,
+            workspace_aliases=workspace_aliases,
+        ),
+        prefix="/api",
+    )
+    app.include_router(
+        create_graph_routes(
+            workspace_rags,
+            api_key,
+            workspace=default_workspace_name,
+            workspace_aliases=workspace_aliases,
+        ),
+        prefix="/api",
+    )
 
-    # Add Ollama API routes
+    # Keep Ollama API bound to the default workspace instance for compatibility.
+    rag = workspace_rags[default_workspace_name]
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
     app.include_router(ollama_api.router, prefix="/api")
 
@@ -1124,6 +1473,8 @@ def create_app(args):
     @app.get("/")
     async def redirect_to_webui():
         """Redirect root path based on WebUI availability"""
+        if webui_dev_enabled:
+            return RedirectResponse(url=webui_dev_public_url)
         if webui_assets_exist:
             return RedirectResponse(url="/webui")
         else:
@@ -1158,6 +1509,123 @@ def create_app(args):
             "webui_title": webui_title,
             "webui_description": webui_description,
         }
+
+    @app.get(
+        "/api/workspaces",
+        dependencies=[Depends(combined_auth)],
+        summary="List available workspaces",
+        description="Returns all loaded workspace identifiers and the default workspace.",
+    )
+    async def list_workspaces():
+        workspace_list = [
+            workspace_metadata.get(name)
+            or {"id": display_workspace_id(name), "alias": display_workspace_id(name)}
+            for name in workspace_names
+        ]
+        default_workspace_meta = workspace_metadata.get(default_workspace_name) or {
+            "id": display_workspace_id(default_workspace_name),
+            "alias": display_workspace_id(default_workspace_name),
+        }
+        return {
+            "default_workspace": default_workspace_meta["id"],
+            "default_workspace_alias": default_workspace_meta["alias"],
+            "workspaces": workspace_list,
+            "count": len(workspace_list),
+        }
+
+    def resolve_workspace_or_raise(
+        request: Request, explicit_workspace: str | None
+    ) -> str:
+        workspace = (explicit_workspace or "").strip()
+        if workspace and workspace not in workspace_rags:
+            workspace = workspace_aliases.get(workspace, workspace)
+        if not workspace:
+            workspace = get_workspace_from_request(request)
+        if workspace is None:
+            workspace = default_workspace_name
+
+        if workspace not in workspace_rags:
+            supported = ", ".join(
+                workspace_metadata.get(name, {}).get("id", display_workspace_id(name))
+                for name in workspace_names
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown workspace '{workspace}'. Available workspaces: {supported}",
+            )
+
+        return workspace
+
+    @app.post(
+        "/api/chunk_content",
+        dependencies=[Depends(combined_auth)],
+        response_model=ChunkContentResponse,
+        summary="Get full chunk content by chunk_id",
+        description="Returns the full stored chunk text for the given chunk_id in the resolved workspace.",
+    )
+    async def get_chunk_content(request: Request, payload: ChunkContentRequest):
+        workspace = resolve_workspace_or_raise(request, payload.workspace)
+
+        chunk_id = payload.chunk_id.strip()
+        try:
+            chunk_data = await workspace_rags[workspace].text_chunks.get_by_id(chunk_id)
+        except Exception as exc:
+            logger.error(
+                f"Failed to fetch chunk '{chunk_id}' in workspace '{workspace}': {exc}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to fetch chunk content: {exc}",
+            ) from exc
+
+        if not chunk_data or "content" not in chunk_data:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Chunk '{chunk_id}' not found in workspace '{display_workspace_id(workspace)}'",
+            )
+
+        return ChunkContentResponse(content=str(chunk_data.get("content", "")))
+
+    @app.post(
+        "/api/translate_chunk",
+        dependencies=[Depends(combined_auth)],
+        response_model=TranslateChunkResponse,
+        summary="Translate a stored chunk into Chinese",
+        description="Returns translated_cn for the given chunk. Reuses cached translation when available; otherwise generates and persists it.",
+    )
+    async def translate_chunk(request: Request, payload: TranslateChunkRequest):
+        workspace = resolve_workspace_or_raise(request, payload.workspace)
+        chunk_id = payload.chunk_id.strip()
+
+        try:
+            translated_cn, cached = await translate_chunk_to_cn(
+                workspace_rags[workspace],
+                chunk_id,
+            )
+        except KeyError:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Chunk '{chunk_id}' not found in workspace '{display_workspace_id(workspace)}'",
+            ) from None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error(
+                "Failed to translate chunk '%s' in workspace '%s': %s",
+                chunk_id,
+                workspace,
+                exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to translate chunk: {exc}",
+            ) from exc
+
+        return TranslateChunkResponse(
+            chunk_id=chunk_id,
+            translated_cn=translated_cn,
+            cached=cached,
+        )
 
     @app.post("/login")
     async def login(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -1248,7 +1716,7 @@ def create_app(args):
 
             return {
                 "status": "healthy",
-                "webui_available": webui_assets_exist,
+                "webui_available": webui_dev_enabled or webui_assets_exist,
                 "working_directory": str(args.working_dir),
                 "input_directory": str(args.input_dir),
                 "configuration": {
@@ -1338,8 +1806,19 @@ def create_app(args):
             name="swagger-ui-static",
         )
 
+    if webui_dev_enabled:
+        logger.info(
+            f"WEBUI_DEV is enabled. `/webui` will redirect to {webui_dev_public_url}"
+        )
+
+        @app.get("/webui")
+        @app.get("/webui/")
+        async def webui_redirect_to_dev():
+            """Redirect /webui to the external Vite dev server."""
+            return RedirectResponse(url=webui_dev_public_url)
+
     # Conditionally mount WebUI only if assets exist
-    if webui_assets_exist:
+    elif webui_assets_exist:
         static_dir = Path(__file__).parent / "webui"
         static_dir.mkdir(exist_ok=True)
         app.mount(

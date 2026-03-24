@@ -42,7 +42,7 @@ export default defineConfig({
             target: import.meta.env.VITE_BACKEND_URL || 'http://localhost:9621',
             changeOrigin: true,
             rewrite: endpoint === '/api' ?
-              (path) => path.replace(/^\/api/, '') :
+              (path) => path :
               endpoint === '/docs' || endpoint === '/redoc' || endpoint === '/openapi.json' || endpoint === '/static' ?
                 (path) => path : undefined
           }

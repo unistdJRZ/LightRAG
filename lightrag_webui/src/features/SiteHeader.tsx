@@ -1,14 +1,17 @@
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import Button from '@/components/ui/Button'
 import { SiteInfo, webuiPrefix } from '@/lib/constants'
 import AppSettings from '@/components/AppSettings'
 import { TabsList, TabsTrigger } from '@/components/ui/Tabs'
 import { useSettingsStore } from '@/stores/settings'
-import { useAuthStore } from '@/stores/state'
+import { useAuthStore, useBackendState } from '@/stores/state'
 import { cn } from '@/lib/utils'
 import { useTranslation } from 'react-i18next'
 import { navigationService } from '@/services/navigation'
 import { ZapIcon, GithubIcon, LogOutIcon } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/Tooltip'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/Select'
+import { getWorkspaces } from '@/api/lightrag'
 
 interface NavigationTabProps {
   value: string
@@ -50,6 +53,86 @@ function TabsNavigation() {
           {t('header.api')}
         </NavigationTab>
       </TabsList>
+    </div>
+  )
+}
+
+function WorkspaceSelector() {
+  const { t } = useTranslation()
+  const workspace = useSettingsStore.use.workspace()
+  const defaultWorkspace = useSettingsStore.use.defaultWorkspace()
+  const availableWorkspaces = useSettingsStore.use.availableWorkspaces()
+  const setWorkspace = useSettingsStore.use.setWorkspace()
+  const setWorkspaceInfo = useSettingsStore.use.setWorkspaceInfo()
+  const [isLoading, setIsLoading] = useState(false)
+
+  const workspaceOptions = useMemo(() => {
+    if (availableWorkspaces.length > 0) {
+      return availableWorkspaces
+    }
+    return [{ id: defaultWorkspace, alias: defaultWorkspace }]
+  }, [availableWorkspaces, defaultWorkspace])
+
+  const selectedWorkspace =
+    workspace && workspaceOptions.some((item) => item.id === workspace)
+      ? workspace
+      : defaultWorkspace
+
+  useEffect(() => {
+    let cancelled = false
+
+    const loadWorkspaces = async () => {
+      setIsLoading(true)
+      try {
+        const response = await getWorkspaces()
+        if (!cancelled) {
+          setWorkspaceInfo(response.workspaces || [], response.default_workspace || 'default')
+        }
+      } catch (error) {
+        console.warn('Failed to load workspaces:', error)
+      } finally {
+        if (!cancelled) {
+          setIsLoading(false)
+        }
+      }
+    }
+
+    loadWorkspaces()
+    return () => {
+      cancelled = true
+    }
+  }, [setWorkspaceInfo])
+
+  const handleWorkspaceChange = useCallback((value: string) => {
+    if (value === defaultWorkspace) {
+      setWorkspace(null)
+    } else {
+      setWorkspace(value)
+    }
+    useBackendState.getState().resetHealthCheckTimer()
+  }, [defaultWorkspace, setWorkspace])
+
+  return (
+    <div className="w-[180px]">
+      <span className="sr-only">{t('header.workspace', 'Workspace')}</span>
+      <Select
+        value={selectedWorkspace}
+        onValueChange={handleWorkspaceChange}
+        disabled={isLoading || workspaceOptions.length === 0}
+      >
+        <SelectTrigger className="h-8 text-xs">
+          <SelectValue placeholder={t('header.workspace', 'Workspace')} />
+        </SelectTrigger>
+        <SelectContent>
+          {workspaceOptions.map((item) => (
+            <SelectItem key={item.id} value={item.id}>
+              {item.id === defaultWorkspace
+                ? `${item.alias} (${t('header.defaultWorkspace', 'default')})`
+                : item.alias}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
     </div>
   )
 }
@@ -109,8 +192,9 @@ export default function SiteHeader() {
         )}
       </div>
 
-      <nav className="w-[200px] flex items-center justify-end">
+      <nav className="min-w-[400px] w-auto flex items-center justify-end">
         <div className="flex items-center gap-2">
+          <WorkspaceSelector />
           {versionDisplay && (
             <TooltipProvider>
               <Tooltip>

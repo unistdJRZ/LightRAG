@@ -23,9 +23,11 @@ classifiers = [
 dependencies = [
     "aiohttp",
     "configparser",
+    "fastapi>=0.120.2",
     "google-api-core>=2.0.0,<3.0.0",
     "google-genai>=1.0.0,<2.0.0",
     "json_repair",
+    "loguru>=0.7.3",
     "nano-vectordb",
     "networkx",
     "numpy>=1.24.0,<3.0.0",
@@ -37,6 +39,7 @@ dependencies = [
     "setuptools",
     "tenacity",
     "tiktoken",
+    "uvicorn>=0.38.0",
     "xlsxwriter>=3.1.0",
 ]
 

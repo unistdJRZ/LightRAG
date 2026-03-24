@@ -140,8 +140,17 @@ export type QueryRequest = {
   enable_rerank?: boolean
 }
 
+export type QueryReference = {
+  reference_id: string
+  chunk_id: string
+  file_path: string
+  file_id?: string | null
+  content: string
+}
+
 export type QueryResponse = {
   response: string
+  references?: QueryReference[] | null
 }
 
 export type EntityUpdateResponse = {
@@ -249,6 +258,16 @@ export type AuthStatusResponse = {
   webui_description?: string
 }
 
+export type WorkspacesResponse = {
+  default_workspace: string
+  default_workspace_alias?: string
+  workspaces: Array<{
+    id: string
+    alias: string
+  }>
+  count: number
+}
+
 export type PipelineStatusResponse = {
   autoscanned: boolean
   busy: boolean
@@ -278,9 +297,20 @@ export type LoginResponse = {
 export const InvalidApiKeyError = 'Invalid API Key'
 export const RequireApiKeError = 'API Key required'
 
+const normalizedBackendBaseUrl = backendBaseUrl.replace(/\/+$/, '')
+const apiBaseUrl = normalizedBackendBaseUrl ? `${normalizedBackendBaseUrl}/api` : '/api'
+const resolveRootUrl = (path: string): string => {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`
+  return normalizedBackendBaseUrl ? `${normalizedBackendBaseUrl}${normalizedPath}` : normalizedPath
+}
+const resolveApiUrl = (path: string): string => {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`
+  return `${apiBaseUrl}${normalizedPath}`
+}
+
 // Axios instance
 const axiosInstance = axios.create({
-  baseURL: backendBaseUrl,
+  baseURL: apiBaseUrl,
   headers: {
     'Content-Type': 'application/json'
   }
@@ -290,6 +320,18 @@ const axiosInstance = axios.create({
 // Prevent multiple requests from triggering token refresh simultaneously
 let isRefreshingGuestToken = false;
 let refreshTokenPromise: Promise<string> | null = null;
+
+const getActiveWorkspace = (): string | null => {
+  const { workspace, defaultWorkspace } = useSettingsStore.getState()
+  const selectedWorkspace = workspace?.trim()
+  if (!selectedWorkspace) {
+    return null
+  }
+  if (selectedWorkspace === defaultWorkspace) {
+    return null
+  }
+  return selectedWorkspace
+}
 
 // Silent refresh for guest token
 const silentRefreshGuestToken = async (): Promise<string> => {
@@ -302,8 +344,7 @@ const silentRefreshGuestToken = async (): Promise<string> => {
   refreshTokenPromise = (async () => {
     try {
       // Call /auth-status to get new guest token
-      const response = await axios.get('/auth-status', {
-        baseURL: backendBaseUrl,
+      const response = await axios.get(resolveRootUrl('/auth-status'), {
         // This request must skip the interceptor to avoid adding expired token
         headers: { 'X-Skip-Interceptor': 'true' }
       });
@@ -351,6 +392,12 @@ axiosInstance.interceptors.request.use((config) => {
   }
   if (apiKey) {
     config.headers['X-API-Key'] = apiKey
+  }
+  const workspace = getActiveWorkspace()
+  if (workspace) {
+    config.headers['LIGHTRAG-WORKSPACE'] = workspace
+  } else {
+    delete config.headers['LIGHTRAG-WORKSPACE']
   }
   return config
 })
@@ -478,13 +525,28 @@ export const checkHealth = async (): Promise<
   LightragStatus | { status: 'error'; message: string }
 > => {
   try {
-    const response = await axiosInstance.get('/health')
+    const response = await axiosInstance.get(resolveRootUrl('/health'))
     return response.data
   } catch (error) {
     return {
       status: 'error',
       message: errorMessage(error)
     }
+  }
+}
+
+export const getWorkspaces = async (): Promise<WorkspacesResponse> => {
+  try {
+    const response = await axiosInstance.get('/workspaces', { withCredentials: false })
+    return response.data
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.status === 404) {
+      const fallbackResponse = await axiosInstance.get(resolveRootUrl('/workspaces'), {
+        withCredentials: false
+      })
+      return fallbackResponse.data
+    }
+    throw error
   }
 }
 
@@ -530,9 +592,15 @@ export const queryTextStream = async (
   if (apiKey) {
     headers['X-API-Key'] = apiKey;
   }
+  const workspace = getActiveWorkspace();
+  if (workspace) {
+    headers['LIGHTRAG-WORKSPACE'] = workspace;
+  }
+
+  const queryStreamUrl = resolveApiUrl('/query/stream');
 
   try {
-    const response = await fetch(`${backendBaseUrl}/query/stream`, {
+    const response = await fetch(queryStreamUrl, {
       method: 'POST',
       headers: headers,
       body: JSON.stringify(request),
@@ -555,7 +623,7 @@ export const queryTextStream = async (
             const retryHeaders = { ...headers };
             retryHeaders['Authorization'] = `Bearer ${newToken}`;
 
-            const retryResponse = await fetch(`${backendBaseUrl}/query/stream`, {
+            const retryResponse = await fetch(queryStreamUrl, {
               method: 'POST',
               headers: retryHeaders,
               body: JSON.stringify(request),
@@ -637,7 +705,7 @@ export const queryTextStream = async (
       } catch { /* ignore */ }
 
       // Format error message similar to axios interceptor for consistency
-      const url = `${backendBaseUrl}/query/stream`;
+      const url = queryStreamUrl;
       throw new Error(
         `${response.status} ${response.statusText}\n${JSON.stringify(
           { error: errorBody }
@@ -852,7 +920,7 @@ export const deleteDocuments = async (
 export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
   try {
     // Add a timeout to the request to prevent hanging
-    const response = await axiosInstance.get('/auth-status', {
+    const response = await axiosInstance.get(resolveRootUrl('/auth-status'), {
       timeout: 5000, // 5 second timeout
       headers: {
         'Accept': 'application/json' // Explicitly request JSON
@@ -924,7 +992,7 @@ export const loginToServer = async (username: string, password: string): Promise
   formData.append('username', username);
   formData.append('password', password);
 
-  const response = await axiosInstance.post('/login', formData, {
+  const response = await axiosInstance.post(resolveRootUrl('/login'), formData, {
     headers: {
       'Content-Type': 'multipart/form-data'
     }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import traceback
 import asyncio
 import configparser
@@ -125,6 +126,161 @@ config = configparser.ConfigParser()
 config.read("config.ini", "utf-8")
 
 
+def _is_structured_document_segments(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, dict) and "content" in item for item in value
+    )
+
+
+def _normalize_bbox_value(value: Any) -> list[float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+
+    normalized_bbox: list[float] = []
+    for coord in value:
+        if not isinstance(coord, (int, float)):
+            return None
+        normalized_bbox.append(float(coord))
+    return normalized_bbox
+
+
+def _normalize_page_size_value(value: Any) -> list[float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+
+    normalized_page_size: list[float] = []
+    for item in value:
+        if not isinstance(item, (int, float)):
+            return None
+        normalized_page_size.append(float(item))
+    return normalized_page_size
+
+
+def _normalize_content_type_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+
+    content_type = value.strip().lower()
+    return content_type or None
+
+
+def _is_non_indexable_content_type(value: Any) -> bool:
+    return _normalize_content_type_value(value) == "image"
+
+
+def _normalize_structured_document_segments(
+    value: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized_segments: list[dict[str, Any]] = []
+
+    for segment in value:
+        raw_content = str(segment.get("content") or "")
+        content = sanitize_text_for_encoding(raw_content).strip()
+        if not content:
+            continue
+
+        normalized_segment: dict[str, Any] = {"content": content}
+
+        page_id = segment.get("page_id", segment.get("page_idx"))
+        if isinstance(page_id, (int, float)):
+            normalized_segment["page_id"] = int(page_id)
+
+        bbox = _normalize_bbox_value(segment.get("bbox"))
+        if bbox is not None:
+            normalized_segment["bbox"] = bbox
+
+        page_size = _normalize_page_size_value(segment.get("page_size"))
+        if page_size is not None:
+            normalized_segment["page_size"] = page_size
+
+        content_type = _normalize_content_type_value(segment.get("content_type"))
+        if content_type is not None:
+            normalized_segment["content_type"] = content_type
+
+        ocr_chunk_id = segment.get("ocr_chunk_id", segment.get("chunk_id"))
+        if isinstance(ocr_chunk_id, (str, int)):
+            normalized_segment["ocr_chunk_id"] = ocr_chunk_id
+
+        normalized_segments.append(normalized_segment)
+
+    return normalized_segments
+
+
+def _is_enqueue_document_spec(value: Any) -> bool:
+    return isinstance(value, dict) and (
+        "content" in value or "content_segments" in value
+    )
+
+
+def _normalize_enqueue_document(
+    value: str | list[dict[str, Any]] | dict[str, Any],
+) -> dict[str, Any]:
+    if isinstance(value, str):
+        content = sanitize_text_for_encoding(value)
+        if not content.strip():
+            raise ValueError("Document content cannot be empty")
+        return {"content": content}
+
+    if _is_enqueue_document_spec(value):
+        normalized_content = sanitize_text_for_encoding(str(value.get("content") or ""))
+        raw_segments = value.get("content_segments")
+        normalized_segments: list[dict[str, Any]] | None = None
+        if raw_segments is not None:
+            if not _is_structured_document_segments(raw_segments):
+                raise TypeError(
+                    "Structured document input must provide content_segments as a list of content dictionaries"
+                )
+            normalized_segments = _normalize_structured_document_segments(raw_segments)
+            if not normalized_segments:
+                raise ValueError("Structured document content cannot be empty")
+
+        if not normalized_content.strip() and normalized_segments:
+            text_segments = [
+                segment["content"]
+                for segment in normalized_segments
+                if not _is_non_indexable_content_type(segment.get("content_type"))
+            ]
+            fallback_segments = text_segments or [
+                segment["content"] for segment in normalized_segments
+            ]
+            normalized_content = "\n\n".join(fallback_segments)
+
+        if not normalized_content.strip():
+            raise ValueError("Document content cannot be empty")
+
+        normalized_document = {"content": normalized_content}
+        if normalized_segments:
+            normalized_document["content_segments"] = normalized_segments
+        return normalized_document
+
+    if not _is_structured_document_segments(value):
+        raise TypeError("Structured document input must be a list of content dictionaries")
+
+    normalized_segments = _normalize_structured_document_segments(value)
+    if not normalized_segments:
+        raise ValueError("Structured document content cannot be empty")
+
+    return {
+        "content": "\n\n".join(segment["content"] for segment in normalized_segments),
+        "content_segments": normalized_segments,
+    }
+
+
+def _split_chunks_by_indexability(
+    chunks: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    indexable_chunks: dict[str, dict[str, Any]] = {}
+    non_indexable_chunks: dict[str, dict[str, Any]] = {}
+
+    for chunk_id, chunk_data in chunks.items():
+        if _is_non_indexable_content_type(chunk_data.get("content_type")):
+            non_indexable_chunks[chunk_id] = chunk_data
+        else:
+            indexable_chunks[chunk_id] = chunk_data
+
+    return indexable_chunks, non_indexable_chunks
+
+
 @final
 @dataclass
 class LightRAG:
@@ -241,7 +397,7 @@ class LightRAG:
     chunking_func: Callable[
         [
             Tokenizer,
-            str,
+            str | list[dict[str, Any]],
             Optional[str],
             bool,
             int,
@@ -257,7 +413,8 @@ class LightRAG:
     The function should take the following parameters:
 
         - `tokenizer`: A Tokenizer instance to use for tokenization.
-        - `content`: The text to be split into chunks.
+        - `content`: The text to be split into chunks, or a structured OCR segment list
+          like `[{"content": "...", "page_id": 1, "bbox": [x0, y0, x1, y1]}]`.
         - `split_by_character`: The character to split the text on. If None, the text is split into chunks of `chunk_token_size` tokens.
         - `split_by_character_only`: If True, the text is split only on the specified character.
         - `chunk_overlap_token_size`: The number of overlapping tokens between consecutive chunks.
@@ -269,6 +426,9 @@ class LightRAG:
         - `tokens` (int): The number of tokens in the chunk.
         - `content` (str): The text content of the chunk.
         - `chunk_order_index` (int): Zero-based index indicating the chunk's order in the document.
+        - `page_id` (int, optional): Page index inherited from OCR segments.
+        - `bbox` (list[float], optional): Bounding box inherited from OCR segments.
+        - `content_type` (str, optional): OCR chunk type, e.g. `text` or `image`.
 
     Defaults to `chunking_by_token_size` if not specified.
     """
@@ -638,7 +798,7 @@ class LightRAG:
             namespace=NameSpace.VECTOR_STORE_CHUNKS,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"full_doc_id", "content", "file_path"},
+            meta_fields={"full_doc_id", "content", "file_path", "page_id", "bbox"},
         )
 
         # Initialize document status storage
@@ -1119,6 +1279,7 @@ class LightRAG:
         ids: str | list[str] | None = None,
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
+        meta_info: dict[str, Any] | None = None,
     ) -> str:
         """Sync Insert documents with checkpoint support
 
@@ -1131,6 +1292,7 @@ class LightRAG:
             ids: single string of the document ID or list of unique document IDs, if not provided, MD5 hash IDs will be generated
             file_paths: single string of the file path or list of file paths, used for citation
             track_id: tracking ID for monitoring processing status, if not provided, will be generated
+            meta_info: additional metadata for the document(s), stored in doc_status.metadata.meta_info
 
         Returns:
             str: tracking ID for monitoring processing status
@@ -1144,6 +1306,7 @@ class LightRAG:
                 ids,
                 file_paths,
                 track_id,
+                meta_info,
             )
         )
 
@@ -1155,6 +1318,7 @@ class LightRAG:
         ids: str | list[str] | None = None,
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
+        meta_info: dict[str, Any] | None = None,
     ) -> str:
         """Async Insert documents with checkpoint support
 
@@ -1167,6 +1331,7 @@ class LightRAG:
             ids: list of unique document IDs, if not provided, MD5 hash IDs will be generated
             file_paths: list of file paths corresponding to each document, used for citation
             track_id: tracking ID for monitoring processing status, if not provided, will be generated
+            meta_info: additional metadata for the document(s), stored in doc_status.metadata.meta_info
 
         Returns:
             str: tracking ID for monitoring processing status
@@ -1175,7 +1340,13 @@ class LightRAG:
         if track_id is None:
             track_id = generate_track_id("insert")
 
-        await self.apipeline_enqueue_documents(input, ids, file_paths, track_id)
+        await self.apipeline_enqueue_documents(
+            input=input,
+            ids=ids,
+            file_paths=file_paths,
+            track_id=track_id,
+            meta_info=meta_info,
+        )
         await self.apipeline_process_enqueue_documents(
             split_by_character, split_by_character_only
         )
@@ -1254,12 +1425,121 @@ class LightRAG:
             if update_storage:
                 await self._insert_done()
 
+    async def _chunk_document_content(
+        self,
+        content: str,
+        content_segments: list[dict[str, Any]] | None,
+        split_by_character: str | None,
+        split_by_character_only: bool,
+    ) -> list[dict[str, Any]]:
+        if content_segments:
+            chunk_records: list[dict[str, Any]] = []
+            next_chunk_index = 0
+
+            for segment_index, segment in enumerate(content_segments):
+                segment_content = str(segment.get("content") or "").strip()
+                if not segment_content:
+                    continue
+
+                content_type = _normalize_content_type_value(segment.get("content_type"))
+                if _is_non_indexable_content_type(content_type):
+                    normalized_chunk = {
+                        "tokens": 0,
+                        "content": segment_content,
+                        "chunk_order_index": next_chunk_index,
+                        "segment_order_index": segment_index,
+                        "content_type": content_type,
+                    }
+                    if segment.get("page_id") is not None:
+                        normalized_chunk["page_id"] = segment["page_id"]
+                    if segment.get("bbox") is not None:
+                        normalized_chunk["bbox"] = segment["bbox"]
+                    if segment.get("page_size") is not None:
+                        normalized_chunk["page_size"] = segment["page_size"]
+                    if segment.get("ocr_chunk_id") is not None:
+                        normalized_chunk["ocr_chunk_id"] = segment["ocr_chunk_id"]
+
+                    chunk_records.append(normalized_chunk)
+                    next_chunk_index += 1
+                    continue
+
+                segment_chunking_result = self.chunking_func(
+                    self.tokenizer,
+                    segment_content,
+                    split_by_character,
+                    split_by_character_only,
+                    self.chunk_overlap_token_size,
+                    self.chunk_token_size,
+                )
+                if inspect.isawaitable(segment_chunking_result):
+                    segment_chunking_result = await segment_chunking_result
+
+                if not isinstance(segment_chunking_result, (list, tuple)):
+                    raise TypeError(
+                        "chunking_func must return a list or tuple of dicts, "
+                        f"got {type(segment_chunking_result)}"
+                    )
+
+                for chunk_data in segment_chunking_result:
+                    chunk_content = sanitize_text_for_encoding(
+                        str(chunk_data.get("content") or "")
+                    ).strip()
+                    if not chunk_content:
+                        continue
+
+                    normalized_chunk = {
+                        **chunk_data,
+                        "content": chunk_content,
+                        "chunk_order_index": next_chunk_index,
+                        "segment_order_index": segment_index,
+                    }
+                    if segment.get("page_id") is not None:
+                        normalized_chunk["page_id"] = segment["page_id"]
+                    if segment.get("bbox") is not None:
+                        normalized_chunk["bbox"] = segment["bbox"]
+                    if segment.get("page_size") is not None:
+                        normalized_chunk["page_size"] = segment["page_size"]
+                    if content_type is not None:
+                        normalized_chunk["content_type"] = content_type
+                    if segment.get("ocr_chunk_id") is not None:
+                        normalized_chunk["ocr_chunk_id"] = segment["ocr_chunk_id"]
+
+                    chunk_records.append(normalized_chunk)
+                    next_chunk_index += 1
+
+            return chunk_records
+
+        chunking_result = self.chunking_func(
+            self.tokenizer,
+            content,
+            split_by_character,
+            split_by_character_only,
+            self.chunk_overlap_token_size,
+            self.chunk_token_size,
+        )
+
+        if inspect.isawaitable(chunking_result):
+            chunking_result = await chunking_result
+
+        if not isinstance(chunking_result, (list, tuple)):
+            raise TypeError(
+                "chunking_func must return a list or tuple of dicts, "
+                f"got {type(chunking_result)}"
+            )
+
+        return list(chunking_result)
+
     async def apipeline_enqueue_documents(
         self,
-        input: str | list[str],
+        input: str
+        | dict[str, Any]
+        | list[str]
+        | list[dict[str, Any]]
+        | list[str | list[dict[str, Any]] | dict[str, Any]],
         ids: list[str] | None = None,
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
+        meta_info: dict[str, Any] | None = None,
     ) -> str:
         """
         Pipeline for Processing Documents
@@ -1270,10 +1550,13 @@ class LightRAG:
         4. Enqueue document in status
 
         Args:
-            input: Single document string or list of document strings
+            input: Single document string, a single structured OCR segment list,
+                a single document spec `{"content": "...", "content_segments": [...]}`,
+                or a list containing any of those document forms.
             ids: list of unique document IDs, if not provided, MD5 hash IDs will be generated
             file_paths: list of file paths corresponding to each document, used for citation
             track_id: tracking ID for monitoring processing status, if not provided, will be generated with "enqueue" prefix
+            meta_info: additional metadata for the document(s), stored in doc_status.metadata.meta_info
 
         Returns:
             str: tracking ID for monitoring processing status
@@ -1281,29 +1564,41 @@ class LightRAG:
         # Generate track_id if not provided
         if track_id is None or track_id.strip() == "":
             track_id = generate_track_id("enqueue")
-        if isinstance(input, str):
+        if (
+            isinstance(input, str)
+            or _is_structured_document_segments(input)
+            or _is_enqueue_document_spec(input)
+        ):
             input = [input]
         if isinstance(ids, str):
             ids = [ids]
         if isinstance(file_paths, str):
             file_paths = [file_paths]
+        if meta_info is not None and not isinstance(meta_info, dict):
+            raise ValueError("meta_info must be a dictionary")
+
+        normalized_input = [_normalize_enqueue_document(doc) for doc in input]
+
+        normalized_meta_info: dict[str, Any] = {}
+        if meta_info:
+            normalized_meta_info = dict(meta_info)
 
         # If file_paths is provided, ensure it matches the number of documents
         if file_paths is not None:
             if isinstance(file_paths, str):
                 file_paths = [file_paths]
-            if len(file_paths) != len(input):
+            if len(file_paths) != len(normalized_input):
                 raise ValueError(
                     "Number of file paths must match the number of documents"
                 )
         else:
             # If no file paths provided, use placeholder
-            file_paths = ["unknown_source"] * len(input)
+            file_paths = ["unknown_source"] * len(normalized_input)
 
         # 1. Validate ids if provided or generate MD5 hash IDs and remove duplicate contents
         if ids is not None:
             # Check if the number of IDs matches the number of documents
-            if len(ids) != len(input):
+            if len(ids) != len(normalized_input):
                 raise ValueError("Number of IDs must match the number of documents")
 
             # Check if IDs are unique
@@ -1312,31 +1607,51 @@ class LightRAG:
 
             # Generate contents dict and remove duplicates in one pass
             unique_contents = {}
-            for id_, doc, path in zip(ids, input, file_paths):
-                cleaned_content = sanitize_text_for_encoding(doc)
+            for id_, doc, path in zip(ids, normalized_input, file_paths):
+                cleaned_content = doc["content"]
                 if cleaned_content not in unique_contents:
-                    unique_contents[cleaned_content] = (id_, path)
+                    unique_contents[cleaned_content] = (
+                        id_,
+                        path,
+                        doc.get("content_segments"),
+                    )
 
             # Reconstruct contents with unique content
             contents = {
-                id_: {"content": content, "file_path": file_path}
-                for content, (id_, file_path) in unique_contents.items()
+                id_: {
+                    "content": content,
+                    "file_path": file_path,
+                    **(
+                        {"content_segments": content_segments}
+                        if content_segments
+                        else {}
+                    ),
+                }
+                for content, (id_, file_path, content_segments) in unique_contents.items()
             }
         else:
             # Clean input text and remove duplicates in one pass
             unique_content_with_paths = {}
-            for doc, path in zip(input, file_paths):
-                cleaned_content = sanitize_text_for_encoding(doc)
+            for doc, path in zip(normalized_input, file_paths):
+                cleaned_content = doc["content"]
                 if cleaned_content not in unique_content_with_paths:
-                    unique_content_with_paths[cleaned_content] = path
+                    unique_content_with_paths[cleaned_content] = (
+                        path,
+                        doc.get("content_segments"),
+                    )
 
             # Generate contents dict of MD5 hash IDs and documents with paths
             contents = {
                 compute_mdhash_id(content, prefix="doc-"): {
                     "content": content,
                     "file_path": path,
+                    **(
+                        {"content_segments": content_segments}
+                        if content_segments
+                        else {}
+                    ),
                 }
-                for content, path in unique_content_with_paths.items()
+                for content, (path, content_segments) in unique_content_with_paths.items()
             }
 
         # 2. Generate document initial status (without content)
@@ -1351,6 +1666,11 @@ class LightRAG:
                     "file_path"
                 ],  # Store file path in document status
                 "track_id": track_id,  # Store track_id in document status
+                "metadata": (
+                    {"meta_info": dict(normalized_meta_info)}
+                    if normalized_meta_info
+                    else {}
+                ),
             }
             for id_, content_data in contents.items()
         }
@@ -1377,6 +1697,13 @@ class LightRAG:
                 existing_track_id = (
                     existing_doc.get("track_id", "") if existing_doc else ""
                 )
+                duplicate_metadata = {
+                    "is_duplicate": True,
+                    "original_doc_id": doc_id,
+                    "original_track_id": existing_track_id,
+                }
+                if normalized_meta_info:
+                    duplicate_metadata["meta_info"] = dict(normalized_meta_info)
 
                 # Create a new record with unique ID for this duplicate attempt
                 dup_record_id = compute_mdhash_id(f"{doc_id}-{track_id}", prefix="dup-")
@@ -1389,11 +1716,7 @@ class LightRAG:
                     "file_path": file_path,
                     "track_id": track_id,  # Use current track_id for tracking
                     "error_msg": f"Content already exists. Original doc_id: {doc_id}, Status: {existing_status}",
-                    "metadata": {
-                        "is_duplicate": True,
-                        "original_doc_id": doc_id,
-                        "original_track_id": existing_track_id,
-                    },
+                    "metadata": duplicate_metadata,
                 }
 
             # Store duplicate records in doc_status
@@ -1420,6 +1743,11 @@ class LightRAG:
             doc_id: {
                 "content": contents[doc_id]["content"],
                 "file_path": contents[doc_id]["file_path"],
+                **(
+                    {"content_segments": contents[doc_id]["content_segments"]}
+                    if contents[doc_id].get("content_segments")
+                    else {}
+                ),
             }
             for doc_id in new_docs.keys()
         }
@@ -1601,6 +1929,10 @@ class LightRAG:
                     DocStatus.PROCESSING,
                     DocStatus.FAILED,
                 ]:
+                    reset_metadata = dict(getattr(status_doc, "metadata", {}) or {})
+                    reset_metadata.pop("processing_start_time", None)
+                    reset_metadata.pop("processing_end_time", None)
+
                     # Prepare document for status reset to PENDING
                     docs_to_reset[doc_id] = {
                         "status": DocStatus.PENDING,
@@ -1612,7 +1944,7 @@ class LightRAG:
                         "track_id": getattr(status_doc, "track_id", ""),
                         # Clear any error messages and processing metadata
                         "error_msg": "",
-                        "metadata": {},
+                        "metadata": reset_metadata,
                     }
 
                     # Update the status in to_process_docs as well
@@ -1784,6 +2116,7 @@ class LightRAG:
                     current_file_number = 0
                     file_extraction_stage_ok = False
                     processing_start_time = int(time.time())
+                    existing_metadata = dict(getattr(status_doc, "metadata", {}) or {})
                     first_stage_tasks = []
                     entity_relation_task = None
 
@@ -1835,41 +2168,51 @@ class LightRAG:
                                     f"Document content not found in full_docs for doc_id: {doc_id}"
                                 )
                             content = content_data["content"]
+                            content_segments = content_data.get("content_segments")
+                            if not _is_structured_document_segments(content_segments):
+                                content_segments = None
 
-                            # Call chunking function, supporting both sync and async implementations
-                            chunking_result = self.chunking_func(
-                                self.tokenizer,
+                            chunking_result = await self._chunk_document_content(
                                 content,
+                                content_segments,
                                 split_by_character,
                                 split_by_character_only,
-                                self.chunk_overlap_token_size,
-                                self.chunk_token_size,
                             )
 
-                            # If result is awaitable, await to get actual result
-                            if inspect.isawaitable(chunking_result):
-                                chunking_result = await chunking_result
-
-                            # Validate return type
-                            if not isinstance(chunking_result, (list, tuple)):
-                                raise TypeError(
-                                    f"chunking_func must return a list or tuple of dicts, "
-                                    f"got {type(chunking_result)}"
-                                )
-
                             # Build chunks dictionary
-                            chunks: dict[str, Any] = {
-                                compute_mdhash_id(dp["content"], prefix="chunk-"): {
+                            chunks: dict[str, Any] = {}
+                            for dp in chunking_result:
+                                chunk_identity = {
+                                    "doc_id": doc_id,
+                                    "chunk_order_index": dp["chunk_order_index"],
+                                    "content": dp["content"],
+                                    "page_id": dp.get("page_id"),
+                                    "bbox": dp.get("bbox"),
+                                    "content_type": dp.get("content_type"),
+                                }
+                                chunk_id = compute_mdhash_id(
+                                    json.dumps(chunk_identity, sort_keys=True),
+                                    prefix="chunk-",
+                                )
+                                chunks[chunk_id] = {
                                     **dp,
                                     "full_doc_id": doc_id,
                                     "file_path": file_path,  # Add file path to each chunk
                                     "llm_cache_list": [],  # Initialize empty LLM cache list for each chunk
                                 }
-                                for dp in chunking_result
-                            }
 
                             if not chunks:
                                 logger.warning("No document chunks to process")
+
+                            indexable_chunks, non_indexable_chunks = (
+                                _split_chunks_by_indexability(chunks)
+                            )
+                            if non_indexable_chunks:
+                                logger.info(
+                                    "Skipping embedding/entity extraction for %d non-indexable chunks in %s",
+                                    len(non_indexable_chunks),
+                                    file_path,
+                                )
 
                             # Record processing start time
                             processing_start_time = int(time.time())
@@ -1899,6 +2242,7 @@ class LightRAG:
                                             "file_path": file_path,
                                             "track_id": status_doc.track_id,  # Preserve existing track_id
                                             "metadata": {
+                                                **existing_metadata,
                                                 "processing_start_time": processing_start_time
                                             },
                                         }
@@ -1906,7 +2250,7 @@ class LightRAG:
                                 )
                             )
                             chunks_vdb_task = asyncio.create_task(
-                                self.chunks_vdb.upsert(chunks)
+                                self.chunks_vdb.upsert(indexable_chunks)
                             )
                             text_chunks_task = asyncio.create_task(
                                 self.text_chunks.upsert(chunks)
@@ -1924,12 +2268,17 @@ class LightRAG:
                             await asyncio.gather(*first_stage_tasks)
 
                             # Stage 2: Process entity relation graph (after text_chunks are saved)
-                            entity_relation_task = asyncio.create_task(
-                                self._process_extract_entities(
-                                    chunks, pipeline_status, pipeline_status_lock
+                            if indexable_chunks:
+                                entity_relation_task = asyncio.create_task(
+                                    self._process_extract_entities(
+                                        indexable_chunks,
+                                        pipeline_status,
+                                        pipeline_status_lock,
+                                    )
                                 )
-                            )
-                            chunk_results = await entity_relation_task
+                                chunk_results = await entity_relation_task
+                            else:
+                                chunk_results = []
                             file_extraction_stage_ok = True
 
                         except Exception as e:
@@ -1992,6 +2341,7 @@ class LightRAG:
                                         "file_path": file_path,
                                         "track_id": status_doc.track_id,  # Preserve existing track_id
                                         "metadata": {
+                                            **existing_metadata,
                                             "processing_start_time": processing_start_time,
                                             "processing_end_time": processing_end_time,
                                         },
@@ -2049,6 +2399,7 @@ class LightRAG:
                                             "file_path": file_path,
                                             "track_id": status_doc.track_id,  # Preserve existing track_id
                                             "metadata": {
+                                                **existing_metadata,
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
                                             },
@@ -2117,6 +2468,7 @@ class LightRAG:
                                             "file_path": file_path,
                                             "track_id": status_doc.track_id,  # Preserve existing track_id
                                             "metadata": {
+                                                **existing_metadata,
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
                                             },
@@ -2197,6 +2549,9 @@ class LightRAG:
     async def _process_extract_entities(
         self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None
     ) -> list:
+        if not chunk:
+            return []
+
         try:
             chunk_results = await extract_entities(
                 chunk,
@@ -2562,7 +2917,8 @@ class LightRAG:
                     "references": [
                         {
                             "reference_id": str,     # Reference identifier
-                            "file_path": str         # Corresponding file path
+                            "file_path": str,        # Corresponding file path
+                            "file_id": str | None    # file_id from metadata.meta_info when available
                         }
                     ]
                 },
@@ -2652,6 +3008,7 @@ class LightRAG:
                 hashing_kv=self.llm_response_cache,
                 system_prompt=None,
                 chunks_vdb=self.chunks_vdb,
+                doc_status_db=self.doc_status,
             )
         elif data_param.mode == "naive":
             logger.debug(f"[aquery_data] Using naive_query for mode: {data_param.mode}")
@@ -2662,6 +3019,7 @@ class LightRAG:
                 global_config,
                 hashing_kv=self.llm_response_cache,
                 system_prompt=None,
+                doc_status_db=self.doc_status,
             )
         elif data_param.mode == "bypass":
             logger.debug("[aquery_data] Using bypass mode")
@@ -2749,6 +3107,7 @@ class LightRAG:
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
                     chunks_vdb=self.chunks_vdb,
+                    doc_status_db=self.doc_status,
                 )
             elif param.mode == "naive":
                 query_result = await naive_query(
@@ -2758,6 +3117,7 @@ class LightRAG:
                     global_config,
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
+                    doc_status_db=self.doc_status,
                 )
             elif param.mode == "bypass":
                 # Bypass mode: directly use LLM without knowledge retrieval
@@ -2821,6 +3181,9 @@ class LightRAG:
 
             # Extract structured data from query result
             raw_data = query_result.raw_data or {}
+            if isinstance(raw_data.get("data"), dict):
+                # Convenience alias for callers that read references directly.
+                raw_data["references"] = raw_data["data"].get("references", [])
             raw_data["llm_response"] = {
                 "content": query_result.content
                 if not query_result.is_streaming

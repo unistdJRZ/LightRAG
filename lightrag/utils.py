@@ -136,6 +136,8 @@ async def safe_vdb_operation_with_exception(
     max_retries: int = 3,
     retry_delay: float = 0.2,
     logger_func: Optional[Callable] = None,
+    failure_context: Any | Callable[[], Any] | None = None,
+    failure_context_max_chars: int = 2000,
 ) -> None:
     """
     Safely execute vector database operations with retry mechanism and exception handling.
@@ -150,6 +152,8 @@ async def safe_vdb_operation_with_exception(
         max_retries: Maximum number of retry attempts
         retry_delay: Delay between retries in seconds
         logger_func: Logger function to use for error messages
+        failure_context: Optional context payload (or callable returning payload) logged only on final failure
+        failure_context_max_chars: Max characters for serialized failure context logs
 
     Raises:
         Exception: When operation fails after all retry attempts
@@ -163,6 +167,36 @@ async def safe_vdb_operation_with_exception(
         except Exception as e:
             if attempt >= max_retries - 1:
                 error_msg = f"VDB {operation_name} failed for {entity_name} after {max_retries} attempts: {e}"
+                if failure_context is not None:
+                    context_obj = None
+                    try:
+                        context_obj = (
+                            failure_context()
+                            if callable(failure_context)
+                            else failure_context
+                        )
+                        try:
+                            context_text = json.dumps(
+                                context_obj,
+                                ensure_ascii=False,
+                                default=str,
+                                allow_nan=False,
+                            )
+                        except Exception:
+                            context_text = repr(context_obj)
+                    except Exception as context_error:
+                        context_text = (
+                            f"<unavailable failure_context: {context_error}>"
+                        )
+
+                    if len(context_text) > failure_context_max_chars:
+                        context_text = (
+                            context_text[:failure_context_max_chars]
+                            + "...(truncated)"
+                        )
+
+                    error_msg += f" | failure_context={context_text}"
+
                 log_func(error_msg)
                 raise Exception(error_msg) from e
             else:
@@ -3258,6 +3292,10 @@ def convert_to_user_format(
             "file_path": chunk.get("file_path", "unknown_source"),
             "chunk_id": chunk.get("chunk_id", ""),
         }
+        if chunk.get("page_id") is not None:
+            chunk_data["page_id"] = chunk.get("page_id")
+        if chunk.get("bbox") is not None:
+            chunk_data["bbox"] = chunk.get("bbox")
         formatted_chunks.append(chunk_data)
 
     logger.debug(
@@ -3286,67 +3324,123 @@ def convert_to_user_format(
     }
 
 
-def generate_reference_list_from_chunks(
+async def generate_reference_list_from_chunks(
     chunks: list[dict],
-) -> tuple[list[dict], list[dict]]:
+    doc_status_storage: Any | None = None,
+) -> tuple[list[dict[str, Any]], list[dict]]:
     """
-    Generate reference list from chunks, prioritizing by occurrence frequency.
+    Generate chunk-level reference list from chunks.
 
-    This function extracts file_paths from chunks, counts their occurrences,
-    sorts by frequency and first appearance order, creates reference_id mappings,
-    and builds a reference_list structure.
+    Each unique chunk gets its own reference entry so API references can be
+    returned in chunk granularity.
 
     Args:
         chunks: List of chunk dictionaries with file_path information
+        doc_status_storage: Optional doc status storage for resolving file_id
+            from metadata.meta_info.file_id
 
     Returns:
-        tuple: (reference_list, updated_chunks_with_reference_ids)
-            - reference_list: List of dicts with reference_id and file_path
+        tuple: (reference_entries, updated_chunks_with_reference_ids)
+            - reference_entries: List with schema:
+              [{"reference_id": "...", "chunk_id": "...", "file_path": "...", "file_id": "..."}]
             - updated_chunks_with_reference_ids: Original chunks with reference_id field added
     """
+
+    def _extract_file_id_from_doc_status(doc_status: Any) -> str | None:
+        if not isinstance(doc_status, dict):
+            return None
+
+        metadata = doc_status.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return None
+
+        meta_info = metadata.get("meta_info", {})
+        if isinstance(meta_info, dict) and meta_info.get("file_id") is not None:
+            return str(meta_info.get("file_id"))
+
+        if metadata.get("file_id") is not None:
+            return str(metadata.get("file_id"))
+
+        return None
+
     if not chunks:
         return [], []
 
-    # 1. Extract all valid file_paths and count their occurrences
-    file_path_counts = {}
+    # 1. Build chunk-level references in first-appearance order
+    reference_entries: list[dict[str, Any]] = []
+    chunk_id_to_ref_id: dict[str, str] = {}
+    resolved_chunk_ids: list[str] = []
+    generated_chunk_counter = 0
+
     for chunk in chunks:
-        file_path = chunk.get("file_path", "")
-        if file_path and file_path != "unknown_source":
-            file_path_counts[file_path] = file_path_counts.get(file_path, 0) + 1
+        chunk_id = chunk.get("chunk_id")
+        if not isinstance(chunk_id, str) or not chunk_id:
+            generated_chunk_counter += 1
+            chunk_id = f"chunk-unknown-{generated_chunk_counter}"
 
-    # 2. Sort file paths by frequency (descending), then by first appearance order
-    # Create a list of (file_path, count, first_index) tuples
-    file_path_with_indices = []
-    seen_paths = set()
-    for i, chunk in enumerate(chunks):
-        file_path = chunk.get("file_path", "")
-        if file_path and file_path != "unknown_source" and file_path not in seen_paths:
-            file_path_with_indices.append((file_path, file_path_counts[file_path], i))
-            seen_paths.add(file_path)
+        resolved_chunk_ids.append(chunk_id)
 
-    # Sort by count (descending), then by first appearance index (ascending)
-    sorted_file_paths = sorted(file_path_with_indices, key=lambda x: (-x[1], x[2]))
-    unique_file_paths = [item[0] for item in sorted_file_paths]
+        if chunk_id in chunk_id_to_ref_id:
+            continue
 
-    # 3. Create mapping from file_path to reference_id (prioritized by frequency)
-    file_path_to_ref_id = {}
-    for i, file_path in enumerate(unique_file_paths):
-        file_path_to_ref_id[file_path] = str(i + 1)
+        reference_id = str(len(reference_entries) + 1)
+        chunk_id_to_ref_id[chunk_id] = reference_id
+        reference_entries.append(
+            {
+                "reference_id": reference_id,
+                "chunk_id": chunk_id,
+                "file_path": chunk.get("file_path", "unknown_source"),
+                "full_doc_id": chunk.get("full_doc_id"),
+                "page_id": chunk.get("page_id"),
+                "bbox": chunk.get("bbox"),
+            }
+        )
 
-    # 4. Add reference_id field to each chunk
+    # 2. Add reference_id back to each chunk
     updated_chunks = []
-    for chunk in chunks:
+    for chunk, resolved_chunk_id in zip(chunks, resolved_chunk_ids):
         chunk_copy = chunk.copy()
-        file_path = chunk_copy.get("file_path", "")
-        if file_path and file_path != "unknown_source":
-            chunk_copy["reference_id"] = file_path_to_ref_id[file_path]
-        else:
-            chunk_copy["reference_id"] = ""
+        chunk_copy["chunk_id"] = resolved_chunk_id
+        chunk_copy["reference_id"] = chunk_id_to_ref_id.get(resolved_chunk_id, "")
         updated_chunks.append(chunk_copy)
 
-    # 5. Build reference_list
-    reference_list = []
-    for i, file_path in enumerate(unique_file_paths):
-        reference_list.append({"reference_id": str(i + 1), "file_path": file_path})
+    # 3. Resolve file_id for each reference entry
+    doc_status_by_doc_id: dict[str, Any] = {}
+    doc_status_by_file_path: dict[str, Any] = {}
 
-    return reference_list, updated_chunks
+    for reference in reference_entries:
+        resolved_file_id: str | None = None
+        file_path = reference.get("file_path", "")
+        full_doc_id = reference.get("full_doc_id")
+
+        if doc_status_storage is not None:
+            if isinstance(full_doc_id, str) and full_doc_id:
+                if full_doc_id not in doc_status_by_doc_id:
+                    try:
+                        doc_status_by_doc_id[full_doc_id] = await doc_status_storage.get_by_id(
+                            full_doc_id
+                        )
+                    except Exception:
+                        doc_status_by_doc_id[full_doc_id] = None
+                resolved_file_id = _extract_file_id_from_doc_status(
+                    doc_status_by_doc_id.get(full_doc_id)
+                )
+
+            # Fallback: lookup by file_path when doc_id lookup has no file_id.
+            if resolved_file_id is None:
+                if file_path and file_path != "unknown_source":
+                    if file_path not in doc_status_by_file_path:
+                        try:
+                            doc_status_by_file_path[file_path] = (
+                                await doc_status_storage.get_doc_by_file_path(file_path)
+                            )
+                        except Exception:
+                            doc_status_by_file_path[file_path] = None
+                    resolved_file_id = _extract_file_id_from_doc_status(
+                        doc_status_by_file_path.get(file_path)
+                    )
+
+        reference["file_id"] = resolved_file_id
+        reference.pop("full_doc_id", None)
+
+    return reference_entries, updated_chunks

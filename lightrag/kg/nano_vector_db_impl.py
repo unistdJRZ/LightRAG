@@ -124,6 +124,15 @@ class NanoVectorDBStorage(BaseVectorStorage):
         embeddings_list = await asyncio.gather(*embedding_tasks)
 
         embeddings = np.concatenate(embeddings_list)
+        non_finite_count = int(np.count_nonzero(~np.isfinite(embeddings)))
+        if non_finite_count > 0:
+            logger.warning(
+                "[%s] Detected %d non-finite embedding values in %s, replacing with 0",
+                self.workspace,
+                non_finite_count,
+                self.namespace,
+            )
+            embeddings = np.nan_to_num(embeddings, nan=0.0, posinf=0.0, neginf=0.0)
         if len(embeddings) == len(list_data):
             for i, d in enumerate(list_data):
                 # Compress vector using Float16 + zlib + Base64 for storage optimization

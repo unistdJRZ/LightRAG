@@ -99,6 +99,35 @@ def parse_args() -> argparse.Namespace:
         default=get_env_value("PORT", 9621, int),
         help="Server port (default: from env or 9621)",
     )
+    parser.add_argument(
+        "--webui-dev",
+        dest="webui_dev",
+        action="store_true",
+        default=get_env_value("WEBUI_DEV", True, bool),
+        help="Run WebUI in Vite dev mode via `bun run dev` and disable static WebUI mounting (default: from env or True)",
+    )
+    parser.add_argument(
+        "--no-webui-dev",
+        dest="webui_dev",
+        action="store_false",
+        help="Disable WebUI dev mode and use static WebUI mounting behavior",
+    )
+    parser.add_argument(
+        "--webui-dev-host",
+        default=get_env_value("WEBUI_DEV_HOST", "127.0.0.1"),
+        help="Host used by the WebUI dev server (default: from env or 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--webui-dev-port",
+        type=int,
+        default=get_env_value("WEBUI_DEV_PORT", 5173, int),
+        help="Port used by the WebUI dev server (default: from env or 5173)",
+    )
+    parser.add_argument(
+        "--webui-dev-public-url",
+        default=get_env_value("WEBUI_DEV_PUBLIC_URL", None, special_none=True),
+        help="Public URL used for redirects to WebUI dev server (default: auto-generated from host/port)",
+    )
 
     # Directory configuration
     parser.add_argument(
@@ -385,9 +414,24 @@ def parse_args() -> argparse.Namespace:
 
     # PDF decryption password
     args.pdf_decrypt_password = get_env_value("PDF_DECRYPT_PASSWORD", None)
+    # Added for /documents/register external OCR workflow
+    args.ocr_server_url = get_env_value("OCR_SERVER_URL", None)
+    args.ocr_poll_timeout_seconds = get_env_value(
+        "OCR_POLL_TIMEOUT_SECONDS", 300, int
+    )
+    args.ocr_request_timeout_seconds = get_env_value(
+        "OCR_REQUEST_TIMEOUT_SECONDS", 300, int
+    )
 
     # Add environment variables that were previously read directly
-    args.cors_origins = get_env_value("CORS_ORIGINS", "*")
+    default_cors_origins = (
+        "http://localhost:3000;http://127.0.0.1:3000;"
+        "http://localhost:5173;http://127.0.0.1:5173"
+    )
+    args.cors_origins = get_env_value(
+        "CORS_ALLOW_ORIGIN",
+        get_env_value("CORS_ORIGINS", default_cors_origins),
+    )
     args.summary_language = get_env_value("SUMMARY_LANGUAGE", DEFAULT_SUMMARY_LANGUAGE)
     args.entity_types = get_env_value("ENTITY_TYPES", DEFAULT_ENTITY_TYPES, list)
     args.whitelist_paths = get_env_value("WHITELIST_PATHS", "/health,/api/*")

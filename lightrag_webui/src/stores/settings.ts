@@ -7,6 +7,7 @@ import { Message, QueryRequest } from '@/api/lightrag'
 type Theme = 'dark' | 'light' | 'system'
 type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' | 'ko'
 type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api'
+type WorkspaceOption = { id: string; alias: string }
 
 interface SettingsState {
   // Document manager settings
@@ -66,6 +67,13 @@ interface SettingsState {
   apiKey: string | null
   setApiKey: (key: string | null) => void
 
+  // Workspace settings
+  workspace: string | null
+  defaultWorkspace: string
+  availableWorkspaces: WorkspaceOption[]
+  setWorkspace: (workspace: string | null) => void
+  setWorkspaceInfo: (workspaces: WorkspaceOption[], defaultWorkspace: string) => void
+
   // App settings
   theme: Theme
   setTheme: (theme: Theme) => void
@@ -113,6 +121,9 @@ const useSettingsStoreBase = create<SettingsState>()(
       enableHealthCheck: true,
 
       apiKey: null,
+      workspace: null,
+      defaultWorkspace: 'default',
+      availableWorkspaces: [],
 
       currentTab: 'documents',
       showFileName: false,
@@ -183,6 +194,36 @@ const useSettingsStoreBase = create<SettingsState>()(
       setEnableHealthCheck: (enable: boolean) => set({ enableHealthCheck: enable }),
 
       setApiKey: (apiKey: string | null) => set({ apiKey }),
+      setWorkspace: (workspace: string | null) => {
+        const normalized = workspace?.trim() || null
+        set({ workspace: normalized })
+      },
+      setWorkspaceInfo: (workspaces: WorkspaceOption[], defaultWorkspace: string) => {
+        const normalizedDefault = defaultWorkspace?.trim() || 'default'
+        const normalizedList = workspaces
+          .map((item) => ({
+            id: item.id?.trim(),
+            alias: item.alias?.trim() || item.id?.trim()
+          }))
+          .filter((item): item is WorkspaceOption => !!item.id && item.id.length > 0)
+          .filter((item, index, array) => array.findIndex((candidate) => candidate.id === item.id) === index)
+
+        if (!normalizedList.some((item) => item.id === normalizedDefault)) {
+          normalizedList.unshift({ id: normalizedDefault, alias: normalizedDefault })
+        }
+
+        set((state) => {
+          let nextWorkspace = state.workspace
+          if (nextWorkspace && !normalizedList.some((item) => item.id === nextWorkspace)) {
+            nextWorkspace = normalizedDefault
+          }
+          return {
+            defaultWorkspace: normalizedDefault,
+            availableWorkspaces: normalizedList,
+            workspace: nextWorkspace
+          }
+        })
+      },
 
       setCurrentTab: (tab: Tab) => set({ currentTab: tab }),
 
@@ -238,7 +279,7 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 19,
+      version: 21,
       migrate: (state: any, version: number) => {
         if (version < 2) {
           state.showEdgeLabel = false
@@ -340,6 +381,35 @@ const useSettingsStoreBase = create<SettingsState>()(
           if (state.querySettings) {
             delete state.querySettings.response_type
           }
+        }
+        if (version < 20) {
+          state.workspace = null
+          state.defaultWorkspace = 'default'
+          state.availableWorkspaces = []
+        }
+        if (version < 21) {
+          const legacyWorkspaces = Array.isArray(state.availableWorkspaces)
+            ? state.availableWorkspaces
+            : []
+          state.availableWorkspaces = legacyWorkspaces
+            .map((item: string | WorkspaceOption) => {
+              if (typeof item === 'string') {
+                const normalized = item.trim()
+                return normalized ? { id: normalized, alias: normalized } : null
+              }
+              if (item && typeof item.id === 'string') {
+                const normalizedId = item.id.trim()
+                if (!normalizedId) {
+                  return null
+                }
+                return {
+                  id: normalizedId,
+                  alias: item.alias?.trim() || normalizedId
+                }
+              }
+              return null
+            })
+            .filter((item: WorkspaceOption | null): item is WorkspaceOption => item !== null)
         }
         return state
       }
