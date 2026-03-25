@@ -5,6 +5,8 @@ import logging
 
 import pipmaster as pm  # Pipmaster for dynamic library install
 
+VLM_ENABLE = False
+
 if not pm.is_installed("aioboto3"):
     pm.install("aioboto3")
 import aioboto3

@@ -68,6 +68,7 @@ def get_default_host(binding_type: str) -> str:
         "gemini": os.getenv(
             "LLM_BINDING_HOST", "https://generativelanguage.googleapis.com"
         ),
+        "qwen": os.getenv("LLM_BINDING_HOST", ""),
     }
     return default_hosts.get(
         binding_type, os.getenv("LLM_BINDING_HOST", "http://localhost:11434")
@@ -261,6 +262,7 @@ def parse_args() -> argparse.Namespace:
             "azure_openai",
             "aws_bedrock",
             "gemini",
+            "qwen",
         ],
         help="LLM binding type (default: from env or ollama)",
     )
@@ -276,6 +278,7 @@ def parse_args() -> argparse.Namespace:
             "aws_bedrock",
             "jina",
             "gemini",
+            "qwen",
         ],
         help="Embedding binding type (default: from env or ollama)",
     )
@@ -283,7 +286,7 @@ def parse_args() -> argparse.Namespace:
         "--rerank-binding",
         type=str,
         default=get_env_value("RERANK_BINDING", DEFAULT_RERANK_BINDING),
-        choices=["null", "cohere", "jina", "aliyun"],
+        choices=["null", "cohere", "jina", "aliyun", "qwen"],
         help=f"Rerank binding type (default: from env or {DEFAULT_RERANK_BINDING})",
     )
 

@@ -268,17 +268,18 @@ def _normalize_enqueue_document(
 
 def _split_chunks_by_indexability(
     chunks: dict[str, dict[str, Any]],
+    vlm_enabled: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    indexable_chunks: dict[str, dict[str, Any]] = {}
-    non_indexable_chunks: dict[str, dict[str, Any]] = {}
+    embeddable_chunks: dict[str, dict[str, Any]] = {}
+    skipped_chunks: dict[str, dict[str, Any]] = {}
 
     for chunk_id, chunk_data in chunks.items():
-        if _is_non_indexable_content_type(chunk_data.get("content_type")):
-            non_indexable_chunks[chunk_id] = chunk_data
+        if _is_non_indexable_content_type(chunk_data.get("content_type")) and not vlm_enabled:
+            skipped_chunks[chunk_id] = chunk_data
         else:
-            indexable_chunks[chunk_id] = chunk_data
+            embeddable_chunks[chunk_id] = chunk_data
 
-    return indexable_chunks, non_indexable_chunks
+    return embeddable_chunks, skipped_chunks
 
 
 @final
@@ -1529,6 +1530,9 @@ class LightRAG:
 
         return list(chunking_result)
 
+    def _embedding_vlm_enabled(self) -> bool:
+        return bool(self.embedding_func and self.embedding_func.vlm_enable)
+
     async def apipeline_enqueue_documents(
         self,
         input: str
@@ -2204,15 +2208,35 @@ class LightRAG:
                             if not chunks:
                                 logger.warning("No document chunks to process")
 
-                            indexable_chunks, non_indexable_chunks = (
-                                _split_chunks_by_indexability(chunks)
+                            embeddable_chunks, skipped_embedding_chunks = (
+                                _split_chunks_by_indexability(
+                                    chunks,
+                                    vlm_enabled=self._embedding_vlm_enabled(),
+                                )
                             )
-                            if non_indexable_chunks:
+                            entity_extractable_chunks = {
+                                chunk_id: chunk_data
+                                for chunk_id, chunk_data in embeddable_chunks.items()
+                                if not _is_non_indexable_content_type(
+                                    chunk_data.get("content_type")
+                                )
+                            }
+                            if skipped_embedding_chunks:
                                 logger.info(
                                     "Skipping embedding/entity extraction for %d non-indexable chunks in %s",
-                                    len(non_indexable_chunks),
+                                    len(skipped_embedding_chunks),
                                     file_path,
                                 )
+                            if self._embedding_vlm_enabled():
+                                image_chunk_count = len(embeddable_chunks) - len(
+                                    entity_extractable_chunks
+                                )
+                                if image_chunk_count > 0:
+                                    logger.info(
+                                        "Embedding %d image chunks without entity extraction in %s",
+                                        image_chunk_count,
+                                        file_path,
+                                    )
 
                             # Record processing start time
                             processing_start_time = int(time.time())
@@ -2250,7 +2274,7 @@ class LightRAG:
                                 )
                             )
                             chunks_vdb_task = asyncio.create_task(
-                                self.chunks_vdb.upsert(indexable_chunks)
+                                self.chunks_vdb.upsert(embeddable_chunks)
                             )
                             text_chunks_task = asyncio.create_task(
                                 self.text_chunks.upsert(chunks)
@@ -2268,10 +2292,10 @@ class LightRAG:
                             await asyncio.gather(*first_stage_tasks)
 
                             # Stage 2: Process entity relation graph (after text_chunks are saved)
-                            if indexable_chunks:
+                            if entity_extractable_chunks:
                                 entity_relation_task = asyncio.create_task(
                                     self._process_extract_entities(
-                                        indexable_chunks,
+                                        entity_extractable_chunks,
                                         pipeline_status,
                                         pipeline_status_lock,
                                     )

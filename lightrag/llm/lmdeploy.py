@@ -1,5 +1,7 @@
 import pipmaster as pm  # Pipmaster for dynamic library install
 
+VLM_ENABLE = False
+
 # install specific modules
 if not pm.is_installed("lmdeploy"):
     pm.install("lmdeploy[all]")

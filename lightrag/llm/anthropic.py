@@ -20,6 +20,8 @@ if not pm.is_installed("voyageai"):
     pm.install("voyageai")
 import voyageai
 
+VLM_ENABLE = False
+
 from anthropic import (
     AsyncAnthropic,
     APIConnectionError,

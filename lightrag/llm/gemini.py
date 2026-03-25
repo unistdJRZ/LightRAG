@@ -9,6 +9,8 @@ implementation mirrors the OpenAI helpers while relying on the official
 
 from __future__ import annotations
 
+VLM_ENABLE = False
+
 import os
 from collections.abc import AsyncIterator
 from functools import lru_cache

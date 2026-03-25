@@ -6,6 +6,8 @@ from urllib.parse import urlparse
 
 import pipmaster as pm
 
+VLM_ENABLE = False
+
 # install specific modules
 if not pm.is_installed("ollama"):
     pm.install("ollama")

@@ -5,6 +5,8 @@ This module provides container implementations for various Large Language Model
 bindings and integrations.
 """
 
+VLM_ENABLE = False
+
 from argparse import ArgumentParser, Namespace
 import argparse
 import json

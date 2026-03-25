@@ -268,6 +268,23 @@ class BaseVectorStorage(StorageNameSpace, ABC):
         safe_model_name = re.sub(r"[^a-zA-Z0-9_]", "_", model_name.lower())
         return f"{safe_model_name}_{embedding_dim}d"
 
+    def _build_embedding_inputs(
+        self, data: dict[str, dict[str, Any]]
+    ) -> list[str | dict[str, str]]:
+        """Build embedding inputs, preserving image chunks for VLM-capable embedders."""
+        if not getattr(self.embedding_func, "vlm_enable", False):
+            return [str(v["content"]) for v in data.values()]
+
+        from .utils import build_multimodal_embedding_input
+
+        return [
+            build_multimodal_embedding_input(
+                v.get("content"),
+                v.get("content_type"),
+            )
+            for v in data.values()
+        ]
+
     @abstractmethod
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None

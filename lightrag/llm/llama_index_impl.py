@@ -7,6 +7,8 @@ from llama_index.core.llms import (
 from typing import List, Optional
 from lightrag.utils import logger
 
+VLM_ENABLE = False
+
 # Install required dependencies
 if not pm.is_installed("llama-index"):
     pm.install("llama-index")

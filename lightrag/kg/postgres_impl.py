@@ -3106,7 +3106,7 @@ class PGVectorStorage(BaseVectorStorage):
             }
             for k, v in data.items()
         ]
-        contents = [v["content"] for v in data.values()]
+        contents = self._build_embedding_inputs(data)
         batches = [
             contents[i : i + self._max_batch_size]
             for i in range(0, len(contents), self._max_batch_size)

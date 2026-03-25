@@ -3,6 +3,8 @@ import re
 import json
 from ..utils import verbose_debug
 
+VLM_ENABLE = False
+
 if sys.version_info < (3, 9):
     pass
 else:

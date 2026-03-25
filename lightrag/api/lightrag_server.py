@@ -476,6 +476,7 @@ def create_app(args):
         "azure_openai",
         "aws_bedrock",
         "gemini",
+        "qwen",
     ]:
         raise Exception("llm binding not supported")
 
@@ -487,6 +488,7 @@ def create_app(args):
         "aws_bedrock",
         "jina",
         "gemini",
+        "qwen",
     ]:
         raise Exception("embedding binding not supported")
 
@@ -894,6 +896,10 @@ def create_app(args):
                 )
             elif binding == "gemini":
                 return create_optimized_gemini_llm_func(config_cache, args, llm_timeout)
+            elif binding == "qwen":
+                raise Exception(
+                    "qwen binding currently supports embedding and reranking only"
+                )
             else:  # openai and compatible
                 # Use optimized function with pre-processed configuration
                 return create_optimized_openai_llm_func(config_cache, args, llm_timeout)
@@ -948,6 +954,7 @@ def create_app(args):
         provider_func = None
         provider_max_token_size = None
         provider_embedding_dim = None
+        provider_vlm_enable = False
 
         try:
             if binding == "openai":
@@ -978,11 +985,16 @@ def create_app(args):
                 from lightrag.llm.lollms import lollms_embed
 
                 provider_func = lollms_embed
+            elif binding == "qwen":
+                from lightrag.llm.transforms_qwen import qwen_embed
+
+                provider_func = qwen_embed
 
             # Extract attributes if provider is an EmbeddingFunc
             if provider_func and isinstance(provider_func, EmbeddingFunc):
                 provider_max_token_size = provider_func.max_token_size
                 provider_embedding_dim = provider_func.embedding_dim
+                provider_vlm_enable = provider_func.vlm_enable
                 logger.debug(
                     f"Extracted from {binding} provider: "
                     f"max_token_size={provider_max_token_size}, "
@@ -1147,6 +1159,22 @@ def create_app(args):
                         kwargs["model"] = model
                     raw_result = await actual_func(**kwargs)
                     return _sanitize_embedding_output(raw_result, len(texts))
+                elif binding == "qwen":
+                    from lightrag.llm.transforms_qwen import qwen_embed
+
+                    actual_func = (
+                        qwen_embed.func
+                        if isinstance(qwen_embed, EmbeddingFunc)
+                        else qwen_embed
+                    )
+                    kwargs = {
+                        "texts": texts,
+                        "embedding_dim": embedding_dim,
+                    }
+                    if model:
+                        kwargs["model"] = model
+                    raw_result = await actual_func(**kwargs)
+                    return _sanitize_embedding_output(raw_result, len(texts))
                 else:  # openai and compatible
                     from lightrag.llm.openai import openai_embed
 
@@ -1190,6 +1218,7 @@ def create_app(args):
             func=optimized_embedding_function,
             max_token_size=final_max_token_size,
             send_dimensions=False,  # Will be set later based on binding requirements
+            vlm_enable=provider_vlm_enable,
             model_name=model,
         )
 
@@ -1256,7 +1285,7 @@ def create_app(args):
     # Determine send_dimensions value based on binding type
     # Jina and Gemini REQUIRE dimension parameter (forced to True)
     # OpenAI and others: controlled by EMBEDDING_SEND_DIM environment variable
-    if args.embedding_binding in ["jina", "gemini"]:
+    if args.embedding_binding in ["jina", "gemini", "qwen"]:
         # Jina and Gemini APIs require dimension parameter - always send it
         send_dimensions = has_embedding_dim_param
         dimension_control = f"forced by {args.embedding_binding.title()} API"
@@ -1296,12 +1325,14 @@ def create_app(args):
     rerank_model_func = None
     if args.rerank_binding != "null":
         from lightrag.rerank import cohere_rerank, jina_rerank, ali_rerank
+        from lightrag.llm.transforms_qwen import qwen_rerank
 
         # Map rerank binding to corresponding function
         rerank_functions = {
             "cohere": cohere_rerank,
             "jina": jina_rerank,
             "aliyun": ali_rerank,
+            "qwen": qwen_rerank,
         }
 
         # Select the appropriate rerank function based on binding
@@ -1352,6 +1383,9 @@ def create_app(args):
 
             return await selected_rerank_func(**kwargs, extra_body=extra_body)
 
+        server_rerank_func.vlm_enable = bool(
+            getattr(selected_rerank_func, "vlm_enable", False)
+        )
         rerank_model_func = server_rerank_func
         logger.info(
             f"Reranking is enabled: {args.rerank_model or 'default model'} using {args.rerank_binding} provider"

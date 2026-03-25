@@ -6,6 +6,8 @@ else:
     from collections.abc import AsyncIterator
 import pipmaster as pm  # Pipmaster for dynamic library install
 
+VLM_ENABLE = False
+
 if not pm.is_installed("aiohttp"):
     pm.install("aiohttp")
 

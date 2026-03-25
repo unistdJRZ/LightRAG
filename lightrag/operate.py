@@ -39,6 +39,7 @@ from lightrag.utils import (
     apply_source_ids_limit,
     merge_source_ids,
     make_relation_chunk_key,
+    render_chunk_content_for_text,
 )
 from lightrag.base import (
     BaseGraphStorage,
@@ -4080,7 +4081,7 @@ async def _build_context_str(
         chunks_context.append(
             {
                 "reference_id": chunk["reference_id"],
-                "content": chunk["content"],
+                "content": render_chunk_content_for_text(chunk),
             }
         )
 
@@ -5006,7 +5007,7 @@ async def naive_query(
         chunks_context.append(
             {
                 "reference_id": chunk["reference_id"],
-                "content": chunk["content"],
+                "content": render_chunk_content_for_text(chunk),
             }
         )
 

@@ -4,6 +4,8 @@ from functools import lru_cache
 
 import pipmaster as pm  # Pipmaster for dynamic library install
 
+VLM_ENABLE = False
+
 # install specific modules
 if not pm.is_installed("transformers"):
     pm.install("transformers")

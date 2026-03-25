@@ -131,6 +131,9 @@ class FaissVectorDBStorage(BaseVectorStorage):
             list_data.append(meta)
             contents.append(v["content"])
 
+        if getattr(self.embedding_func, "vlm_enable", False):
+            contents = self._build_embedding_inputs(data)
+
         # Split into batches for embedding if needed
         batches = [
             contents[i : i + self._max_batch_size]

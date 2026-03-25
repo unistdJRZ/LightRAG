@@ -4,6 +4,8 @@ import logging
 
 from collections.abc import AsyncIterator
 
+VLM_ENABLE = False
+
 import pipmaster as pm
 import tiktoken
 

@@ -476,6 +476,7 @@ class EmbeddingFunc:
     func: callable
     max_token_size: int | None = None
     send_dimensions: bool = False
+    vlm_enable: bool = False
     model_name: str | None = (
         None  # Model name for implementing workspace data isolation in vector DB
     )
@@ -1375,6 +1376,46 @@ def split_string_by_multi_markers(content: str, markers: list[str]) -> list[str]
     content = content if content is not None else ""
     results = re.split("|".join(re.escape(marker) for marker in markers), content)
     return [r.strip() for r in results if r.strip()]
+
+
+def is_image_content_type(content_type: Any) -> bool:
+    """Return True when the declared content type is an image."""
+    return isinstance(content_type, str) and content_type.strip().lower() == "image"
+
+
+def build_multimodal_embedding_input(
+    content: Any,
+    content_type: Any = None,
+) -> str | dict[str, str]:
+    """Build an embedding input item for text-only or multimodal embedders."""
+    normalized_content = str(content or "")
+    if is_image_content_type(content_type):
+        return {"image": normalized_content}
+    return {"text": normalized_content}
+
+
+def render_chunk_content_for_text(chunk: dict[str, Any] | Any) -> str:
+    """Render chunk content for text-only consumers without leaking raw image payloads."""
+    if not isinstance(chunk, dict):
+        return str(chunk or "")
+
+    content = str(chunk.get("content") or "")
+    if not is_image_content_type(chunk.get("content_type")):
+        return content
+
+    metadata_parts: list[str] = []
+    page_id = chunk.get("page_id")
+    if page_id is not None:
+        metadata_parts.append(f"page={page_id}")
+    ocr_chunk_id = chunk.get("ocr_chunk_id")
+    if ocr_chunk_id is not None:
+        metadata_parts.append(f"ocr_chunk_id={ocr_chunk_id}")
+    bbox = chunk.get("bbox")
+    if bbox is not None:
+        metadata_parts.append(f"bbox={bbox}")
+
+    suffix = f" | {' | '.join(metadata_parts)}" if metadata_parts else ""
+    return f"[image chunk omitted{suffix}]"
 
 
 def is_float_regex(value: str) -> bool:
@@ -2680,6 +2721,8 @@ async def apply_rerank_if_enabled(
         return retrieved_docs
 
     try:
+        rerank_is_vlm = bool(getattr(rerank_func, "vlm_enable", False))
+
         # Extract document content for reranking
         document_texts = []
         for doc in retrieved_docs:
@@ -2691,11 +2734,16 @@ async def apply_rerank_if_enabled(
                 or doc.get("document")
                 or str(doc)
             )
-            document_texts.append(content)
+            if rerank_is_vlm:
+                document_texts.append(
+                    build_multimodal_embedding_input(content, doc.get("content_type"))
+                )
+            else:
+                document_texts.append(render_chunk_content_for_text(doc))
 
         # Call the new rerank function that returns index-based results
         rerank_results = await rerank_func(
-            query=query,
+            query={"text": query} if rerank_is_vlm else query,
             documents=document_texts,
             top_n=top_n,
         )
@@ -2820,9 +2868,7 @@ async def process_chunks_unified(
 
         unique_chunks = truncate_list_by_token_size(
             unique_chunks,
-            key=lambda x: "\n".join(
-                json.dumps(item, ensure_ascii=False) for item in [x]
-            ),
+            key=lambda x: render_chunk_content_for_text(x),
             max_token_size=chunk_token_limit,
             tokenizer=tokenizer,
         )
