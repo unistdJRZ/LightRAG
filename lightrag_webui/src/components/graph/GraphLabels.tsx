@@ -10,16 +10,19 @@ import {
   searchLabelsDefaultLimit
 } from '@/lib/constants'
 import { useTranslation } from 'react-i18next'
-import { RefreshCw } from 'lucide-react'
+import { GitMerge, RefreshCw } from 'lucide-react'
+import { toast } from 'sonner'
 import Button from '@/components/ui/Button'
 import { SearchHistoryManager } from '@/utils/SearchHistoryManager'
-import { getPopularLabels, searchLabels } from '@/api/lightrag'
+import { getPopularLabels, mergeSimilarGraphEntities, searchLabels } from '@/api/lightrag'
+import { errorMessage } from '@/lib/utils'
 
 const GraphLabels = () => {
   const { t } = useTranslation()
   const label = useSettingsStore.use.queryLabel()
   const dropdownRefreshTrigger = useSettingsStore.use.searchLabelDropdownRefreshTrigger()
   const [isRefreshing, setIsRefreshing] = useState(false)
+  const [isMerging, setIsMerging] = useState(false)
   const [refreshTrigger, setRefreshTrigger] = useState(0)
   const [selectKey, setSelectKey] = useState(0)
 
@@ -239,6 +242,35 @@ const GraphLabels = () => {
     }
   }, [reloadPopularLabels, bumpDropdownData])
 
+  const handleMergeSimilarEntities = useCallback(async () => {
+    if (isMerging) return
+
+    setIsMerging(true)
+    try {
+      const result = await mergeSimilarGraphEntities()
+      const mergedGroups = result.data?.merged_groups ?? 0
+      const mergedEntities = result.data?.merged_entities ?? 0
+      toast.success(
+        t(
+          'graphPanel.graphLabels.mergeSuccess',
+          'Merged {{groups}} groups and {{entities}} entities.',
+          { groups: mergedGroups, entities: mergedEntities }
+        )
+      )
+      await handleRefresh()
+    } catch (error) {
+      toast.error(
+        t(
+          'graphPanel.graphLabels.mergeError',
+          'Failed to merge graph entities: {{error}}',
+          { error: errorMessage(error) }
+        )
+      )
+    } finally {
+      setIsMerging(false)
+    }
+  }, [handleRefresh, isMerging, t])
+
   return (
     <div className="flex items-center">
       {/* Always show refresh button */}
@@ -251,6 +283,28 @@ const GraphLabels = () => {
         disabled={isRefreshing}
       >
         <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+      </Button>
+      <Button
+        size="sm"
+        variant={controlButtonVariant}
+        onClick={handleMergeSimilarEntities}
+        tooltip={
+          isMerging
+            ? t('graphPanel.graphLabels.mergingTooltip', 'Merging similar entities...')
+            : t(
+                'graphPanel.graphLabels.mergeTooltip',
+                'Merge similar entities in the current workspace graph'
+              )
+        }
+        className="mr-2"
+        disabled={isMerging || isRefreshing}
+      >
+        <GitMerge className={`h-4 w-4 ${isMerging ? 'animate-pulse' : ''}`} />
+        <span>
+          {isMerging
+            ? t('graphPanel.graphLabels.mergingButton', 'Merging...')
+            : t('graphPanel.graphLabels.mergeButton', 'Merge Graph')}
+        </span>
       </Button>
       <div className="w-full min-w-[280px] max-w-[500px]">
         <AsyncSelect<string>

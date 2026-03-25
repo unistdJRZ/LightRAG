@@ -4376,6 +4376,39 @@ class LightRAG:
             )
         )
 
+    async def amerge_similar_entities(
+        self,
+        max_candidates: int = 100,
+        type_whitelist: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Asynchronously merge similar entities inside this LightRAG workspace."""
+        from lightrag.utils_graph import amerge_similar_entities
+
+        return await amerge_similar_entities(
+            self.chunk_entity_relation_graph,
+            self.entities_vdb,
+            self.relationships_vdb,
+            self.llm_model_func,
+            llm_response_cache=self.llm_response_cache,
+            max_candidates=max_candidates,
+            type_whitelist=type_whitelist,
+            entity_chunks_storage=self.entity_chunks,
+            relation_chunks_storage=self.relation_chunks,
+        )
+
+    def merge_similar_entities(
+        self,
+        max_candidates: int = 100,
+        type_whitelist: list[str] | None = None,
+    ) -> dict[str, Any]:
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(
+            self.amerge_similar_entities(
+                max_candidates=max_candidates,
+                type_whitelist=type_whitelist,
+            )
+        )
+
     async def aexport_data(
         self,
         output_path: str,

@@ -36,9 +36,12 @@ dependencies = [
     "pydantic",
     "pypinyin",
     "python-dotenv",
+    "qwen-vl-utils>=0.0.14",
     "setuptools",
     "tenacity",
     "tiktoken",
+    "torch==2.8.0",
+    "transformers>=4.57.0",
     "uvicorn>=0.38.0",
     "xlsxwriter>=3.1.0",
 ]
@@ -164,6 +167,14 @@ Homepage = "https://github.com/HKUDS/LightRAG"
 Documentation = "https://github.com/HKUDS/LightRAG"
 Repository = "https://github.com/HKUDS/LightRAG"
 "Bug Tracker" = "https://github.com/HKUDS/LightRAG/issues"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu129" }
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
 
 [tool.setuptools.packages.find]
 include = ["lightrag*"]

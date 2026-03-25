@@ -1,14 +1,165 @@
 from __future__ import annotations
 
+import json
 import time
 import asyncio
 from typing import Any, cast
+from collections import defaultdict
+
+import json_repair
 
 from .base import DeletionResult
 from .kg.shared_storage import get_storage_keyed_lock
 from .constants import GRAPH_FIELD_SEP
-from .utils import compute_mdhash_id, logger
+from .prompt import PROMPTS
+from .utils import compute_mdhash_id, logger, use_llm_func_with_cache
 from .base import StorageNameSpace
+
+
+class _EntityMergeUnionFind:
+    def __init__(self, items: list[str]):
+        self.parent = {item: item for item in items}
+
+    def find(self, item: str) -> str:
+        parent = self.parent.get(item, item)
+        if parent != item:
+            self.parent[item] = self.find(parent)
+        return self.parent.get(item, item)
+
+    def attach_to(self, item: str, root: str) -> None:
+        item_root = self.find(item)
+        target_root = self.find(root)
+        if item_root != target_root:
+            self.parent[item_root] = target_root
+
+
+def _normalize_entity_merge_type(value: Any) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _build_entity_merge_record(
+    entity_name: str, node_data: dict[str, Any]
+) -> dict[str, str]:
+    return {
+        "entity_name": entity_name,
+        "entity_type": str(node_data.get("entity_type", "") or "").strip(),
+        "description": str(node_data.get("description", "") or "").strip(),
+        "source_id": str(node_data.get("source_id", "") or "").strip(),
+        "file_path": str(node_data.get("file_path", "") or "").strip(),
+    }
+
+
+def _format_entity_group_for_prompt(entity_group: list[dict[str, str]]) -> str:
+    lines: list[str] = []
+    for index, entity in enumerate(entity_group, start=1):
+        lines.extend(
+            [
+                f"Entity {index}:",
+                f"- Name: {entity['entity_name'] or '<empty>'}",
+                f"- Type: {entity['entity_type'] or '<empty>'}",
+                f"- Description: {entity['description'] or '<empty>'}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _parse_llm_json_payload(payload: str) -> dict[str, Any]:
+    text = (payload or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    parsed = json_repair.loads(text)
+    if isinstance(parsed, str):
+        parsed = json.loads(parsed)
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM output is not a JSON object")
+    return parsed
+
+
+def _build_fallback_group_description(entity_group: list[dict[str, str]]) -> str:
+    descriptions: list[str] = []
+    seen_descriptions: set[str] = set()
+    for entity in entity_group:
+        description = entity.get("description", "").strip()
+        if description and description not in seen_descriptions:
+            seen_descriptions.add(description)
+            descriptions.append(description)
+    return "\n\n".join(descriptions)
+
+
+async def _judge_entity_merge_pair(
+    source_entity: dict[str, str],
+    candidate_entity: dict[str, str],
+    similarity_score: float,
+    *,
+    llm_model_func,
+    llm_response_cache=None,
+) -> tuple[bool, str, float]:
+    if _normalize_entity_merge_type(source_entity["entity_type"]) != _normalize_entity_merge_type(
+        candidate_entity["entity_type"]
+    ):
+        return False, "entity type mismatch", 0.0
+
+    prompt = PROMPTS["entity_merge_decision"].format(
+        entity_a_name=source_entity["entity_name"],
+        entity_a_type=source_entity["entity_type"] or "UNKNOWN",
+        entity_a_description=source_entity["description"] or "<empty>",
+        entity_b_name=candidate_entity["entity_name"],
+        entity_b_type=candidate_entity["entity_type"] or "UNKNOWN",
+        entity_b_description=candidate_entity["description"] or "<empty>",
+        similarity_score=f"{similarity_score:.4f}",
+    )
+
+    response, _ = await use_llm_func_with_cache(
+        prompt,
+        llm_model_func,
+        llm_response_cache=llm_response_cache,
+        cache_type="entity_merge_decision",
+    )
+    payload = _parse_llm_json_payload(response)
+    same_entity = bool(payload.get("same_entity", False))
+    reason = str(payload.get("reason", "") or "").strip()
+    try:
+        confidence = float(payload.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return same_entity, reason, confidence
+
+
+async def _canonicalize_entity_group(
+    entity_group: list[dict[str, str]],
+    *,
+    llm_model_func,
+    llm_response_cache=None,
+    language: str,
+    fallback_name: str,
+) -> dict[str, str]:
+    prompt = PROMPTS["entity_merge_canonicalize"].format(
+        entity_type=entity_group[0]["entity_type"] or "UNKNOWN",
+        language=language,
+        entity_group=_format_entity_group_for_prompt(entity_group),
+    )
+    response, _ = await use_llm_func_with_cache(
+        prompt,
+        llm_model_func,
+        llm_response_cache=llm_response_cache,
+        cache_type="entity_merge_canonicalize",
+    )
+    payload = _parse_llm_json_payload(response)
+    entity_name = str(payload.get("entity_name", "") or "").strip() or fallback_name
+    description = (
+        str(payload.get("description", "") or "").strip()
+        or _build_fallback_group_description(entity_group)
+    )
+    return {
+        "entity_name": entity_name,
+        "description": description,
+    }
 
 
 async def _persist_graph_updates(
@@ -1583,6 +1734,199 @@ async def amerge_entities(
         except Exception as e:
             logger.error(f"Error merging entities: {e}")
             raise
+
+
+async def amerge_similar_entities(
+    chunk_entity_relation_graph,
+    entities_vdb,
+    relationships_vdb,
+    llm_model_func,
+    *,
+    llm_response_cache=None,
+    max_candidates: int = 100,
+    type_whitelist: list[str] | None = None,
+    entity_chunks_storage=None,
+    relation_chunks_storage=None,
+) -> dict[str, Any]:
+    """Find and merge similar entities inside the current workspace graph."""
+    if llm_model_func is None:
+        raise ValueError("llm_model_func is required for similar entity merging")
+
+    candidate_limit = max(1, min(int(max_candidates), 100))
+    blocked_types = {
+        _normalize_entity_merge_type(value)
+        for value in (type_whitelist or [])
+        if str(value or "").strip()
+    }
+    language = entities_vdb.global_config.get("addon_params", {}).get(
+        "language", "English"
+    )
+
+    all_nodes = await chunk_entity_relation_graph.get_all_nodes()
+    entities_by_name: dict[str, dict[str, str]] = {}
+    traversal_order: list[str] = []
+    for node in all_nodes:
+        entity_name = str(node.get("id") or node.get("entity_id") or "").strip()
+        if not entity_name:
+            continue
+        entities_by_name[entity_name] = _build_entity_merge_record(entity_name, node)
+        traversal_order.append(entity_name)
+
+    union_find = _EntityMergeUnionFind(traversal_order)
+
+    compared_pairs = 0
+    merged_pairs = 0
+    skipped_roots = 0
+    skipped_types = 0
+
+    for entity_name in traversal_order:
+        if union_find.find(entity_name) != entity_name:
+            skipped_roots += 1
+            continue
+
+        root_entity = entities_by_name[entity_name]
+        root_type = _normalize_entity_merge_type(root_entity["entity_type"])
+        if root_type in blocked_types:
+            skipped_types += 1
+            continue
+
+        query_text = f"{root_entity['entity_name']}\n{root_entity['description']}"
+        embeddings = await entities_vdb.embedding_func([query_text], _priority=5)
+        query_embedding = embeddings[0]
+        if hasattr(query_embedding, "tolist"):
+            query_embedding = query_embedding.tolist()
+        else:
+            query_embedding = list(query_embedding)
+
+        candidate_results = await entities_vdb.query(
+            query_text,
+            candidate_limit + 1,
+            query_embedding=query_embedding,
+        )
+
+        seen_candidate_roots: set[str] = set()
+        for candidate in candidate_results:
+            candidate_name = str(
+                candidate.get("entity_name") or candidate.get("name") or ""
+            ).strip()
+            if not candidate_name or candidate_name not in entities_by_name:
+                continue
+
+            candidate_root = union_find.find(candidate_name)
+            if candidate_root == entity_name or candidate_root in seen_candidate_roots:
+                continue
+            seen_candidate_roots.add(candidate_root)
+
+            candidate_entity = entities_by_name[candidate_root]
+            candidate_type = _normalize_entity_merge_type(candidate_entity["entity_type"])
+            if candidate_type in blocked_types or candidate_type != root_type:
+                continue
+
+            compared_pairs += 1
+            same_entity, _, _ = await _judge_entity_merge_pair(
+                root_entity,
+                candidate_entity,
+                float(candidate.get("distance", 0.0) or 0.0),
+                llm_model_func=llm_model_func,
+                llm_response_cache=llm_response_cache,
+            )
+            if same_entity:
+                union_find.attach_to(candidate_root, entity_name)
+                merged_pairs += 1
+
+    groups_by_root: dict[str, list[str]] = defaultdict(list)
+    for entity_name in traversal_order:
+        groups_by_root[union_find.find(entity_name)].append(entity_name)
+
+    existing_entity_names = set(traversal_order)
+    reserved_targets: set[str] = set()
+    committed_groups: list[dict[str, Any]] = []
+
+    for root_name in traversal_order:
+        if union_find.find(root_name) != root_name:
+            continue
+
+        member_names = groups_by_root.get(root_name, [])
+        if len(member_names) <= 1:
+            continue
+
+        entity_group = [entities_by_name[name] for name in member_names]
+        group_type = entity_group[0]["entity_type"]
+
+        try:
+            canonical_data = await _canonicalize_entity_group(
+                entity_group,
+                llm_model_func=llm_model_func,
+                llm_response_cache=llm_response_cache,
+                language=language,
+                fallback_name=root_name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Entity Merge: canonicalization failed for root '%s': %s",
+                root_name,
+                exc,
+            )
+            canonical_data = {
+                "entity_name": root_name,
+                "description": _build_fallback_group_description(entity_group),
+            }
+
+        target_entity = canonical_data["entity_name"].strip() or root_name
+        if (
+            (target_entity in existing_entity_names and target_entity not in member_names)
+            or target_entity in reserved_targets
+        ):
+            logger.warning(
+                "Entity Merge: canonical target '%s' conflicts with an existing entity, fallback to '%s'",
+                target_entity,
+                root_name,
+            )
+            target_entity = root_name
+
+        reserved_targets.add(target_entity)
+        merge_result = await amerge_entities(
+            chunk_entity_relation_graph,
+            entities_vdb,
+            relationships_vdb,
+            member_names,
+            target_entity,
+            target_entity_data={
+                "description": canonical_data["description"],
+                "entity_type": group_type,
+            },
+            entity_chunks_storage=entity_chunks_storage,
+            relation_chunks_storage=relation_chunks_storage,
+        )
+
+        committed_groups.append(
+            {
+                "root_entity": root_name,
+                "target_entity": target_entity,
+                "entity_type": group_type,
+                "members": member_names,
+                "result": merge_result,
+            }
+        )
+
+        for member_name in member_names:
+            if member_name != target_entity:
+                existing_entity_names.discard(member_name)
+        existing_entity_names.add(target_entity)
+
+    return {
+        "workspace": entities_vdb.global_config.get("workspace", ""),
+        "candidate_limit": candidate_limit,
+        "type_whitelist": sorted(type_whitelist or []),
+        "total_entities": len(traversal_order),
+        "skipped_roots": skipped_roots,
+        "skipped_types": skipped_types,
+        "compared_pairs": compared_pairs,
+        "merged_pairs": merged_pairs,
+        "merged_groups": len(committed_groups),
+        "merged_entities": sum(len(group["members"]) - 1 for group in committed_groups),
+        "groups": committed_groups,
+    }
 
 
 def _merge_attributes(

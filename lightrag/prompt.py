@@ -246,6 +246,62 @@ Description List:
 ---Output---
 """
 
+PROMPTS["entity_merge_decision"] = """---Role---
+You are a knowledge graph entity resolution specialist.
+
+---Task---
+Decide whether two entities should be merged into the same knowledge graph node.
+
+---Rules---
+1. Output MUST be a valid JSON object and nothing else.
+2. Use this JSON schema exactly:
+   {{"same_entity": true|false, "reason": "short reason", "confidence": 0.0}}
+3. If the entity types are different, `same_entity` MUST be false.
+4. `same_entity` can be true when the two entities represent the same concept, model, term, scientific concept, product family, or canonical entity variant, even if they are not literally the same physical instance.
+5. Be conservative. If the evidence is weak or ambiguous, return false.
+6. Base your decision only on the provided names, types, descriptions, and similarity score.
+
+---Input---
+Entity A:
+- Name: {entity_a_name}
+- Type: {entity_a_type}
+- Description: {entity_a_description}
+
+Entity B:
+- Name: {entity_b_name}
+- Type: {entity_b_type}
+- Description: {entity_b_description}
+
+Embedding Similarity Score: {similarity_score}
+
+---Output---
+"""
+
+PROMPTS["entity_merge_canonicalize"] = """---Role---
+You are a knowledge graph normalization specialist.
+
+---Task---
+You will receive a group of entities that have already been judged mergeable and share the same entity type.
+Generate a canonical entity name and a merged description for the final graph node.
+
+---Rules---
+1. Output MUST be a valid JSON object and nothing else.
+2. Use this JSON schema exactly:
+   {{"entity_name": "canonical name", "description": "merged description"}}
+3. The canonical name must be concise, stable, and suitable as a knowledge graph node label.
+4. The description must merge all important information without contradiction when possible.
+5. Keep the entity type unchanged. Do not invent a new type.
+6. The output language must be {language}. Proper nouns may remain in their original language when appropriate.
+
+---Input---
+Entity Type: {entity_type}
+
+Entity Group:
+{entity_group}
+
+---Output---
+"""
+
 PROMPTS["fail_response"] = (
     "Sorry, I'm not able to provide an answer to that question.[no-context]"
 )

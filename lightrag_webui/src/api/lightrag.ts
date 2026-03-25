@@ -174,6 +174,30 @@ export type DocActionResponse = {
   track_id?: string
 }
 
+export type GraphMergeSimilarResponse = {
+  status: 'success' | 'failure'
+  message: string
+  data: {
+    workspace: string
+    candidate_limit: number
+    type_whitelist: string[]
+    total_entities: number
+    skipped_roots: number
+    skipped_types: number
+    compared_pairs: number
+    merged_pairs: number
+    merged_groups: number
+    merged_entities: number
+    groups: Array<{
+      root_entity: string
+      target_entity: string
+      entity_type: string
+      members: string[]
+      result: Record<string, any>
+    }>
+  }
+}
+
 export type ScanResponse = {
   status: 'scanning_started'
   message: string
@@ -1057,6 +1081,17 @@ export const checkEntityNameExists = async (entityName: string): Promise<boolean
     console.error('Error checking entity name:', error)
     return false
   }
+}
+
+export const mergeSimilarGraphEntities = async (
+  maxCandidates: number = 100,
+  typeWhitelist: string[] = []
+): Promise<GraphMergeSimilarResponse> => {
+  const response = await axiosInstance.post('/graph/entities/merge_similar', {
+    max_candidates: maxCandidates,
+    type_whitelist: typeWhitelist
+  })
+  return response.data
 }
 
 /**

@@ -58,6 +58,23 @@ class EntityMergeRequest(BaseModel):
     )
 
 
+class SimilarEntityMergeRequest(BaseModel):
+    workspace: Optional[str] = Field(
+        default=None,
+        description="Target workspace for this request.",
+    )
+    max_candidates: int = Field(
+        default=100,
+        description="Maximum number of similar entity candidates to inspect per root entity.",
+        ge=1,
+        le=100,
+    )
+    type_whitelist: list[str] = Field(
+        default_factory=list,
+        description="Entity types that should be skipped during similar-entity merge traversal.",
+    )
+
+
 class EntityCreateRequest(BaseModel):
     workspace: Optional[str] = Field(
         default=None,
@@ -735,6 +752,60 @@ def create_graph_routes(
             logger.error(traceback.format_exc())
             raise HTTPException(
                 status_code=500, detail=f"Error merging entities: {str(e)}"
+            )
+
+    @router.post(
+        "/graph/entities/merge_similar", dependencies=[Depends(combined_auth)]
+    )
+    async def merge_similar_entities(
+        request: SimilarEntityMergeRequest | None = None,
+    ):
+        """
+        Merge semantically similar entities inside the current workspace graph.
+
+        This endpoint performs a workspace-scoped batch merge process that:
+            1. Retrieves similar entity candidates by embedding search
+            2. Uses LLM checks to decide whether candidate pairs should be merged
+            3. Builds merge groups before committing any graph changes
+            4. Rewrites graph nodes, edges, vectors, and chunk tracking for each merged set
+
+        Request Body:
+            max_candidates (int): Top-k similar entity candidates to inspect per root entity
+            type_whitelist (list[str]): Entity types to skip during traversal and merging
+
+        Response Schema:
+            {
+                "status": "success",
+                "message": "Merged 4 entities across 2 groups",
+                "data": {
+                    "merged_groups": 2,
+                    "merged_entities": 4,
+                    ...
+                }
+            }
+        """
+        payload = request or SimilarEntityMergeRequest()
+        try:
+            result = await rag.amerge_similar_entities(
+                max_candidates=payload.max_candidates,
+                type_whitelist=payload.type_whitelist,
+            )
+            return {
+                "status": "success",
+                "message": (
+                    f"Merged {result.get('merged_entities', 0)} entities across "
+                    f"{result.get('merged_groups', 0)} groups"
+                ),
+                "data": result,
+            }
+        except ValueError as ve:
+            logger.error(f"Validation error merging similar entities: {str(ve)}")
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            logger.error(f"Error merging similar entities: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500, detail=f"Error merging similar entities: {str(e)}"
             )
 
     return router
