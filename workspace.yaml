@@ -3,14 +3,10 @@
 # Legacy format is still supported:
 # workspace: "default,team_a,team_b"
 workspaces:
-  - id: rag_storage
+  - id: default_storage
     alias: Default Workspace
   - id: ornl_test
     alias: 橡树岭测试
-  - id: empty_test_3
-    alias: 测试3
-  - id: empty_test_4
-    alias: 测试4
 
 # Backend dev server (FastAPI)
 backend_host: "0.0.0.0"

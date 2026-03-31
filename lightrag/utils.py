@@ -45,6 +45,13 @@ from lightrag.constants import (
 
 # Precompile regex pattern for JSON sanitization (module-level, compiled once)
 _SURROGATE_PATTERN = re.compile(r"[\uD800-\uDFFF\uFFFE\uFFFF]")
+_DATA_IMAGE_URI_PREFIX_PATTERN = re.compile(
+    r"^\s*(data:image/[-a-zA-Z0-9.+]+;base64,)", re.IGNORECASE
+)
+_MARKDOWN_DATA_IMAGE_PATTERN = re.compile(
+    r"!\[(?P<alt>[^\]]*)\]\(\s*(?P<image>data:image/[-a-zA-Z0-9.+]+;base64,[A-Za-z0-9+/=\s]+?)\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class SafeStreamHandler(logging.StreamHandler):
@@ -1383,14 +1390,99 @@ def is_image_content_type(content_type: Any) -> bool:
     return isinstance(content_type, str) and content_type.strip().lower() == "image"
 
 
+def split_image_content_fields(
+    content: Any,
+    image_base64: Any = None,
+    image_text: Any = None,
+) -> tuple[str | None, str | None]:
+    """Split OCR image payload into image data and trailing caption text.
+
+    Supports both the new structured storage fields and legacy mixed values like:
+    `data:image/jpeg;base64,...)\nFig.4. ...`
+    """
+    explicit_image = str(image_base64 or "").strip() or None
+    explicit_text = str(image_text or "").strip() or None
+    content_str = str(content or "").strip()
+    if explicit_image is not None or explicit_text is not None:
+        if explicit_text is None and content_str and content_str != explicit_image:
+            _, parsed_text = split_image_content_fields(content_str)
+            explicit_text = parsed_text
+        return explicit_image, explicit_text
+
+    if not content_str:
+        return None, None
+
+    prefix_match = _DATA_IMAGE_URI_PREFIX_PATTERN.match(content_str)
+    if not prefix_match:
+        markdown_match = _MARKDOWN_DATA_IMAGE_PATTERN.search(content_str)
+        if markdown_match:
+            image_payload = re.sub(r"\s+", "", markdown_match.group("image"))
+            text_parts = [
+                content_str[: markdown_match.start()].strip(),
+                content_str[markdown_match.end() :].strip(),
+            ]
+            trailing_text = "\n\n".join(part for part in text_parts if part)
+            return image_payload, trailing_text or None
+        return None, content_str
+
+    prefix = prefix_match.group(1)
+    remainder = content_str[prefix_match.end() :]
+    image_chars: list[str] = []
+    split_index = len(remainder)
+    for idx, char in enumerate(remainder):
+        if char.isalnum() or char in "+/=\r\n\t ":
+            image_chars.append(char)
+            continue
+        split_index = idx
+        break
+
+    compact_base64 = re.sub(r"\s+", "", "".join(image_chars))
+    if not compact_base64:
+        return None, content_str
+
+    trailing_text = remainder[split_index:]
+    if trailing_text.startswith(")"):
+        trailing_text = trailing_text[1:]
+    trailing_text = trailing_text.lstrip(" \t\r\n:-")
+
+    return prefix + compact_base64, trailing_text.strip() or None
+
+
+def get_chunk_image_fields(
+    chunk: dict[str, Any] | Any,
+) -> tuple[str | None, str | None]:
+    """Return normalized image payload fields for a chunk-like object."""
+    if isinstance(chunk, dict):
+        return split_image_content_fields(
+            chunk.get("content"),
+            chunk.get("image_base64"),
+            chunk.get("image_text"),
+        )
+    return split_image_content_fields(chunk)
+
+
 def build_multimodal_embedding_input(
     content: Any,
     content_type: Any = None,
+    image_base64: Any = None,
+    image_text: Any = None,
 ) -> str | dict[str, str]:
     """Build an embedding input item for text-only or multimodal embedders."""
     normalized_content = str(content or "")
-    if is_image_content_type(content_type):
-        return {"image": normalized_content}
+    resolved_image, resolved_text = split_image_content_fields(
+        normalized_content,
+        image_base64=image_base64,
+        image_text=image_text,
+    )
+    if resolved_image:
+        multimodal_item: dict[str, str] = {"image": resolved_image}
+        if resolved_text:
+            multimodal_item["text"] = resolved_text
+        return multimodal_item
+    if is_image_content_type(content_type) and resolved_text:
+        return {"text": resolved_text}
+    if resolved_text:
+        return {"text": resolved_text}
     return {"text": normalized_content}
 
 
@@ -2736,7 +2828,12 @@ async def apply_rerank_if_enabled(
             )
             if rerank_is_vlm:
                 document_texts.append(
-                    build_multimodal_embedding_input(content, doc.get("content_type"))
+                    build_multimodal_embedding_input(
+                        content,
+                        doc.get("content_type"),
+                        doc.get("image_base64"),
+                        doc.get("image_text"),
+                    )
                 )
             else:
                 document_texts.append(render_chunk_content_for_text(doc))
@@ -3332,16 +3429,28 @@ def convert_to_user_format(
     # Convert chunks format (chunks already contain complete data)
     formatted_chunks = []
     for i, chunk in enumerate(chunks):
+        resolved_image_base64, resolved_image_text = get_chunk_image_fields(chunk)
+        chunk_content = chunk.get("content", "")
+        if is_image_content_type(chunk.get("content_type")) and resolved_image_base64:
+            chunk_content = resolved_image_base64
         chunk_data = {
             "reference_id": chunk.get("reference_id", ""),
-            "content": chunk.get("content", ""),
+            "content": chunk_content,
             "file_path": chunk.get("file_path", "unknown_source"),
             "chunk_id": chunk.get("chunk_id", ""),
         }
+        if chunk.get("content_type") is not None:
+            chunk_data["content_type"] = chunk.get("content_type")
         if chunk.get("page_id") is not None:
             chunk_data["page_id"] = chunk.get("page_id")
         if chunk.get("bbox") is not None:
             chunk_data["bbox"] = chunk.get("bbox")
+        if chunk.get("ocr_chunk_id") is not None:
+            chunk_data["ocr_chunk_id"] = chunk.get("ocr_chunk_id")
+        if resolved_image_base64 is not None:
+            chunk_data["image_base64"] = resolved_image_base64
+        if resolved_image_text is not None:
+            chunk_data["image_text"] = resolved_image_text
         formatted_chunks.append(chunk_data)
 
     logger.debug(

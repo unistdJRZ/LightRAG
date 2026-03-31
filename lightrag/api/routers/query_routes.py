@@ -12,7 +12,12 @@ from lightrag.api.utils_api import (
     WorkspaceObjectProxy,
     create_workspace_scope_dependency,
 )
-from lightrag.utils import get_content_summary, logger
+from lightrag.utils import (
+    get_content_summary,
+    get_chunk_image_fields,
+    is_image_content_type,
+    logger,
+)
 from pydantic import BaseModel, Field, field_validator
 
 router = APIRouter(tags=["query"])
@@ -162,7 +167,21 @@ class ReferenceItem(BaseModel):
         default=None,
         description="Bounding box of the referenced chunk when available",
     )
-    content: str = Field(description="Preview text of the referenced chunk")
+    content_type: Optional[str] = Field(
+        default=None,
+        description="Referenced chunk content type when available",
+    )
+    content: str = Field(
+        description="Referenced chunk content preview for text, or full content for image chunks"
+    )
+    image_base64: Optional[str] = Field(
+        default=None,
+        description="Full image payload for image chunks when available",
+    )
+    image_text: Optional[str] = Field(
+        default=None,
+        description="Accompanying OCR text for image chunks when available",
+    )
 
 
 class QueryResponse(BaseModel):
@@ -204,22 +223,43 @@ class StreamChunkResponse(BaseModel):
 def _enrich_references_with_chunk_preview(
     references: List[Dict[str, Any]], chunks: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """Attach chunk preview text to references using reference_id mapping."""
+    """Attach chunk content to references using reference_id mapping."""
     if not references:
         return references
 
-    ref_id_to_preview: Dict[str, str] = {}
+    ref_id_to_content: Dict[str, str] = {}
+    ref_id_to_content_type: Dict[str, str] = {}
+    ref_id_to_image_base64: Dict[str, str] = {}
+    ref_id_to_image_text: Dict[str, str] = {}
     for chunk in chunks:
         ref_id = str(chunk.get("reference_id", "")).strip()
         content = chunk.get("content", "")
-        if ref_id and content and ref_id not in ref_id_to_preview:
-            ref_id_to_preview[ref_id] = get_content_summary(str(content))
+        if ref_id and ref_id not in ref_id_to_content:
+            content_type = str(chunk.get("content_type", "")).strip()
+            resolved_image_base64, resolved_image_text = get_chunk_image_fields(chunk)
+            ref_id_to_content[ref_id] = (
+                str(resolved_image_base64 or content)
+                if is_image_content_type(content_type)
+                else get_content_summary(str(content))
+            )
+            if content_type:
+                ref_id_to_content_type[ref_id] = content_type
+            if resolved_image_base64 is not None:
+                ref_id_to_image_base64[ref_id] = resolved_image_base64
+            if resolved_image_text is not None:
+                ref_id_to_image_text[ref_id] = resolved_image_text
 
     enriched_references: List[Dict[str, Any]] = []
     for ref in references:
         ref_copy = ref.copy()
         ref_id = str(ref.get("reference_id", "")).strip()
-        ref_copy["content"] = ref_id_to_preview.get(ref_id, "")
+        ref_copy["content"] = ref_id_to_content.get(ref_id, "")
+        if ref_id in ref_id_to_content_type:
+            ref_copy["content_type"] = ref_id_to_content_type[ref_id]
+        if ref_id in ref_id_to_image_base64:
+            ref_copy["image_base64"] = ref_id_to_image_base64[ref_id]
+        if ref_id in ref_id_to_image_text:
+            ref_copy["image_text"] = ref_id_to_image_text[ref_id]
         enriched_references.append(ref_copy)
 
     return enriched_references
@@ -238,8 +278,11 @@ def _normalize_chunk_level_references(data: Dict[str, Any]) -> List[Dict[str, An
         if not chunk_id:
             continue
         chunk_metadata_by_chunk_id[chunk_id] = {
+            "content_type": chunk.get("content_type"),
             "page_id": chunk.get("page_id"),
             "bbox": chunk.get("bbox"),
+            "image_base64": chunk.get("image_base64"),
+            "image_text": chunk.get("image_text"),
         }
 
     if references and all(
@@ -253,10 +296,25 @@ def _normalize_chunk_level_references(data: Dict[str, Any]) -> List[Dict[str, An
                 str(ref_copy.get("chunk_id", "")).strip()
             )
             if chunk_meta:
+                if (
+                    ref_copy.get("content_type") is None
+                    and chunk_meta.get("content_type") is not None
+                ):
+                    ref_copy["content_type"] = chunk_meta["content_type"]
                 if ref_copy.get("page_id") is None and chunk_meta.get("page_id") is not None:
                     ref_copy["page_id"] = chunk_meta["page_id"]
                 if ref_copy.get("bbox") is None and chunk_meta.get("bbox") is not None:
                     ref_copy["bbox"] = chunk_meta["bbox"]
+                if (
+                    ref_copy.get("image_base64") is None
+                    and chunk_meta.get("image_base64") is not None
+                ):
+                    ref_copy["image_base64"] = chunk_meta["image_base64"]
+                if (
+                    ref_copy.get("image_text") is None
+                    and chunk_meta.get("image_text") is not None
+                ):
+                    ref_copy["image_text"] = chunk_meta["image_text"]
             normalized_references.append(ref_copy)
         return normalized_references
 
@@ -281,8 +339,11 @@ def _normalize_chunk_level_references(data: Dict[str, Any]) -> List[Dict[str, An
                 "chunk_id": chunk_id,
                 "file_path": chunk.get("file_path", "unknown_source"),
                 "file_id": file_id_by_reference_id.get(ref_id),
+                "content_type": chunk.get("content_type"),
                 "page_id": chunk.get("page_id"),
                 "bbox": chunk.get("bbox"),
+                "image_base64": chunk.get("image_base64"),
+                "image_text": chunk.get("image_text"),
             }
         )
         seen_reference_ids.add(ref_id)

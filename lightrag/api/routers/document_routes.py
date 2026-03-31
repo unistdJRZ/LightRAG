@@ -32,6 +32,7 @@ from lightrag.utils import (
     generate_track_id,
     compute_mdhash_id,
     sanitize_text_for_encoding,
+    split_image_content_fields,
 )
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.api.utils_api import (
@@ -1442,15 +1443,25 @@ def _extract_structured_segments_from_ocr_chunks(
         if not isinstance(raw_markdown, str):
             continue
 
-        content = (
-            sanitize_text_for_encoding(raw_markdown).strip()
-            if content_type == "image"
-            else _normalize_markdown_content_for_enqueue(raw_markdown)
-        )
-        if not content:
+        image_base64, image_text = split_image_content_fields(raw_markdown)
+        if content_type == "image":
+            content = (
+                image_base64
+                or sanitize_text_for_encoding(image_text or raw_markdown).strip()
+            )
+        else:
+            base_text = image_text if image_base64 is not None else raw_markdown
+            content = _normalize_markdown_content_for_enqueue(base_text)
+            if not content and image_base64:
+                content = sanitize_text_for_encoding(image_text or "[embedded image]").strip()
+        if not content and not image_base64:
             continue
 
         segment: dict[str, Any] = {"content": content, "content_type": content_type}
+        if image_base64:
+            segment["image_base64"] = image_base64
+        if image_text:
+            segment["image_text"] = sanitize_text_for_encoding(image_text).strip()
 
         page_id = chunk.get("page_id", chunk.get("page_idx"))
         if isinstance(page_id, (int, float)):
@@ -2072,6 +2083,7 @@ async def pipeline_enqueue_file(
                 content_segments = content.get("content_segments")
                 if isinstance(content_segments, list) and not any(
                     str(item.get("content") or "").strip()
+                    or str(item.get("image_base64") or "").strip()
                     for item in content_segments
                     if isinstance(item, dict)
                 ):

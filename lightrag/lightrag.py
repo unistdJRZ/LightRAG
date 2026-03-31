@@ -105,6 +105,7 @@ from lightrag.utils import (
     priority_limit_async_func_call,
     get_content_summary,
     sanitize_text_for_encoding,
+    split_image_content_fields,
     check_storage_env_vars,
     generate_track_id,
     convert_to_user_format,
@@ -175,8 +176,18 @@ def _normalize_structured_document_segments(
 
     for segment in value:
         raw_content = str(segment.get("content") or "")
-        content = sanitize_text_for_encoding(raw_content).strip()
-        if not content:
+        resolved_image_base64, resolved_image_text = split_image_content_fields(
+            raw_content,
+            segment.get("image_base64"),
+            segment.get("image_text"),
+        )
+        normalized_text = sanitize_text_for_encoding(
+            resolved_image_text if resolved_image_base64 is not None else raw_content
+        ).strip()
+        content = normalized_text
+        if not content and resolved_image_base64 is not None:
+            content = "[embedded image]"
+        if not content and resolved_image_base64 is None:
             continue
 
         normalized_segment: dict[str, Any] = {"content": content}
@@ -196,6 +207,11 @@ def _normalize_structured_document_segments(
         content_type = _normalize_content_type_value(segment.get("content_type"))
         if content_type is not None:
             normalized_segment["content_type"] = content_type
+
+        if resolved_image_base64 is not None:
+            normalized_segment["image_base64"] = resolved_image_base64
+        if resolved_image_text is not None:
+            normalized_segment["image_text"] = resolved_image_text
 
         ocr_chunk_id = segment.get("ocr_chunk_id", segment.get("chunk_id"))
         if isinstance(ocr_chunk_id, (str, int)):
@@ -799,7 +815,17 @@ class LightRAG:
             namespace=NameSpace.VECTOR_STORE_CHUNKS,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"full_doc_id", "content", "file_path", "page_id", "bbox"},
+            meta_fields={
+                "full_doc_id",
+                "content",
+                "content_type",
+                "file_path",
+                "page_id",
+                "bbox",
+                "ocr_chunk_id",
+                "image_base64",
+                "image_text",
+            },
         )
 
         # Initialize document status storage
@@ -1459,6 +1485,10 @@ class LightRAG:
                         normalized_chunk["page_size"] = segment["page_size"]
                     if segment.get("ocr_chunk_id") is not None:
                         normalized_chunk["ocr_chunk_id"] = segment["ocr_chunk_id"]
+                    if segment.get("image_base64") is not None:
+                        normalized_chunk["image_base64"] = segment["image_base64"]
+                    if segment.get("image_text") is not None:
+                        normalized_chunk["image_text"] = segment["image_text"]
 
                     chunk_records.append(normalized_chunk)
                     next_chunk_index += 1
@@ -1504,6 +1534,10 @@ class LightRAG:
                         normalized_chunk["content_type"] = content_type
                     if segment.get("ocr_chunk_id") is not None:
                         normalized_chunk["ocr_chunk_id"] = segment["ocr_chunk_id"]
+                    if segment.get("image_base64") is not None:
+                        normalized_chunk["image_base64"] = segment["image_base64"]
+                    if segment.get("image_text") is not None:
+                        normalized_chunk["image_text"] = segment["image_text"]
 
                     chunk_records.append(normalized_chunk)
                     next_chunk_index += 1

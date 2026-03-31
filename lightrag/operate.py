@@ -5,6 +5,7 @@ from pathlib import Path
 import asyncio
 import json
 import json_repair
+import os
 from typing import Any, AsyncIterator, overload, Literal
 from collections import Counter, defaultdict
 
@@ -75,6 +76,104 @@ from dotenv import load_dotenv
 # allows to use different .env file for each lightrag instance
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
+
+
+def _parse_keyword_extraction_ollama_options() -> dict[str, Any]:
+    options: dict[str, Any] = {}
+
+    num_ctx = os.getenv("KEYWORD_EXTRACTION_OLLAMA_NUM_CTX") or os.getenv(
+        "OLLAMA_LLM_NUM_CTX"
+    )
+    if num_ctx:
+        options["num_ctx"] = int(num_ctx)
+
+    num_predict = os.getenv("KEYWORD_EXTRACTION_OLLAMA_NUM_PREDICT") or os.getenv(
+        "OLLAMA_LLM_NUM_PREDICT"
+    )
+    if num_predict:
+        options["num_predict"] = int(num_predict)
+
+    stop_sequences = os.getenv("KEYWORD_EXTRACTION_OLLAMA_STOP") or os.getenv(
+        "OLLAMA_LLM_STOP"
+    )
+    if stop_sequences:
+        try:
+            options["stop"] = json.loads(stop_sequences)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Invalid KEYWORD_EXTRACTION_OLLAMA_STOP/OLLAMA_LLM_STOP value: %s",
+                stop_sequences,
+            )
+
+    return options
+
+
+def _get_keyword_extraction_model_func(
+    param: QueryParam,
+    hashing_kv: BaseKVStorage | None,
+):
+    if param.model_func:
+        return partial(param.model_func, _priority=5)
+
+    from lightrag.llm.ollama import ollama_model_complete
+
+    ollama_kwargs: dict[str, Any] = {
+        "host": os.getenv("KEYWORD_EXTRACTION_OLLAMA_HOST", "http://localhost:11434"),
+        "llm_model_name": os.getenv(
+            "KEYWORD_EXTRACTION_OLLAMA_MODEL", "qwen3.5:4b"
+        ),
+    }
+
+    timeout = os.getenv("KEYWORD_EXTRACTION_OLLAMA_TIMEOUT") or os.getenv("LLM_TIMEOUT")
+    if timeout:
+        ollama_kwargs["timeout"] = int(timeout)
+
+    options = _parse_keyword_extraction_ollama_options()
+    if options:
+        ollama_kwargs["options"] = options
+
+    if hashing_kv is not None:
+        ollama_kwargs["hashing_kv"] = hashing_kv
+
+    return partial(ollama_model_complete, **ollama_kwargs)
+
+
+def _flatten_entity_types_for_prompt(entity_types_raw: Any) -> dict[str, str] | Any:
+    if not isinstance(entity_types_raw, dict):
+        return entity_types_raw
+
+    flattened_entity_types: dict[str, str] = {}
+    for prefix, entity_value in entity_types_raw.items():
+        if isinstance(entity_value, dict):
+            normalized_prefix = str(prefix or "").strip()
+            for entity_name, description in entity_value.items():
+                normalized_name = str(entity_name or "").strip()
+                full_entity_name = (
+                    f"{normalized_prefix}-{normalized_name}"
+                    if normalized_prefix and normalized_name
+                    else normalized_prefix or normalized_name
+                )
+                if not full_entity_name:
+                    continue
+                flattened_entity_types[full_entity_name] = str(
+                    description or ""
+                ).strip()
+        else:
+            normalized_key = str(prefix or "").strip()
+            if not normalized_key:
+                continue
+            flattened_entity_types[normalized_key] = str(entity_value or "").strip()
+
+    return flattened_entity_types
+
+
+def _format_entity_types_for_prompt(entity_types_raw: Any) -> str:
+    normalized_entity_types = _flatten_entity_types_for_prompt(entity_types_raw)
+
+    if isinstance(normalized_entity_types, (dict, list)):
+        return json.dumps(normalized_entity_types, ensure_ascii=False, indent=2)
+
+    return str(normalized_entity_types)
 
 
 def _truncate_entity_identifier(
@@ -2878,13 +2977,7 @@ async def extract_entities(
     entity_types_raw = global_config["addon_params"].get(
         "entity_types", DEFAULT_ENTITY_TYPES
     )
-
-    if isinstance(entity_types_raw, dict):
-        entity_types_str = "\n".join(
-            [f"{k}: {v}" for k, v in entity_types_raw.items()]
-        )
-    else:
-        entity_types_str = ", ".join(entity_types_raw)
+    entity_types_str = _format_entity_types_for_prompt(entity_types_raw)
 
     examples = "\n".join(PROMPTS["entity_extraction_examples"])
 
@@ -3404,13 +3497,7 @@ async def extract_keywords_only(
     )
 
     # 4. Call the LLM for keyword extraction
-    if param.model_func:
-        use_model_func = param.model_func
-    else:
-        use_model_func = global_config["llm_model_func"]
-        # Apply higher priority (5) to query relation LLM function
-        use_model_func = partial(use_model_func, _priority=5)
-
+    use_model_func = _get_keyword_extraction_model_func(param, hashing_kv)
     result = await use_model_func(kw_prompt, keyword_extraction=True)
 
     # 5. Parse out JSON from the LLM response
@@ -3502,11 +3589,15 @@ async def _get_vector_context(
             if "content" in result:
                 chunk_with_metadata = {
                     "content": result["content"],
+                    "content_type": result.get("content_type"),
                     "created_at": result.get("created_at", None),
                     "file_path": result.get("file_path", "unknown_source"),
                     "full_doc_id": result.get("full_doc_id"),
                     "page_id": result.get("page_id"),
                     "bbox": result.get("bbox"),
+                    "ocr_chunk_id": result.get("ocr_chunk_id"),
+                    "image_base64": result.get("image_base64"),
+                    "image_text": result.get("image_text"),
                     "source_type": "vector",  # Mark the source type
                     "chunk_id": result.get("id"),  # Add chunk_id for deduplication
                 }

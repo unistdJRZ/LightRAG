@@ -43,6 +43,9 @@ function TabsNavigation() {
         <NavigationTab value="documents" currentTab={currentTab}>
           {t('header.documents')}
         </NavigationTab>
+        <NavigationTab value="chunks" currentTab={currentTab}>
+          {t('header.chunks', 'Chunks')}
+        </NavigationTab>
         <NavigationTab value="knowledge-graph" currentTab={currentTab}>
           {t('header.knowledgeGraph')}
         </NavigationTab>

@@ -16,7 +16,7 @@ import logging.config
 import sys
 import subprocess
 import shutil
-from typing import Any
+from typing import Any, Literal
 import numpy as np
 import uvicorn
 import pipmaster as pm
@@ -58,7 +58,12 @@ from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
 
-from lightrag.utils import logger, remove_think_tags, set_verbose_debug
+from lightrag.utils import (
+    get_chunk_image_fields,
+    logger,
+    remove_think_tags,
+    set_verbose_debug,
+)
 from lightrag.kg.shared_storage import (
     get_namespace_data,
     get_default_workspace,
@@ -66,6 +71,8 @@ from lightrag.kg.shared_storage import (
     cleanup_keyed_lock,
     finalize_share_data,
 )
+from lightrag.llm.local_model_manager import shutdown_local_model_manager
+from lightrag.llm.local_model_process import shutdown_local_model_process_manager
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from lightrag.api.auth import auth_handler
@@ -104,6 +111,73 @@ class ChunkContentRequest(BaseModel):
 
 class ChunkContentResponse(BaseModel):
     content: str = Field(description="Full text content of the requested chunk")
+    content_type: str | None = Field(
+        default=None, description="Chunk content type when available"
+    )
+    image_base64: str | None = Field(
+        default=None, description="Image payload for image chunks when available"
+    )
+    image_text: str | None = Field(
+        default=None, description="Accompanying OCR text for image chunks when available"
+    )
+
+
+class ChunksPaginatedRequest(BaseModel):
+    page: int = Field(default=1, ge=1, description="1-based page number")
+    page_size: int = Field(
+        default=20, ge=1, le=200, description="Number of chunks per page"
+    )
+    sort_direction: Literal["asc", "desc"] = Field(
+        default="desc",
+        description="Chunk ordering follows document updated_at ordering and per-document chunk order",
+    )
+    workspace: str | None = Field(
+        default=None,
+        description="Optional workspace id or alias. If omitted, falls back to query/header/default workspace routing.",
+    )
+
+
+class ChunksPaginationInfo(BaseModel):
+    page: int = Field(description="Current page number")
+    page_size: int = Field(description="Number of items per page")
+    total_count: int = Field(description="Total number of chunks")
+    total_pages: int = Field(description="Total number of pages")
+    has_next: bool = Field(description="Whether there is a next page")
+    has_prev: bool = Field(description="Whether there is a previous page")
+
+
+class ChunkPreviewItem(BaseModel):
+    chunk_id: str = Field(description="Chunk identifier")
+    doc_id: str = Field(description="Owning document identifier")
+    file_path: str = Field(description="Document file path")
+    content: str = Field(description="Stored chunk content")
+    content_type: str | None = Field(
+        default=None, description="Chunk content type when available"
+    )
+    page_id: int | None = Field(default=None, description="Page index when available")
+    bbox: list[float] | None = Field(
+        default=None, description="Chunk bounding box when available"
+    )
+    ocr_chunk_id: str | None = Field(
+        default=None, description="OCR chunk identifier when available"
+    )
+    image_base64: str | None = Field(
+        default=None, description="Image payload for image chunks when available"
+    )
+    image_text: str | None = Field(
+        default=None, description="Accompanying OCR text for image chunks when available"
+    )
+    chunk_order_index: int | None = Field(
+        default=None, description="Chunk order within the source document"
+    )
+    tokens: int | None = Field(default=None, description="Token count when available")
+
+
+class ChunksPaginatedResponse(BaseModel):
+    chunks: list[ChunkPreviewItem] = Field(
+        description="Chunks for the current page"
+    )
+    pagination: ChunksPaginationInfo = Field(description="Pagination information")
 
 
 class TranslateChunkRequest(BaseModel):
@@ -170,6 +244,95 @@ async def translate_chunk_to_cn(
     await rag.text_chunks.upsert({chunk_id: chunk_data})
 
     return translated_text, False
+
+
+async def get_chunks_paginated(
+    rag: LightRAG,
+    page: int,
+    page_size: int,
+    sort_direction: Literal["asc", "desc"] = "desc",
+) -> tuple[list[dict[str, Any]], int]:
+    """Build a chunk page by walking paginated document status records."""
+    doc_page_size = 200
+    doc_page = 1
+    total_chunks = 0
+    start_index = (page - 1) * page_size
+    end_index = start_index + page_size
+    selected_chunk_meta: list[dict[str, Any]] = []
+
+    while True:
+        docs_page, _ = await rag.doc_status.get_docs_paginated(
+            page=doc_page,
+            page_size=doc_page_size,
+            sort_field="updated_at",
+            sort_direction=sort_direction,
+        )
+        if not docs_page:
+            break
+
+        for doc_id, doc_status in docs_page:
+            chunk_ids = list(getattr(doc_status, "chunks_list", []) or [])
+            file_path = str(getattr(doc_status, "file_path", "unknown_source") or "unknown_source")
+
+            for chunk_order_index, chunk_id in enumerate(chunk_ids):
+                if not chunk_id:
+                    continue
+
+                if start_index <= total_chunks < end_index:
+                    selected_chunk_meta.append(
+                        {
+                            "chunk_id": str(chunk_id),
+                            "doc_id": str(doc_id),
+                            "file_path": file_path,
+                            "chunk_order_index": chunk_order_index,
+                        }
+                    )
+                total_chunks += 1
+
+        if len(docs_page) < doc_page_size:
+            break
+        doc_page += 1
+
+    if not selected_chunk_meta:
+        return [], total_chunks
+
+    chunk_records = await rag.text_chunks.get_by_ids(
+        [item["chunk_id"] for item in selected_chunk_meta]
+    )
+
+    page_chunks: list[dict[str, Any]] = []
+    for meta, record in zip(selected_chunk_meta, chunk_records):
+        chunk_record = record or {}
+        raw_ocr_chunk_id = chunk_record.get("ocr_chunk_id")
+        resolved_image_base64, resolved_image_text = get_chunk_image_fields(chunk_record)
+        chunk_content = chunk_record.get("content", "")
+        if str(chunk_record.get("content_type", "") or "").strip().lower() == "image":
+            chunk_content = resolved_image_base64 or chunk_content
+        page_chunks.append(
+            {
+                "chunk_id": meta["chunk_id"],
+                "doc_id": meta["doc_id"],
+                "file_path": chunk_record.get("file_path")
+                or meta["file_path"],
+                "content": str(chunk_content or ""),
+                "content_type": chunk_record.get("content_type"),
+                "page_id": chunk_record.get("page_id"),
+                "bbox": chunk_record.get("bbox"),
+                "ocr_chunk_id": (
+                    str(raw_ocr_chunk_id)
+                    if raw_ocr_chunk_id is not None
+                    else None
+                ),
+                "image_base64": resolved_image_base64,
+                "image_text": resolved_image_text,
+                "chunk_order_index": chunk_record.get(
+                    "chunk_order_index", meta["chunk_order_index"]
+                ),
+                "tokens": chunk_record.get("tokens"),
+            }
+        )
+
+    return page_chunks, total_chunks
 
 
 class LLMConfigCache:
@@ -594,6 +757,16 @@ def create_app(args):
 
             if webui_dev_enabled:
                 stop_webui_dev_server(webui_dev_process)
+
+            try:
+                shutdown_local_model_manager()
+            except Exception as e:
+                logger.error(f"Failed to shutdown local model manager: {e}")
+
+            try:
+                shutdown_local_model_process_manager()
+            except Exception as e:
+                logger.error(f"Failed to shutdown local model process manager: {e}")
 
     # Initialize FastAPI
     base_description = (
@@ -1035,7 +1208,9 @@ def create_app(args):
 
         # Step 3: Create optimized embedding function (calls underlying function directly)
         # Note: When model is None, each binding will use its own default model
-        async def optimized_embedding_function(texts, embedding_dim=None):
+        async def optimized_embedding_function(
+            texts, embedding_dim=None, max_token_size=None
+        ):
             try:
                 if binding == "lollms":
                     from lightrag.llm.lollms import lollms_embed
@@ -1171,6 +1346,8 @@ def create_app(args):
                         "texts": texts,
                         "embedding_dim": embedding_dim,
                     }
+                    if max_token_size is not None:
+                        kwargs["max_token_size"] = max_token_size
                     if model:
                         kwargs["model"] = model
                     raw_result = await actual_func(**kwargs)
@@ -1591,6 +1768,47 @@ def create_app(args):
         return workspace
 
     @app.post(
+        "/api/chunks/paginated",
+        dependencies=[Depends(combined_auth)],
+        response_model=ChunksPaginatedResponse,
+        summary="Get paginated chunk previews",
+        description="Returns paginated chunk records for the resolved workspace.",
+    )
+    async def list_chunks_paginated(
+        request: Request, payload: ChunksPaginatedRequest
+    ):
+        workspace = resolve_workspace_or_raise(request, payload.workspace)
+
+        try:
+            chunks, total_count = await get_chunks_paginated(
+                workspace_rags[workspace],
+                page=payload.page,
+                page_size=payload.page_size,
+                sort_direction=payload.sort_direction,
+            )
+        except Exception as exc:
+            logger.error(
+                f"Failed to fetch paginated chunks in workspace '{workspace}': {exc}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to fetch paginated chunks: {exc}",
+            ) from exc
+
+        total_pages = (total_count + payload.page_size - 1) // payload.page_size
+        return ChunksPaginatedResponse(
+            chunks=chunks,
+            pagination=ChunksPaginationInfo(
+                page=payload.page,
+                page_size=payload.page_size,
+                total_count=total_count,
+                total_pages=total_pages,
+                has_next=payload.page < total_pages,
+                has_prev=payload.page > 1,
+            ),
+        )
+
+    @app.post(
         "/api/chunk_content",
         dependencies=[Depends(combined_auth)],
         response_model=ChunkContentResponse,
@@ -1618,7 +1836,16 @@ def create_app(args):
                 detail=f"Chunk '{chunk_id}' not found in workspace '{display_workspace_id(workspace)}'",
             )
 
-        return ChunkContentResponse(content=str(chunk_data.get("content", "")))
+        resolved_image_base64, resolved_image_text = get_chunk_image_fields(chunk_data)
+        chunk_content = chunk_data.get("content", "")
+        if str(chunk_data.get("content_type", "") or "").strip().lower() == "image":
+            chunk_content = resolved_image_base64 or chunk_content
+        return ChunkContentResponse(
+            content=str(chunk_content or ""),
+            content_type=str(chunk_data.get("content_type", "") or "").strip() or None,
+            image_base64=resolved_image_base64,
+            image_text=resolved_image_text,
+        )
 
     @app.post(
         "/api/translate_chunk",

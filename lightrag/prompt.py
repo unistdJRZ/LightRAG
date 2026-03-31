@@ -71,7 +71,7 @@ Extract entities and relationships from the input text in Data to be Processed b
 
 ---Data to be Processed---
 <Entity_types>
-[{entity_types}]
+{entity_types}
 
 <Input Text>
 ```

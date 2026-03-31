@@ -145,6 +145,7 @@ export type QueryReference = {
   chunk_id: string
   file_path: string
   file_id?: string | null
+  content_type?: string | null
   content: string
 }
 
@@ -258,6 +259,31 @@ export type PaginationInfo = {
   total_pages: number
   has_next: boolean
   has_prev: boolean
+}
+
+export type ChunkPreview = {
+  chunk_id: string
+  doc_id: string
+  file_path: string
+  content: string
+  content_type?: string | null
+  page_id?: number | null
+  bbox?: number[] | null
+  ocr_chunk_id?: string | null
+  chunk_order_index?: number | null
+  tokens?: number | null
+}
+
+export type ChunksRequest = {
+  page: number
+  page_size: number
+  sort_direction?: 'asc' | 'desc'
+  workspace?: string | null
+}
+
+export type PaginatedChunksResponse = {
+  chunks: ChunkPreview[]
+  pagination: PaginationInfo
 }
 
 export type PaginatedDocsResponse = {
@@ -1111,6 +1137,11 @@ export const getTrackStatus = async (trackId: string): Promise<TrackStatusRespon
  */
 export const getDocumentsPaginated = async (request: DocumentsRequest): Promise<PaginatedDocsResponse> => {
   const response = await axiosInstance.post('/documents/paginated', request)
+  return response.data
+}
+
+export const getChunksPaginated = async (request: ChunksRequest): Promise<PaginatedChunksResponse> => {
+  const response = await axiosInstance.post('/chunks/paginated', request)
   return response.data
 }
 

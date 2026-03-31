@@ -83,6 +83,8 @@ class TextChunkSchema(TypedDict):
     page_size: NotRequired[list[float]]
     content_type: NotRequired[str]
     ocr_chunk_id: NotRequired[str | int]
+    image_base64: NotRequired[str]
+    image_text: NotRequired[str]
     segment_order_index: NotRequired[int]
     llm_cache_list: NotRequired[list[str]]
     translated_cn: NotRequired[str]
@@ -281,6 +283,8 @@ class BaseVectorStorage(StorageNameSpace, ABC):
             build_multimodal_embedding_input(
                 v.get("content"),
                 v.get("content_type"),
+                v.get("image_base64"),
+                v.get("image_text"),
             )
             for v in data.values()
         ]

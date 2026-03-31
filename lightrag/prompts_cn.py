@@ -71,7 +71,7 @@ PROMPTS["entity_extraction_user_prompt"] = """---任务---
 
 ---待处理数据---
 <Entity_types>
-[{entity_types}]
+{entity_types}
 
 <Input Text>
 ```

@@ -13,6 +13,7 @@ import { ZapIcon } from 'lucide-react'
 
 import GraphViewer from '@/features/GraphViewer'
 import DocumentManager from '@/features/DocumentManager'
+import ChunksExplorer from '@/features/ChunksExplorer'
 import RetrievalTesting from '@/features/RetrievalTesting'
 import ApiSite from '@/features/ApiSite'
 
@@ -207,6 +208,9 @@ function App() {
               <div className="relative grow" key={`workspace-${workspace ?? 'default'}`}>
                 <TabsContent value="documents" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
                   <DocumentManager />
+                </TabsContent>
+                <TabsContent value="chunks" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
+                  <ChunksExplorer />
                 </TabsContent>
                 <TabsContent value="knowledge-graph" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <GraphViewer />
