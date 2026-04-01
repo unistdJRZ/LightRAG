@@ -1192,3 +1192,60 @@ def test_chunk_document_content_keeps_image_segment_as_single_chunk():
     assert chunks[2]["bbox"] == [10, 10, 20, 20]
     assert chunks[2]["page_size"] == [612, 792]
     assert chunks[2]["ocr_chunk_id"] == 99
+
+
+@pytest.mark.offline
+def test_chunk_document_content_keeps_table_and_interline_equation_as_single_chunk():
+    rag = LightRAG.__new__(LightRAG)
+    rag.tokenizer = make_tokenizer()
+    rag.chunking_func = chunking_by_token_size
+    rag.chunk_overlap_token_size = 0
+    rag.chunk_token_size = 6
+
+    chunks = asyncio.run(
+        rag._chunk_document_content(
+            "",
+            [
+                {
+                    "content": "alpha beta",
+                    "page_id": 1,
+                    "bbox": [0, 0, 10, 10],
+                    "content_type": "text",
+                },
+                {
+                    "content": "row1 | row2 | row3",
+                    "page_id": 2,
+                    "bbox": [10, 10, 20, 20],
+                    "content_type": "table",
+                    "ocr_chunk_id": 100,
+                },
+                {
+                    "content": "E = mc^2 + delta",
+                    "page_id": 3,
+                    "bbox": [20, 20, 30, 30],
+                    "content_type": "interline_equation",
+                    "ocr_chunk_id": 101,
+                },
+            ],
+            None,
+            False,
+        )
+    )
+
+    assert [chunk["content"] for chunk in chunks] == [
+        "alpha",
+        "beta",
+        "row1 | row2 | row3",
+        "E = mc^2 + delta",
+    ]
+    assert [chunk["chunk_order_index"] for chunk in chunks] == [0, 1, 2, 3]
+    assert chunks[2]["content_type"] == "table"
+    assert chunks[2]["page_id"] == 2
+    assert chunks[2]["bbox"] == [10, 10, 20, 20]
+    assert chunks[2]["ocr_chunk_id"] == 100
+    assert chunks[2]["tokens"] > 0
+    assert chunks[3]["content_type"] == "interline_equation"
+    assert chunks[3]["page_id"] == 3
+    assert chunks[3]["bbox"] == [20, 20, 30, 30]
+    assert chunks[3]["ocr_chunk_id"] == 101
+    assert chunks[3]["tokens"] > 0

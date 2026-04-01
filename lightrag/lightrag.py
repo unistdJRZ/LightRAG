@@ -165,6 +165,14 @@ def _normalize_content_type_value(value: Any) -> str | None:
     return content_type or None
 
 
+def _is_unsplittable_content_type(value: Any) -> bool:
+    return _normalize_content_type_value(value) in {
+        "image",
+        "interline_equation",
+        "table",
+    }
+
+
 def _is_non_indexable_content_type(value: Any) -> bool:
     return _normalize_content_type_value(value) == "image"
 
@@ -1469,9 +1477,11 @@ class LightRAG:
                     continue
 
                 content_type = _normalize_content_type_value(segment.get("content_type"))
-                if _is_non_indexable_content_type(content_type):
+                if _is_unsplittable_content_type(content_type):
                     normalized_chunk = {
-                        "tokens": 0,
+                        "tokens": 0
+                        if _is_non_indexable_content_type(content_type)
+                        else len(self.tokenizer.encode(segment_content)),
                         "content": segment_content,
                         "chunk_order_index": next_chunk_index,
                         "segment_order_index": segment_index,

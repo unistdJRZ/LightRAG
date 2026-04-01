@@ -270,6 +270,8 @@ export type ChunkPreview = {
   page_id?: number | null
   bbox?: number[] | null
   ocr_chunk_id?: string | null
+  image_base64?: string | null
+  image_text?: string | null
   chunk_order_index?: number | null
   tokens?: number | null
 }

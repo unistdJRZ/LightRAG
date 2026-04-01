@@ -4179,6 +4179,23 @@ async def _build_context_str(
     text_units_str = "\n".join(
         json.dumps(text_unit, ensure_ascii=False) for text_unit in chunks_context
     )
+
+    prompt_entities_context, prompt_relations_context = (
+        _annotate_related_chunks_for_prompt(
+            entities_context,
+            relations_context,
+            truncated_chunks,
+            entity_id_to_original=entity_id_to_original,
+            relation_id_to_original=relation_id_to_original,
+        )
+    )
+    entities_str = "\n".join(
+        json.dumps(entity, ensure_ascii=False) for entity in prompt_entities_context
+    )
+    relations_str = "\n".join(
+        json.dumps(relation, ensure_ascii=False) for relation in prompt_relations_context
+    )
+
     reference_list_str = "\n".join(
         f"[{ref['reference_id']}] {ref.get('chunk_id')} | {ref['file_path']} | file_id: {ref.get('file_id')}"
         for ref in reference_entries
@@ -4245,6 +4262,83 @@ async def _build_context_str(
         f"[_build_context_str] Final data after conversion: {len(final_data.get('entities', []))} entities, {len(final_data.get('relationships', []))} relationships, {len(final_data.get('chunks', []))} chunks"
     )
     return result, final_data
+
+
+def _annotate_related_chunks_for_prompt(
+    entities_context: list[dict],
+    relations_context: list[dict],
+    chunks: list[dict],
+    *,
+    entity_id_to_original: dict | None = None,
+    relation_id_to_original: dict | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Add `related_chunk` to prompt-side entity and relation payloads."""
+
+    missing_entity_message = "本实体 仅用于知识补充，禁止引用。"
+    missing_relation_message = "本边 仅用于知识补充，禁止引用。"
+
+    chunk_id_to_reference_id: dict[str, str] = {}
+    for chunk in chunks:
+        chunk_id = str(chunk.get("chunk_id", "") or "").strip()
+        reference_id = str(chunk.get("reference_id", "") or "").strip()
+        if chunk_id and reference_id and chunk_id not in chunk_id_to_reference_id:
+            chunk_id_to_reference_id[chunk_id] = reference_id
+
+    def _resolve_related_chunk_from_source_id(
+        source_id: Any, missing_message: str
+    ) -> str:
+        if not isinstance(source_id, str) or not source_id.strip():
+            return missing_message
+
+        for chunk_id in split_string_by_multi_markers(source_id, [GRAPH_FIELD_SEP]):
+            reference_id = chunk_id_to_reference_id.get(chunk_id)
+            if reference_id:
+                return reference_id
+
+        return missing_message
+
+    prompt_entities_context: list[dict] = []
+    for entity in entities_context:
+        prompt_entity = entity.copy()
+        entity_name = prompt_entity.get("entity", "")
+        original_entity = (
+            entity_id_to_original.get(entity_name)
+            if entity_id_to_original and entity_name in entity_id_to_original
+            else None
+        )
+        source_id = (
+            original_entity.get("source_id", "")
+            if isinstance(original_entity, dict)
+            else prompt_entity.get("source_id", "")
+        )
+        prompt_entity["related_chunk"] = _resolve_related_chunk_from_source_id(
+            source_id, missing_entity_message
+        )
+        prompt_entities_context.append(prompt_entity)
+
+    prompt_relations_context: list[dict] = []
+    for relation in relations_context:
+        prompt_relation = relation.copy()
+        relation_key = (
+            prompt_relation.get("entity1", ""),
+            prompt_relation.get("entity2", ""),
+        )
+        original_relation = (
+            relation_id_to_original.get(relation_key)
+            if relation_id_to_original and relation_key in relation_id_to_original
+            else None
+        )
+        source_id = (
+            original_relation.get("source_id", "")
+            if isinstance(original_relation, dict)
+            else prompt_relation.get("source_id", "")
+        )
+        prompt_relation["related_chunk"] = _resolve_related_chunk_from_source_id(
+            source_id, missing_relation_message
+        )
+        prompt_relations_context.append(prompt_relation)
+
+    return prompt_entities_context, prompt_relations_context
 
 
 # Now let's update the old _build_query_context to use the new architecture

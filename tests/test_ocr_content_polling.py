@@ -145,6 +145,7 @@ def test_extract_structured_segments_from_ocr_chunks():
         {
             "content": "hello\n\nworld",
             "content_type": "text",
+            "image_text": "Hello\n\nWorld",
             "page_id": 57,
             "bbox": [88.0, 154.0, 417.0, 207.0],
             "page_size": [612.0, 792.0],
@@ -153,11 +154,129 @@ def test_extract_structured_segments_from_ocr_chunks():
         {
             "content": "QUJDREVGRw==",
             "content_type": "image",
+            "image_text": "QUJDREVGRw==",
             "page_id": 58,
             "bbox": [10.0, 20.0, 30.0, 40.0],
             "page_size": [612.0, 792.0],
             "ocr_chunk_id": 271,
         },
+    ]
+
+
+def test_extract_structured_segments_merges_short_chunks_repeatedly(monkeypatch):
+    monkeypatch.setattr(routes.global_args, "ocr_chunk_merge_thr", 20)
+
+    ocr_chunks = [
+        {
+            "chunk_id": 1,
+            "page_idx": 1,
+            "bbox": [0, 0, 100, 10],
+            "markdown": "alpha",
+            "content_type": "text",
+        },
+        {
+            "chunk_id": 2,
+            "page_idx": 1,
+            "bbox": [0, 20, 100, 30],
+            "markdown": "beta",
+            "content_type": "text",
+        },
+        {
+            "chunk_id": 3,
+            "page_idx": 1,
+            "bbox": [0, 40, 100, 60],
+            "markdown": "this is a long enough paragraph for merge target",
+            "content_type": "text",
+        },
+    ]
+
+    segments = routes._extract_structured_segments_from_ocr_chunks(ocr_chunks)
+
+    assert segments == [
+        {
+            "content": "alpha\nbeta\nthis is a long enough paragraph for merge target",
+            "content_type": "text",
+            "image_text": "alpha\nbeta\nthis is a long enough paragraph for merge target",
+            "page_id": 1,
+            "bbox": [0.0, 0.0, 100.0, 60.0],
+            "ocr_chunk_id": 3,
+        }
+    ]
+
+
+def test_extract_structured_segments_does_not_merge_across_pages(monkeypatch):
+    monkeypatch.setattr(routes.global_args, "ocr_chunk_merge_thr", 20)
+
+    ocr_chunks = [
+        {
+            "chunk_id": 1,
+            "page_idx": 1,
+            "bbox": [0, 0, 100, 10],
+            "markdown": "alpha",
+            "content_type": "text",
+        },
+        {
+            "chunk_id": 2,
+            "page_idx": 2,
+            "bbox": [0, 0, 100, 20],
+            "markdown": "this is a long enough paragraph for page two",
+            "content_type": "text",
+        },
+    ]
+
+    segments = routes._extract_structured_segments_from_ocr_chunks(ocr_chunks)
+
+    assert segments == [
+        {
+            "content": "alpha",
+            "content_type": "text",
+            "image_text": "alpha",
+            "page_id": 1,
+            "bbox": [0.0, 0.0, 100.0, 10.0],
+            "ocr_chunk_id": 1,
+        },
+        {
+            "content": "this is a long enough paragraph for page two",
+            "content_type": "text",
+            "image_text": "this is a long enough paragraph for page two",
+            "page_id": 2,
+            "bbox": [0.0, 0.0, 100.0, 20.0],
+            "ocr_chunk_id": 2,
+        },
+    ]
+
+
+def test_extract_structured_segments_merges_title_chunks(monkeypatch):
+    monkeypatch.setattr(routes.global_args, "ocr_chunk_merge_thr", 20)
+
+    ocr_chunks = [
+        {
+            "chunk_id": 1,
+            "page_idx": 1,
+            "bbox": [0, 0, 100, 10],
+            "markdown": "chapter 1",
+            "content_type": "title",
+        },
+        {
+            "chunk_id": 2,
+            "page_idx": 1,
+            "bbox": [0, 20, 100, 40],
+            "markdown": "this is a long enough paragraph for merge target",
+            "content_type": "text",
+        },
+    ]
+
+    segments = routes._extract_structured_segments_from_ocr_chunks(ocr_chunks)
+
+    assert segments == [
+        {
+            "content": "chapter 1\nthis is a long enough paragraph for merge target",
+            "content_type": "text",
+            "image_text": "chapter 1\nthis is a long enough paragraph for merge target",
+            "page_id": 1,
+            "bbox": [0.0, 0.0, 100.0, 40.0],
+            "ocr_chunk_id": 2,
+        }
     ]
 
 
@@ -212,22 +331,24 @@ def test_fetch_text_from_ocr_server_prefers_chunk_list(monkeypatch):
     assert content == {
         "content": "markdown text",
         "content_segments": [
-            {
-                "content": "segment",
-                "content_type": "text",
-                "page_id": 1,
-                "bbox": [0.0, 1.0, 2.0, 3.0],
-                "page_size": [612.0, 792.0],
-                "ocr_chunk_id": 10,
-            },
-            {
-                "content": "YmFzZTY0LWltYWdl",
-                "content_type": "image",
-                "page_id": 1,
-                "bbox": [4.0, 5.0, 6.0, 7.0],
-                "page_size": [612.0, 792.0],
-                "ocr_chunk_id": 11,
-            },
+                {
+                    "content": "segment",
+                    "content_type": "text",
+                    "image_text": "Segment",
+                    "page_id": 1,
+                    "bbox": [0.0, 1.0, 2.0, 3.0],
+                    "page_size": [612.0, 792.0],
+                    "ocr_chunk_id": 10,
+                },
+                {
+                    "content": "YmFzZTY0LWltYWdl",
+                    "content_type": "image",
+                    "image_text": "YmFzZTY0LWltYWdl",
+                    "page_id": 1,
+                    "bbox": [4.0, 5.0, 6.0, 7.0],
+                    "page_size": [612.0, 792.0],
+                    "ocr_chunk_id": 11,
+                },
         ],
     }
 

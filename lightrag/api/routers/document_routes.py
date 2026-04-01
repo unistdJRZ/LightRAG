@@ -106,6 +106,7 @@ OCR_IMAGE_EXTENSIONS = (
 )
 
 OCR_POLL_INTERVAL_SECONDS = 2
+OCR_MERGEABLE_CONTENT_TYPES = {"text", "list", "phonetic", "ref_text", "title", "index", "interline_equation"}
 
 
 def sanitize_filename(filename: str, input_dir: Path) -> str:
@@ -1488,7 +1489,245 @@ def _extract_structured_segments_from_ocr_chunks(
     if not segments:
         raise ValueError("OCR chunk list does not contain usable content")
 
-    return segments
+    return _merge_short_ocr_segments(segments)
+
+
+def _get_ocr_chunk_merge_threshold() -> int:
+    raw_value = getattr(global_args, "ocr_chunk_merge_thr", 50)
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        return 50
+
+
+def _get_segment_bbox(segment: Mapping[str, Any]) -> list[float] | None:
+    bbox = segment.get("bbox")
+    if (
+        isinstance(bbox, list)
+        and len(bbox) == 4
+        and all(isinstance(item, (int, float)) for item in bbox)
+    ):
+        return [float(item) for item in bbox]
+    return None
+
+
+def _get_segment_sort_key(
+    segment: Mapping[str, Any], original_index: int
+) -> tuple[float, float, float, float, int]:
+    bbox = _get_segment_bbox(segment)
+    if bbox is None:
+        return (float("inf"), float("inf"), float("inf"), float("inf"), original_index)
+
+    x0, y0, x1, y1 = bbox
+    top_y = min(y0, y1)
+    left_x = min(x0, x1)
+    bottom_y = max(y0, y1)
+    right_x = max(x0, x1)
+    return (top_y, left_x, bottom_y, right_x, original_index)
+
+
+def _is_mergeable_ocr_segment(segment: Mapping[str, Any]) -> bool:
+    content = str(segment.get("content") or "").strip()
+    content_type = str(segment.get("content_type") or "").strip().lower()
+    return (
+        bool(content)
+        and content_type in OCR_MERGEABLE_CONTENT_TYPES
+        and _get_segment_bbox(segment) is not None
+    )
+
+
+def _compute_y_axis_distance(
+    source_bbox: list[float], target_bbox: list[float]
+) -> float:
+    source_top = min(source_bbox[1], source_bbox[3])
+    source_bottom = max(source_bbox[1], source_bbox[3])
+    target_top = min(target_bbox[1], target_bbox[3])
+    target_bottom = max(target_bbox[1], target_bbox[3])
+
+    if source_bottom < target_top:
+        return target_top - source_bottom
+    if target_bottom < source_top:
+        return source_top - target_bottom
+    return 0.0
+
+
+def _merge_bbox_values(source_bbox: list[float], target_bbox: list[float]) -> list[float]:
+    return [
+        min(source_bbox[0], source_bbox[2], target_bbox[0], target_bbox[2]),
+        min(source_bbox[1], source_bbox[3], target_bbox[1], target_bbox[3]),
+        max(source_bbox[0], source_bbox[2], target_bbox[0], target_bbox[2]),
+        max(source_bbox[1], source_bbox[3], target_bbox[1], target_bbox[3]),
+    ]
+
+
+def _merge_segment_content(first: str, second: str) -> str:
+    if not first:
+        return second
+    if not second:
+        return first
+    return f"{first}\n{second}"
+
+
+def _merge_short_ocr_segments(
+    segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    threshold = _get_ocr_chunk_merge_threshold()
+    if threshold <= 0 or len(segments) < 2:
+        return segments
+
+    bucket_order: list[tuple[str, int]] = []
+    bucket_to_items: dict[tuple[str, int], list[tuple[int, dict[str, Any]]]] = {}
+
+    for original_index, segment in enumerate(segments):
+        page_id = segment.get("page_id")
+        if isinstance(page_id, int):
+            bucket_key = ("page", page_id)
+        else:
+            # Missing page information must never be merged with any other chunk.
+            bucket_key = ("segment", original_index)
+
+        if bucket_key not in bucket_to_items:
+            bucket_order.append(bucket_key)
+            bucket_to_items[bucket_key] = []
+        bucket_to_items[bucket_key].append((original_index, segment))
+
+    merged_segments: list[dict[str, Any]] = []
+    for bucket_key in bucket_order:
+        bucket_items = bucket_to_items[bucket_key]
+        if bucket_key[0] != "page":
+            merged_segments.extend(segment for _, segment in bucket_items)
+            continue
+
+        page_items = [
+            {"segment": segment, "original_index": original_index}
+            for original_index, segment in bucket_items
+        ]
+        page_items.sort(
+            key=lambda item: _get_segment_sort_key(
+                item["segment"], item["original_index"]
+            )
+        )
+
+        item_index = 0
+        while item_index < len(page_items):
+            source_item = page_items[item_index]
+            source_segment = source_item["segment"]
+
+            if (
+                not _is_mergeable_ocr_segment(source_segment)
+                or len(str(source_segment.get("content") or "")) >= threshold
+            ):
+                item_index += 1
+                continue
+
+            source_bbox = _get_segment_bbox(source_segment)
+            if source_bbox is None:
+                item_index += 1
+                continue
+
+            best_target_index: int | None = None
+            best_target_key: tuple[float, int, int, int] | None = None
+
+            for candidate_index, candidate_item in enumerate(page_items):
+                if candidate_index == item_index:
+                    continue
+
+                candidate_segment = candidate_item["segment"]
+                if not _is_mergeable_ocr_segment(candidate_segment):
+                    continue
+
+                candidate_bbox = _get_segment_bbox(candidate_segment)
+                if candidate_bbox is None:
+                    continue
+
+                candidate_key = (
+                    _compute_y_axis_distance(source_bbox, candidate_bbox),
+                    abs(candidate_index - item_index),
+                    0 if candidate_index > item_index else 1,
+                    candidate_index,
+                )
+                if best_target_key is None or candidate_key < best_target_key:
+                    best_target_key = candidate_key
+                    best_target_index = candidate_index
+
+            if best_target_index is None:
+                item_index += 1
+                continue
+
+            target_item = page_items[best_target_index]
+            target_segment = target_item["segment"]
+            target_bbox = _get_segment_bbox(target_segment)
+            if target_bbox is None:
+                item_index += 1
+                continue
+
+            if item_index < best_target_index:
+                merged_content = _merge_segment_content(
+                    str(source_segment.get("content") or ""),
+                    str(target_segment.get("content") or ""),
+                )
+                merged_image_text = _merge_segment_content(
+                    str(
+                        source_segment.get("image_text")
+                        or source_segment.get("content")
+                        or ""
+                    ),
+                    str(
+                        target_segment.get("image_text")
+                        or target_segment.get("content")
+                        or ""
+                    ),
+                )
+            else:
+                merged_content = _merge_segment_content(
+                    str(target_segment.get("content") or ""),
+                    str(source_segment.get("content") or ""),
+                )
+                merged_image_text = _merge_segment_content(
+                    str(
+                        target_segment.get("image_text")
+                        or target_segment.get("content")
+                        or ""
+                    ),
+                    str(
+                        source_segment.get("image_text")
+                        or source_segment.get("content")
+                        or ""
+                    ),
+                )
+
+            target_segment["content"] = merged_content
+            if merged_image_text:
+                target_segment["image_text"] = merged_image_text
+            target_segment["bbox"] = _merge_bbox_values(source_bbox, target_bbox)
+            if target_segment.get("page_size") is None and source_segment.get(
+                "page_size"
+            ) is not None:
+                target_segment["page_size"] = source_segment["page_size"]
+            if target_segment.get("ocr_chunk_id") is None and source_segment.get(
+                "ocr_chunk_id"
+            ) is not None:
+                target_segment["ocr_chunk_id"] = source_segment["ocr_chunk_id"]
+
+            source_type = str(source_segment.get("content_type") or "").strip().lower()
+            target_type = str(target_segment.get("content_type") or "").strip().lower()
+            if source_type != target_type and target_type in OCR_MERGEABLE_CONTENT_TYPES:
+                target_segment["content_type"] = "text"
+
+            target_item["original_index"] = min(
+                target_item["original_index"], source_item["original_index"]
+            )
+            page_items.pop(item_index)
+            page_items.sort(
+                key=lambda item: _get_segment_sort_key(
+                    item["segment"], item["original_index"]
+                )
+            )
+            item_index = 0
+
+        merged_segments.extend(item["segment"] for item in page_items)
+
+    return merged_segments
 
 
 def _build_full_content_from_segments(segments: list[dict[str, Any]]) -> str:

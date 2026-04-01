@@ -35,6 +35,15 @@ function isImageChunk(chunk: ChunkPreview | null): boolean {
   return (chunk?.content_type ?? '').trim().toLowerCase() === 'image'
 }
 
+function getImagePayload(chunk: ChunkPreview | null): string | null {
+  if (!chunk || !isImageChunk(chunk)) {
+    return null
+  }
+
+  const payload = (chunk.image_base64 ?? chunk.content ?? '').trim()
+  return payload || null
+}
+
 function buildImageSrc(content: string): string {
   if (content.startsWith('data:image/')) {
     return content
@@ -112,12 +121,67 @@ export default function ChunksExplorer() {
     [chunks, selectedChunkId]
   )
 
+  const selectedChunkImagePayload = useMemo(() => getImagePayload(selectedChunk), [selectedChunk])
+
   const selectedChunkImageSrc = useMemo(() => {
-    if (!selectedChunk || !isImageChunk(selectedChunk) || !selectedChunk.content) {
+    if (!selectedChunkImagePayload) {
       return null
     }
-    return buildImageSrc(selectedChunk.content)
-  }, [selectedChunk])
+    return buildImageSrc(selectedChunkImagePayload)
+  }, [selectedChunkImagePayload])
+
+  const selectedChunkMetadata = useMemo(() => {
+    if (!selectedChunk) {
+      return []
+    }
+
+    return [
+      {
+        label: t('chunksPanel.meta.chunkId', 'Chunk ID'),
+        value: selectedChunk.chunk_id,
+        mono: true
+      },
+      {
+        label: t('chunksPanel.meta.docId', 'Document ID'),
+        value: selectedChunk.doc_id,
+        mono: true
+      },
+      {
+        label: t('chunksPanel.meta.file', 'File'),
+        value: selectedChunk.file_path
+      },
+      {
+        label: t('chunksPanel.meta.type', 'Type'),
+        value: selectedChunk.content_type || 'text'
+      },
+      {
+        label: t('chunksPanel.meta.order', 'Order'),
+        value: selectedChunk.chunk_order_index ?? '-'
+      },
+      {
+        label: t('chunksPanel.meta.tokens', 'Tokens'),
+        value: selectedChunk.tokens ?? '-'
+      },
+      {
+        label: t('chunksPanel.meta.page', 'Page'),
+        value: selectedChunk.page_id ?? '-'
+      },
+      {
+        label: t('chunksPanel.meta.ocrChunkId', 'OCR Chunk ID'),
+        value: selectedChunk.ocr_chunk_id ?? '-',
+        mono: true
+      },
+      {
+        label: t('chunksPanel.meta.bbox', 'BBox'),
+        value: selectedChunk.bbox ? JSON.stringify(selectedChunk.bbox) : '-',
+        mono: true
+      },
+      {
+        label: t('chunksPanel.meta.size', 'Size'),
+        value: selectedChunk.content.length.toLocaleString()
+      }
+    ]
+  }, [selectedChunk, t])
 
   const handlePageChange = useCallback((page: number) => {
     setPagination((previous) => ({ ...previous, page }))
@@ -167,23 +231,23 @@ export default function ChunksExplorer() {
         />
       ) : (
         <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(360px,0.9fr)]">
-          <Card className="min-h-0">
+          <Card className="min-h-0 min-w-0 overflow-hidden">
             <CardHeader>
               <CardTitle>{t('chunksPanel.listTitle', 'Chunk List')}</CardTitle>
               <CardDescription>
                 {t('chunksPanel.listDescription', 'Select a chunk to inspect its stored payload and metadata.')}
               </CardDescription>
             </CardHeader>
-            <CardContent className="flex min-h-0 flex-1 flex-col gap-4">
-              <div className="min-h-0 flex-1 overflow-auto rounded-md border">
-                <Table>
+            <CardContent className="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
+              <div className="min-h-0 flex-1 overflow-hidden rounded-md border">
+                <Table className="table-fixed">
                   <TableHeader>
                     <TableRow>
-                      <TableHead>{t('chunksPanel.columns.type', 'Type')}</TableHead>
-                      <TableHead>{t('chunksPanel.columns.chunkId', 'Chunk ID')}</TableHead>
+                      <TableHead className="w-[120px]">{t('chunksPanel.columns.type', 'Type')}</TableHead>
+                      <TableHead className="w-[190px]">{t('chunksPanel.columns.chunkId', 'Chunk ID')}</TableHead>
                       <TableHead>{t('chunksPanel.columns.file', 'File')}</TableHead>
-                      <TableHead>{t('chunksPanel.columns.page', 'Page')}</TableHead>
-                      <TableHead>{t('chunksPanel.columns.size', 'Size')}</TableHead>
+                      <TableHead className="w-[70px]">{t('chunksPanel.columns.page', 'Page')}</TableHead>
+                      <TableHead className="w-[96px] text-right">{t('chunksPanel.columns.size', 'Size')}</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -196,16 +260,22 @@ export default function ChunksExplorer() {
                           className={cn('cursor-pointer', selected && 'bg-emerald-500/10')}
                           onClick={() => setSelectedChunkId(chunk.chunk_id)}
                         >
-                          <TableCell>
-                            <span className="inline-flex items-center gap-2 text-xs font-medium">
+                          <TableCell className="w-[120px]">
+                            <span className="inline-flex max-w-full items-center gap-2 text-xs font-medium">
                               {image ? <ImageIcon className="size-4" /> : <FileTextIcon className="size-4" />}
-                              {chunk.content_type || 'text'}
+                              <span className="truncate">{chunk.content_type || 'text'}</span>
                             </span>
                           </TableCell>
-                          <TableCell className="font-mono text-xs">{truncateMiddle(chunk.chunk_id, 28)}</TableCell>
-                          <TableCell>{getDisplayFileName(chunk.file_path)}</TableCell>
-                          <TableCell>{chunk.page_id ?? '-'}</TableCell>
-                          <TableCell>{chunk.content.length.toLocaleString()}</TableCell>
+                          <TableCell className="w-[190px] font-mono text-xs" title={chunk.chunk_id}>
+                            <span className="block truncate">{truncateMiddle(chunk.chunk_id, 28)}</span>
+                          </TableCell>
+                          <TableCell title={chunk.file_path}>
+                            <span className="block truncate">{getDisplayFileName(chunk.file_path)}</span>
+                          </TableCell>
+                          <TableCell className="w-[70px] whitespace-nowrap">{chunk.page_id ?? '-'}</TableCell>
+                          <TableCell className="w-[96px] whitespace-nowrap text-right font-mono text-xs">
+                            {chunk.content.length.toLocaleString()}
+                          </TableCell>
                         </TableRow>
                       )
                     })}
@@ -225,7 +295,7 @@ export default function ChunksExplorer() {
             </CardContent>
           </Card>
 
-          <Card className="min-h-0">
+          <Card className="min-h-0 min-w-0 overflow-hidden">
             <CardHeader>
               <CardTitle>{t('chunksPanel.previewTitle', 'Preview')}</CardTitle>
               <CardDescription>
@@ -238,19 +308,20 @@ export default function ChunksExplorer() {
                   : t('chunksPanel.previewEmpty', 'Select a chunk to preview its content.')}
               </CardDescription>
             </CardHeader>
-            <CardContent className="flex min-h-0 flex-1 flex-col gap-4">
+            <CardContent className="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
               {selectedChunk ? (
                 <>
-                  <div className="grid gap-2 rounded-md border bg-muted/20 p-3 text-sm">
-                    <div><span className="font-medium">{t('chunksPanel.meta.chunkId', 'Chunk ID')}:</span> <span className="font-mono text-xs">{selectedChunk.chunk_id}</span></div>
-                    <div><span className="font-medium">{t('chunksPanel.meta.docId', 'Document ID')}:</span> <span className="font-mono text-xs">{selectedChunk.doc_id}</span></div>
-                    <div><span className="font-medium">{t('chunksPanel.meta.file', 'File')}:</span> {selectedChunk.file_path}</div>
-                    <div><span className="font-medium">{t('chunksPanel.meta.type', 'Type')}:</span> {selectedChunk.content_type || 'text'}</div>
-                    <div><span className="font-medium">{t('chunksPanel.meta.order', 'Order')}:</span> {selectedChunk.chunk_order_index ?? '-'}</div>
-                    <div><span className="font-medium">{t('chunksPanel.meta.tokens', 'Tokens')}:</span> {selectedChunk.tokens ?? '-'}</div>
-                    <div><span className="font-medium">{t('chunksPanel.meta.page', 'Page')}:</span> {selectedChunk.page_id ?? '-'}</div>
-                    <div><span className="font-medium">{t('chunksPanel.meta.ocrChunkId', 'OCR Chunk ID')}:</span> {selectedChunk.ocr_chunk_id ?? '-'}</div>
-                    <div><span className="font-medium">{t('chunksPanel.meta.bbox', 'BBox')}:</span> {selectedChunk.bbox ? JSON.stringify(selectedChunk.bbox) : '-'}</div>
+                  <div className="grid gap-3 rounded-md border bg-muted/20 p-3 text-sm sm:grid-cols-2">
+                    {selectedChunkMetadata.map((item) => (
+                      <div key={item.label} className="min-w-0">
+                        <div className="text-muted-foreground text-xs font-medium uppercase tracking-wide">
+                          {item.label}
+                        </div>
+                        <div className={cn('break-words', item.mono && 'font-mono text-xs')}>
+                          {String(item.value)}
+                        </div>
+                      </div>
+                    ))}
                   </div>
 
                   {isImageChunk(selectedChunk) && selectedChunkImageSrc && (
@@ -263,11 +334,27 @@ export default function ChunksExplorer() {
                     </div>
                   )}
 
-                  <div className="min-h-0 flex-1 overflow-auto rounded-md border bg-muted/10 p-3">
-                    <pre className="whitespace-pre-wrap break-all text-xs leading-5">
-                      {selectedChunk.content}
-                    </pre>
-                  </div>
+                  {selectedChunk.image_text && (
+                    <div className="rounded-md border bg-muted/10 p-3">
+                      <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        {t('chunksPanel.previewFields.imageText', 'Image Text')}
+                      </div>
+                      <pre className="whitespace-pre-wrap break-words text-xs leading-5">
+                        {selectedChunk.image_text}
+                      </pre>
+                    </div>
+                  )}
+
+                  {!isImageChunk(selectedChunk) && (
+                    <div className="min-h-0 flex-1 overflow-auto rounded-md border bg-muted/10 p-3">
+                      <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        {t('chunksPanel.previewFields.content', 'Content')}
+                      </div>
+                      <pre className="whitespace-pre-wrap break-words text-xs leading-5">
+                        {selectedChunk.content}
+                      </pre>
+                    </div>
+                  )}
                 </>
               ) : (
                 <EmptyCard

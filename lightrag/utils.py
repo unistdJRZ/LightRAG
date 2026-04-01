@@ -3350,6 +3350,27 @@ def convert_to_user_format(
 ) -> dict[str, Any]:
     """Convert internal data format to user-friendly format using original database data"""
 
+    chunk_id_to_reference_id: dict[str, str] = {}
+    for chunk in chunks:
+        chunk_id = str(chunk.get("chunk_id", "")).strip()
+        reference_id = str(chunk.get("reference_id", "")).strip()
+        if chunk_id and reference_id and chunk_id not in chunk_id_to_reference_id:
+            chunk_id_to_reference_id[chunk_id] = reference_id
+
+    def _resolve_related_chunk(
+        source_id: Any,
+        missing_message: str,
+    ) -> str:
+        if not isinstance(source_id, str) or not source_id.strip():
+            return missing_message
+
+        for chunk_id in split_string_by_multi_markers(source_id, [GRAPH_FIELD_SEP]):
+            reference_id = chunk_id_to_reference_id.get(chunk_id)
+            if reference_id:
+                return reference_id
+
+        return missing_message
+
     # Convert entities format using original data when available
     formatted_entities = []
     for entity in entities_context:
@@ -3362,26 +3383,34 @@ def convert_to_user_format(
 
         if original_entity:
             # Use original database data
+            source_id = original_entity.get("source_id", "")
             formatted_entities.append(
                 {
                     "entity_name": original_entity.get("entity_name", entity_name),
                     "entity_type": original_entity.get("entity_type", "UNKNOWN"),
                     "description": original_entity.get("description", ""),
-                    "source_id": original_entity.get("source_id", ""),
+                    "source_id": source_id,
                     "file_path": original_entity.get("file_path", "unknown_source"),
                     "created_at": original_entity.get("created_at", ""),
+                    "related_chunk": _resolve_related_chunk(
+                        source_id, "本实体 仅用于知识补充，禁止引用。"
+                    ),
                 }
             )
         else:
             # Fallback to LLM context data (for backward compatibility)
+            source_id = entity.get("source_id", "")
             formatted_entities.append(
                 {
                     "entity_name": entity_name,
                     "entity_type": entity.get("type", "UNKNOWN"),
                     "description": entity.get("description", ""),
-                    "source_id": entity.get("source_id", ""),
+                    "source_id": source_id,
                     "file_path": entity.get("file_path", "unknown_source"),
                     "created_at": entity.get("created_at", ""),
+                    "related_chunk": _resolve_related_chunk(
+                        source_id, "本实体 仅用于知识补充，禁止引用。"
+                    ),
                 }
             )
 
@@ -3399,6 +3428,7 @@ def convert_to_user_format(
 
         if original_relation:
             # Use original database data
+            source_id = original_relation.get("source_id", "")
             formatted_relationships.append(
                 {
                     "src_id": original_relation.get("src_id", entity1),
@@ -3406,13 +3436,17 @@ def convert_to_user_format(
                     "description": original_relation.get("description", ""),
                     "keywords": original_relation.get("keywords", ""),
                     "weight": original_relation.get("weight", 1.0),
-                    "source_id": original_relation.get("source_id", ""),
+                    "source_id": source_id,
                     "file_path": original_relation.get("file_path", "unknown_source"),
                     "created_at": original_relation.get("created_at", ""),
+                    "related_chunk": _resolve_related_chunk(
+                        source_id, "本边 仅用于知识补充，禁止引用。"
+                    ),
                 }
             )
         else:
             # Fallback to LLM context data (for backward compatibility)
+            source_id = relation.get("source_id", "")
             formatted_relationships.append(
                 {
                     "src_id": entity1,
@@ -3420,9 +3454,12 @@ def convert_to_user_format(
                     "description": relation.get("description", ""),
                     "keywords": relation.get("keywords", ""),
                     "weight": relation.get("weight", 1.0),
-                    "source_id": relation.get("source_id", ""),
+                    "source_id": source_id,
                     "file_path": relation.get("file_path", "unknown_source"),
                     "created_at": relation.get("created_at", ""),
+                    "related_chunk": _resolve_related_chunk(
+                        source_id, "本边 仅用于知识补充，禁止引用。"
+                    ),
                 }
             )
 

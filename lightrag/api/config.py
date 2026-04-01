@@ -425,6 +425,7 @@ def parse_args() -> argparse.Namespace:
     args.ocr_request_timeout_seconds = get_env_value(
         "OCR_REQUEST_TIMEOUT_SECONDS", 300, int
     )
+    args.ocr_chunk_merge_thr = get_env_value("OCR_CHUNK_MERGE_THR", 50, int)
 
     # Add environment variables that were previously read directly
     default_cors_origins = (
