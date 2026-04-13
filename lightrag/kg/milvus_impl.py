@@ -22,6 +22,48 @@ config.read("config.ini", "utf-8")
 @final
 @dataclass
 class MilvusVectorDBStorage(BaseVectorStorage):
+    def _get_lightweight_meta_fields(self) -> set[str]:
+        """Return only the small identifier fields that should live in Milvus."""
+        if self.namespace.endswith("entities"):
+            return {"entity_name"}
+        if self.namespace.endswith("relationships"):
+            return {"src_id", "tgt_id"}
+        return set()
+
+    def _get_output_fields(self) -> list[str]:
+        return ["created_at", *sorted(self._get_lightweight_meta_fields())]
+
+    def _resolve_milvus_uri(self) -> str:
+        """Resolve Milvus Standalone connection target."""
+        configured_uri = os.environ.get("MILVUS_URI") or config.get(
+            "milvus", "uri", fallback=""
+        )
+        if configured_uri and configured_uri.strip():
+            return configured_uri.strip()
+
+        return "http://localhost:19530"
+
+    def _get_milvus_client_kwargs(self) -> dict[str, Any]:
+        uri = self._resolve_milvus_uri()
+        client_kwargs: dict[str, Any] = {"uri": uri}
+        logger.info(
+            f"[{self.workspace}] Using Milvus Standalone endpoint '{uri}' for namespace '{self.namespace}'"
+        )
+
+        client_kwargs["user"] = os.environ.get(
+            "MILVUS_USER", config.get("milvus", "user", fallback=None)
+        )
+        client_kwargs["password"] = os.environ.get(
+            "MILVUS_PASSWORD", config.get("milvus", "password", fallback=None)
+        )
+        client_kwargs["token"] = os.environ.get(
+            "MILVUS_TOKEN", config.get("milvus", "token", fallback=None)
+        )
+        client_kwargs["db_name"] = os.environ.get(
+            "MILVUS_DB_NAME", config.get("milvus", "db_name", fallback=None)
+        )
+        return client_kwargs
+
     def _create_schema_for_namespace(self) -> CollectionSchema:
         """Create schema based on the current instance's namespace"""
 
@@ -31,7 +73,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         # Base fields (common to all collections)
         base_fields = [
             FieldSchema(
-                name="id", dtype=DataType.VARCHAR, max_length=64, is_primary=True
+                name="id", dtype=DataType.VARCHAR, max_length=1024, is_primary=True
             ),
             FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=dimension),
             FieldSchema(name="created_at", dtype=DataType.INT64),
@@ -43,13 +85,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 FieldSchema(
                     name="entity_name",
                     dtype=DataType.VARCHAR,
-                    max_length=512,
-                    nullable=True,
-                ),
-                FieldSchema(
-                    name="file_path",
-                    dtype=DataType.VARCHAR,
-                    max_length=DEFAULT_MAX_FILE_PATH_LENGTH,
+                    max_length=1024,
                     nullable=True,
                 ),
             ]
@@ -58,47 +94,21 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         elif self.namespace.endswith("relationships"):
             specific_fields = [
                 FieldSchema(
-                    name="src_id", dtype=DataType.VARCHAR, max_length=512, nullable=True
+                    name="src_id", dtype=DataType.VARCHAR, max_length=1024, nullable=True
                 ),
                 FieldSchema(
-                    name="tgt_id", dtype=DataType.VARCHAR, max_length=512, nullable=True
-                ),
-                FieldSchema(
-                    name="file_path",
-                    dtype=DataType.VARCHAR,
-                    max_length=DEFAULT_MAX_FILE_PATH_LENGTH,
-                    nullable=True,
+                    name="tgt_id", dtype=DataType.VARCHAR, max_length=1024, nullable=True
                 ),
             ]
             description = "LightRAG relationships vector storage"
 
         elif self.namespace.endswith("chunks"):
-            specific_fields = [
-                FieldSchema(
-                    name="full_doc_id",
-                    dtype=DataType.VARCHAR,
-                    max_length=64,
-                    nullable=True,
-                ),
-                FieldSchema(
-                    name="file_path",
-                    dtype=DataType.VARCHAR,
-                    max_length=DEFAULT_MAX_FILE_PATH_LENGTH,
-                    nullable=True,
-                ),
-            ]
+            specific_fields = []
             description = "LightRAG chunks vector storage"
 
         else:
             # Default generic schema (backward compatibility)
-            specific_fields = [
-                FieldSchema(
-                    name="file_path",
-                    dtype=DataType.VARCHAR,
-                    max_length=DEFAULT_MAX_FILE_PATH_LENGTH,
-                    nullable=True,
-                ),
-            ]
+            specific_fields = []
             description = "LightRAG generic vector storage"
 
         # Merge all fields
@@ -107,7 +117,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         return CollectionSchema(
             fields=all_fields,
             description=description,
-            enable_dynamic_field=True,  # Support dynamic fields
+            enable_dynamic_field=False,
         )
 
     def _get_index_params(self):
@@ -216,9 +226,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     )
                     self._create_vector_index_fallback()
 
-                # Create scalar indexes based on namespace
                 if self.namespace.endswith("entities"):
-                    # Create indexes for entity fields
                     try:
                         entity_name_index = self._get_index_params()
                         entity_name_index.add_index(
@@ -235,7 +243,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                         self._create_scalar_index_fallback("entity_name", "INVERTED")
 
                 elif self.namespace.endswith("relationships"):
-                    # Create indexes for relationship fields
                     try:
                         src_id_index = self._get_index_params()
                         src_id_index.add_index(
@@ -266,42 +273,19 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                         )
                         self._create_scalar_index_fallback("tgt_id", "INVERTED")
 
-                elif self.namespace.endswith("chunks"):
-                    # Create indexes for chunk fields
-                    try:
-                        doc_id_index = self._get_index_params()
-                        doc_id_index.add_index(
-                            field_name="full_doc_id", index_type="INVERTED"
-                        )
-                        self._client.create_index(
-                            collection_name=self.final_namespace,
-                            index_params=doc_id_index,
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"[{self.workspace}] IndexParams method failed for full_doc_id: {e}"
-                        )
-                        self._create_scalar_index_fallback("full_doc_id", "INVERTED")
-
-                # No common indexes needed
-
             else:
                 # Fallback to direct API calls if IndexParams is not available
                 logger.info(
                     f"[{self.workspace}] IndexParams not available, using fallback methods for {self.namespace}"
                 )
 
-                # Create vector index using fallback
                 self._create_vector_index_fallback()
 
-                # Create scalar indexes using fallback
                 if self.namespace.endswith("entities"):
                     self._create_scalar_index_fallback("entity_name", "INVERTED")
                 elif self.namespace.endswith("relationships"):
                     self._create_scalar_index_fallback("src_id", "INVERTED")
                     self._create_scalar_index_fallback("tgt_id", "INVERTED")
-                elif self.namespace.endswith("chunks"):
-                    self._create_scalar_index_fallback("full_doc_id", "INVERTED")
 
             logger.info(
                 f"[{self.workspace}] Created indexes for collection: {self.namespace}"
@@ -322,27 +306,17 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             "created_at": {"type": "Int64"},
         }
 
-        # Add specific fields based on namespace
         if self.namespace.endswith("entities"):
             specific_fields = {
                 "entity_name": {"type": "VarChar"},
-                "file_path": {"type": "VarChar"},
             }
         elif self.namespace.endswith("relationships"):
             specific_fields = {
                 "src_id": {"type": "VarChar"},
                 "tgt_id": {"type": "VarChar"},
-                "file_path": {"type": "VarChar"},
-            }
-        elif self.namespace.endswith("chunks"):
-            specific_fields = {
-                "full_doc_id": {"type": "VarChar"},
-                "file_path": {"type": "VarChar"},
             }
         else:
-            specific_fields = {
-                "file_path": {"type": "VarChar"},
-            }
+            specific_fields = {}
 
         return {**base_fields, **specific_fields}
 
@@ -991,32 +965,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             try:
                 # Create MilvusClient if not already created
                 if self._client is None:
-                    self._client = MilvusClient(
-                        uri=os.environ.get(
-                            "MILVUS_URI",
-                            config.get(
-                                "milvus",
-                                "uri",
-                                fallback=os.path.join(
-                                    self.global_config["working_dir"], "milvus_lite.db"
-                                ),
-                            ),
-                        ),
-                        user=os.environ.get(
-                            "MILVUS_USER", config.get("milvus", "user", fallback=None)
-                        ),
-                        password=os.environ.get(
-                            "MILVUS_PASSWORD",
-                            config.get("milvus", "password", fallback=None),
-                        ),
-                        token=os.environ.get(
-                            "MILVUS_TOKEN", config.get("milvus", "token", fallback=None)
-                        ),
-                        db_name=os.environ.get(
-                            "MILVUS_DB_NAME",
-                            config.get("milvus", "db_name", fallback=None),
-                        ),
-                    )
+                    self._client = MilvusClient(**self._get_milvus_client_kwargs())
                     logger.debug(
                         f"[{self.workspace}] MilvusClient created successfully"
                     )
@@ -1049,7 +998,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             {
                 "id": k,
                 "created_at": current_time,
-                **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
+                **{
+                    k1: v1
+                    for k1, v1 in v.items()
+                    if k1 in self._get_lightweight_meta_fields()
+                },
             }
             for k, v in data.items()
         ]
@@ -1070,6 +1023,42 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         )
         return results
 
+    async def upsert_precomputed(self, data: dict[str, dict[str, Any]]) -> None:
+        """Insert or update vectors with precomputed embeddings.
+
+        This is used by migration tooling so existing vector payloads can be
+        copied into Milvus without recomputing embeddings.
+        """
+        if not data:
+            return
+
+        self._ensure_collection_loaded()
+
+        import time
+
+        current_time = int(time.time())
+        list_data: list[dict[str, Any]] = []
+        for item_id, item in data.items():
+            vector = item.get("__vector__", item.get("vector"))
+            if vector is None:
+                raise ValueError(
+                    f"[{self.workspace}] Missing precomputed vector for '{item_id}' in {self.namespace}"
+                )
+
+            row = {
+                "id": item_id,
+                "created_at": int(item.get("created_at", current_time)),
+                "vector": np.asarray(vector, dtype=np.float32).tolist(),
+                **{
+                    key: value
+                    for key, value in item.items()
+                    if key in self._get_lightweight_meta_fields()
+                },
+            }
+            list_data.append(row)
+
+        self._client.upsert(collection_name=self.final_namespace, data=list_data)
+
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
     ) -> list[dict[str, Any]]:
@@ -1084,8 +1073,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 [query], _priority=5
             )  # higher priority for query
 
-        # Include all meta_fields (created_at is now always included)
-        output_fields = list(self.meta_fields)
+        output_fields = self._get_output_fields()
 
         results = self._client.search(
             collection_name=self.final_namespace,
@@ -1099,10 +1087,10 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         )
         return [
             {
-                **dp["entity"],
+                **dp.get("entity", {}),
                 "id": dp["id"],
                 "distance": dp["distance"],
-                "created_at": dp.get("created_at"),
+                "created_at": dp.get("entity", {}).get("created_at"),
             }
             for dp in results[0]
         ]
@@ -1118,7 +1106,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             entity_name: The name of the entity to delete
         """
         try:
-            # Compute entity ID from name
+            self._ensure_collection_loaded()
+
             entity_id = compute_mdhash_id(entity_name, prefix="ent-")
             logger.debug(
                 f"[{self.workspace}] Attempting to delete entity {entity_name} with ID {entity_id}"
@@ -1148,37 +1137,31 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             entity_name: The name of the entity whose relations should be deleted
         """
         try:
-            # Ensure collection is loaded before querying
             self._ensure_collection_loaded()
 
-            # Search for relations where entity is either source or target
-            expr = f'src_id == "{entity_name}" or tgt_id == "{entity_name}"'
-
-            # Find all relations involving this entity
-            results = self._client.query(
-                collection_name=self.final_namespace, filter=expr, output_fields=["id"]
+            escaped_entity_name = entity_name.replace("\\", "\\\\").replace('"', '\\"')
+            result = self._client.query(
+                collection_name=self.final_namespace,
+                filter=(
+                    f'src_id == "{escaped_entity_name}" '
+                    f'or tgt_id == "{escaped_entity_name}"'
+                ),
+                output_fields=["id"],
             )
+            ids_to_delete = [
+                str(row["id"]) for row in result if isinstance(row, dict) and row.get("id")
+            ]
 
-            if not results or len(results) == 0:
-                logger.debug(
-                    f"[{self.workspace}] No relations found for entity {entity_name}"
-                )
-                return
-
-            # Extract IDs of relations to delete
-            relation_ids = [item["id"] for item in results]
-            logger.debug(
-                f"[{self.workspace}] Found {len(relation_ids)} relations for entity {entity_name}"
-            )
-
-            # Delete the relations
-            if relation_ids:
+            if ids_to_delete:
                 delete_result = self._client.delete(
-                    collection_name=self.final_namespace, pks=relation_ids
+                    collection_name=self.final_namespace, pks=ids_to_delete
                 )
-
                 logger.debug(
                     f"[{self.workspace}] Deleted {delete_result.get('delete_count', 0)} relations for {entity_name}"
+                )
+            else:
+                logger.debug(
+                    f"[{self.workspace}] No relations found for entity {entity_name}"
                 )
 
         except Exception as e:
@@ -1227,7 +1210,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             self._ensure_collection_loaded()
 
             # Include all meta_fields (created_at is now always included) plus id
-            output_fields = list(self.meta_fields) + ["id"]
+            output_fields = self._get_output_fields() + ["id"]
 
             # Query Milvus for a specific ID
             result = self._client.query(
@@ -1263,7 +1246,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             self._ensure_collection_loaded()
 
             # Include all meta_fields (created_at is now always included) plus id
-            output_fields = list(self.meta_fields) + ["id"]
+            output_fields = self._get_output_fields() + ["id"]
 
             # Prepare the ID filter expression
             id_list = '", "'.join(ids)

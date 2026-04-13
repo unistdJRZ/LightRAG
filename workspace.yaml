@@ -3,10 +3,14 @@
 # Legacy format is still supported:
 # workspace: "default,team_a,team_b"
 workspaces:
-  - id: default_storage
-    alias: Default Workspace
+  - id: msre
+    alias: MSRE代表文献
+  - id: msr_1
+    alias: MSR-1
   - id: ornl_test
     alias: 橡树岭测试
+  - id: batch_test
+    alias: 批量导入测试
 
 # Backend dev server (FastAPI)
 backend_host: "0.0.0.0"

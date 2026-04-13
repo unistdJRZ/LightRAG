@@ -1,0 +1,24 @@
+services:
+  postgres-age-pgvector:
+    container_name: lightrag-postgres-age
+    image: lightrag/postgres-age-pgvector:latest
+    build:
+      context: ../..
+      dockerfile: docker/postgres-age-pgvector/Dockerfile
+    ports:
+      - "5455:5432"
+    environment:
+      POSTGRES_USER: postgresUser
+      POSTGRES_PASSWORD: postgresPW
+      POSTGRES_DB: postgresDB
+    volumes:
+      - type: bind
+        source: G:/postgredocker_data
+        target: /var/lib/postgresql
+    shm_size: 1g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10

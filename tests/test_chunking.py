@@ -1,9 +1,12 @@
 import asyncio
+import uuid
 
 import pytest
 
+from lightrag.base import DocProcessingStatus, DocStatus
 from lightrag.exceptions import ChunkTokenLimitExceededError
 from lightrag.lightrag import LightRAG, _normalize_enqueue_document
+from lightrag.kg.shared_storage import initialize_pipeline_status, initialize_share_data
 from lightrag.operate import chunking_by_token_size
 from lightrag.utils import Tokenizer, TokenizerInterface
 
@@ -1149,6 +1152,40 @@ def test_normalize_enqueue_document_accepts_full_content_with_segments():
 
 
 @pytest.mark.offline
+def test_normalize_enqueue_document_accepts_image_segment_without_image_text():
+    normalized = _normalize_enqueue_document(
+        {
+            "content": "document with image",
+            "content_segments": [
+                {
+                    "content": "data:image/png;base64,AAAA",
+                    "content_type": "image",
+                    "page_id": 2,
+                    "bbox": [10, 20, 30, 40],
+                    "page_size": [612, 792],
+                    "chunk_id": 11,
+                }
+            ],
+        }
+    )
+
+    assert normalized == {
+        "content": "document with image",
+        "content_segments": [
+            {
+                "content": "[embedded image]",
+                "page_id": 2,
+                "bbox": [10.0, 20.0, 30.0, 40.0],
+                "page_size": [612.0, 792.0],
+                "content_type": "image",
+                "image_base64": "data:image/png;base64,AAAA",
+                "ocr_chunk_id": 11,
+            }
+        ],
+    }
+
+
+@pytest.mark.offline
 def test_chunk_document_content_keeps_image_segment_as_single_chunk():
     rag = LightRAG.__new__(LightRAG)
     rag.tokenizer = make_tokenizer()
@@ -1192,6 +1229,138 @@ def test_chunk_document_content_keeps_image_segment_as_single_chunk():
     assert chunks[2]["bbox"] == [10, 10, 20, 20]
     assert chunks[2]["page_size"] == [612, 792]
     assert chunks[2]["ocr_chunk_id"] == 99
+
+
+class _FakeDocStatusStorage:
+    def __init__(self, initial_records: dict[str, dict]):
+        self.records = {doc_id: dict(payload) for doc_id, payload in initial_records.items()}
+
+    async def get_docs_by_status(self, status: DocStatus):
+        result = {}
+        for doc_id, payload in self.records.items():
+            if payload["status"] == status:
+                result[doc_id] = DocProcessingStatus(
+                    content_summary=payload["content_summary"],
+                    content_length=payload["content_length"],
+                    file_path=payload["file_path"],
+                    status=payload["status"],
+                    created_at=payload["created_at"],
+                    updated_at=payload["updated_at"],
+                    track_id=payload.get("track_id"),
+                    chunks_count=payload.get("chunks_count"),
+                    chunks_list=list(payload.get("chunks_list", []) or []),
+                    error_msg=payload.get("error_msg"),
+                    metadata=dict(payload.get("metadata", {}) or {}),
+                )
+        return result
+
+    async def upsert(self, data: dict[str, dict]):
+        for doc_id, payload in data.items():
+            current = dict(self.records.get(doc_id, {}))
+            current.update(payload)
+            self.records[doc_id] = current
+
+    async def delete(self, doc_ids: list[str]):
+        for doc_id in doc_ids:
+            self.records.pop(doc_id, None)
+
+
+class _FakeFullDocsStorage:
+    def __init__(self, records: dict[str, dict]):
+        self.records = records
+
+    async def get_by_id(self, doc_id: str):
+        record = self.records.get(doc_id)
+        return dict(record) if record else None
+
+
+class _FakeTextChunksStorage:
+    def __init__(self):
+        self.records: dict[str, dict] = {}
+
+    async def upsert(self, data: dict[str, dict]):
+        self.records.update({chunk_id: dict(payload) for chunk_id, payload in data.items()})
+
+
+class _FakeVectorStorage:
+    def __init__(self):
+        self.upserts: list[dict[str, dict]] = []
+
+    async def upsert(self, data: dict[str, dict]):
+        self.upserts.append(dict(data))
+
+
+@pytest.mark.offline
+def test_apipeline_process_enqueue_documents_preserves_chunk_metadata_on_failed_extraction():
+    workspace = f"test-failed-chunks-{uuid.uuid4().hex}"
+    initialize_share_data()
+    asyncio.run(initialize_pipeline_status(workspace))
+
+    doc_id = "doc-test"
+    created_at = "2025-01-01T00:00:00+00:00"
+
+    rag = LightRAG.__new__(LightRAG)
+    rag.workspace = workspace
+    rag.max_parallel_insert = 1
+    rag.llm_response_cache = None
+    rag.full_entities = None
+    rag.full_relations = None
+    rag.entity_chunks = None
+    rag.relation_chunks = None
+    rag.entities_vdb = None
+    rag.relationships_vdb = None
+    rag.chunk_entity_relation_graph = None
+    rag.doc_status = _FakeDocStatusStorage(
+        {
+            doc_id: {
+                "status": DocStatus.PENDING,
+                "content_summary": "summary",
+                "content_length": 11,
+                "created_at": created_at,
+                "updated_at": created_at,
+                "file_path": "doc.txt",
+                "track_id": "track-1",
+                "metadata": {},
+            }
+        }
+    )
+    rag.full_docs = _FakeFullDocsStorage(
+        {
+            doc_id: {
+                "content": "hello world",
+                "file_path": "doc.txt",
+            }
+        }
+    )
+    rag.text_chunks = _FakeTextChunksStorage()
+    rag.chunks_vdb = _FakeVectorStorage()
+    rag._embedding_vlm_enabled = lambda: False
+
+    async def _fake_chunk_document_content(*args, **kwargs):
+        return [
+            {
+                "content": "hello world",
+                "tokens": 2,
+                "chunk_order_index": 0,
+            }
+        ]
+
+    async def _fake_process_extract_entities(*args, **kwargs):
+        raise RuntimeError("simulated extraction failure")
+
+    rag._chunk_document_content = _fake_chunk_document_content
+    rag._process_extract_entities = _fake_process_extract_entities
+
+    asyncio.run(rag.apipeline_process_enqueue_documents())
+
+    final_status = rag.doc_status.records[doc_id]
+    stored_chunk_ids = list(rag.text_chunks.records.keys())
+
+    assert final_status["status"] == DocStatus.FAILED
+    assert final_status["error_msg"] == "simulated extraction failure"
+    assert final_status["chunks_count"] == 1
+    assert final_status["chunks_list"] == stored_chunk_ids
+    assert len(stored_chunk_ids) == 1
 
 
 @pytest.mark.offline

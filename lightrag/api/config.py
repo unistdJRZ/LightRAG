@@ -53,10 +53,10 @@ ollama_server_infos = OllamaServerInfos()
 
 
 class DefaultRAGStorageConfig:
-    KV_STORAGE = "JsonKVStorage"
-    VECTOR_STORAGE = "NanoVectorDBStorage"
-    GRAPH_STORAGE = "NetworkXStorage"
-    DOC_STATUS_STORAGE = "JsonDocStatusStorage"
+    KV_STORAGE = "PGKVStorage"
+    VECTOR_STORAGE = "MilvusVectorDBStorage"
+    GRAPH_STORAGE = "Neo4JStorage"
+    DOC_STATUS_STORAGE = "PGDocStatusStorage"
 
 
 def get_default_host(binding_type: str) -> str:
@@ -420,7 +420,7 @@ def parse_args() -> argparse.Namespace:
     # Added for /documents/register external OCR workflow
     args.ocr_server_url = get_env_value("OCR_SERVER_URL", None)
     args.ocr_poll_timeout_seconds = get_env_value(
-        "OCR_POLL_TIMEOUT_SECONDS", 300, int
+        "OCR_POLL_TIMEOUT_SECONDS", 1800, int
     )
     args.ocr_request_timeout_seconds = get_env_value(
         "OCR_REQUEST_TIMEOUT_SECONDS", 300, int

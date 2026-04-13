@@ -493,12 +493,14 @@ class PostgreSQLDB:
         """Set the Apache AGE environment and creates a graph if it does not exist.
 
         This method:
+        - Loads the Apache AGE library for the current session.
         - Sets the PostgreSQL `search_path` to include `ag_catalog`, ensuring that Apache AGE functions can be used without specifying the schema.
         - Attempts to create a new graph with the provided `graph_name` if it does not already exist.
         - Silently ignores errors related to the graph already existing.
 
         """
         try:
+            await connection.execute("LOAD 'age'")  # type: ignore
             await connection.execute(  # type: ignore
                 'SET search_path = ag_catalog, "$user", public'
             )
@@ -1650,6 +1652,21 @@ class PostgreSQLDB:
             embedding_dim: Embedding dimension for the vector column
         """
         if not self.vector_index_type:
+            return
+
+        if self.vector_index_type in {"HNSW", "IVFFLAT"} and embedding_dim > 2000:
+            logger.warning(
+                "Skipping %s vector index on table %s: pgvector %s indexes on "
+                "the vector type support at most 2000 dimensions, but the current "
+                "embedding dimension is %s. The table will still be created and "
+                "usable, but vector search will fall back to non-indexed scans "
+                "unless you switch to a <=2000d embedding, add halfvec-based "
+                "index/query support, or use another index backend.",
+                self.vector_index_type,
+                table_name,
+                self.vector_index_type,
+                embedding_dim,
+            )
             return
 
         create_sql = {
@@ -3145,6 +3162,51 @@ class PGVectorStorage(BaseVectorStorage):
             await self.db._run_with_retry(_batch_upsert)
             logger.debug(
                 f"[{self.workspace}] Batch upserted {len(batch_values)} records to {self.namespace}"
+            )
+
+    async def upsert_precomputed(self, data: dict[str, dict[str, Any]]) -> None:
+        """Insert or update vector rows using precomputed embeddings."""
+        logger.debug(
+            f"[{self.workspace}] Inserting {len(data)} precomputed vectors to {self.namespace}"
+        )
+        if not data:
+            return
+
+        current_time = datetime.datetime.now(timezone.utc).replace(tzinfo=None)
+        batch_values: list[tuple[Any, ...]] = []
+        upsert_sql = None
+
+        for key, value in data.items():
+            if "__vector__" not in value:
+                raise ValueError(
+                    f"Precomputed vector payload for '{key}' is missing '__vector__'"
+                )
+
+            item = {
+                "__id__": key,
+                **value,
+                "__vector__": np.asarray(value["__vector__"], dtype=np.float32),
+            }
+
+            if is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
+                upsert_sql, values = self._upsert_chunks(item, current_time)
+            elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_ENTITIES):
+                upsert_sql, values = self._upsert_entities(item, current_time)
+            elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_RELATIONSHIPS):
+                upsert_sql, values = self._upsert_relationships(item, current_time)
+            else:
+                raise ValueError(f"{self.namespace} is not supported")
+
+            batch_values.append(values)
+
+        if batch_values and upsert_sql:
+
+            async def _batch_upsert(connection: asyncpg.Connection) -> None:
+                await connection.executemany(upsert_sql, batch_values)
+
+            await self.db._run_with_retry(_batch_upsert)
+            logger.debug(
+                f"[{self.workspace}] Batch upserted {len(batch_values)} precomputed records to {self.namespace}"
             )
 
     #################### query method ###############

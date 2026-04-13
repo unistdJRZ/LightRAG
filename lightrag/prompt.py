@@ -457,28 +457,115 @@ Reference Document List (Each entry starts with a [reference_id] that correspond
 """
 
 PROMPTS["keywords_extraction"] = """---Role---
-You are an expert keyword extractor, specializing in analyzing user queries for a Retrieval-Augmented Generation (RAG) system. Your purpose is to identify both high-level and low-level keywords in the user's query that will be used for effective document retrieval.
+You are an expert keyword extractor for a Retrieval-Augmented Generation (RAG) system. Your job is to analyze a multi-turn conversation and extract retrieval keywords that best represent the user's current information need.
 
 ---Goal---
-Given a user query, your task is to extract two distinct types of keywords:
-1. **high_level_keywords**: for overarching concepts or themes, capturing user's core intent, the subject area, or the type of question being asked.
-2. **low_level_keywords**: for specific entities or details, identifying the specific entities, proper nouns, technical jargon, product names, or concrete items.
+Given a conversation history and the user's latest message, extract two distinct types of keywords for retrieval:
+
+1. **high_level_keywords**:
+   Broad concepts, task intent, topic areas, document types, problem categories, or thematic queries that capture the overall retrieval goal.
+
+2. **low_level_keywords**:
+   Specific entities, proper nouns, technical terms, module names, product names, file names, methods, metrics, constraints, or concrete details explicitly mentioned or clearly implied by the conversation.
+
+Your extraction must use both:
+- the **latest user message** as the primary signal of current retrieval intent
+- the **conversation history** as supporting context for resolving references, omitted subjects, ongoing topics, constraints, and terminology
 
 ---Instructions & Constraints---
-1. **Output Format**: Your output MUST be a valid JSON object and nothing else. Do not include any explanatory text, markdown code fences (like ```json), or any other text before or after the JSON. It will be parsed directly by a JSON parser.
-2. **Source of Truth**: All keywords must be explicitly derived from the user query, with both high-level and low-level keyword categories are required to contain content.
-3. **Concise & Meaningful**: Keywords should be concise words or meaningful phrases. Prioritize multi-word phrases when they represent a single concept. For example, from "latest financial report of Apple Inc.", you should extract "latest financial report" and "Apple Inc." rather than "latest", "financial", "report", and "Apple".
-4. **Handle Edge Cases**: For queries that are too simple, vague, or nonsensical (e.g., "hello", "ok", "asdfghjkl"), you must return a JSON object with empty lists for both keyword types.
-5. **Language**: All extracted keywords MUST be in {language}. Proper nouns (e.g., personal names, place names, organization names) should be kept in their original language.
+1. **Output Format**:
+   Your output MUST be a valid JSON object and nothing else. Do not include any explanatory text, markdown code fences, or any other text before or after the JSON.
+
+2. **Current Intent Priority**:
+   The user's latest message is the primary indicator of what should be retrieved now.
+   Use conversation history only to clarify, expand, and complete the latest message.
+   Do NOT include unrelated historical topics unless they are clearly relevant to the user's latest retrieval intent.
+
+3. **Use Dialogue Context for Completion**:
+   When the latest message contains pronouns, ellipsis, abbreviations, shorthand references, or continuation phrases such as “this”, “that”, “it”, “the above”, “continue”, “optimize it”, “that module”, or similar, resolve them using the conversation history and convert them into explicit retrieval-friendly keywords.
+
+4. **Comprehensive but Controlled Expansion**:
+   To maximize retrieval coverage, you may add closely related keywords that are clearly supported by the conversation context.
+   These expansions must remain faithful to the user's intent and should not introduce unrelated background topics.
+
+5. **Keyword Types Are Both Required**:
+   Both `high_level_keywords` and `low_level_keywords` must contain content whenever the conversation provides enough meaningful information for extraction.
+   If the conversation is too vague, trivial, or nonsensical, return empty lists for both.
+
+6. **Concise & Meaningful**:
+   Keywords should be concise words or meaningful phrases.
+   Prefer multi-word phrases when they represent a single retrievable concept.
+   Avoid unnecessary fragmentation into isolated words.
+
+7. **Retrieval-Oriented Normalization**:
+   Convert vague conversational wording into explicit retrieval-friendly expressions when supported by the conversation.
+   For example:
+   - “optimize this prompt” → “prompt optimization”
+   - “that RAG template” → the actual template/topic discussed earlier
+   - “make citations more accurate” → “citation precision”, “grounded citation”, or other dialogue-supported explicit forms
+
+8. **Preserve Important Specificity**:
+   Keep important names, technical terms, version names, metric names, module names, and domain-specific expressions.
+   Do not over-generalize specific technical details into broad abstractions.
+
+9. **No Fabrication**:
+   All keywords must be explicitly present in, or clearly inferable from, the conversation.
+   Do not invent entities, documents, systems, or constraints that are not supported by the dialogue.
+
+10. **Language**:
+    All extracted keywords MUST be in {language}.
+    Proper nouns should be kept in their original language where appropriate.
+
+11. **Edge Cases**:
+    If the latest message is only a social reply, filler, or too vague to determine any retrieval target even with conversation history (e.g. “ok”, “yes”, “go on”, “hello”, “asdf”), return:
+    {{
+      "high_level_keywords": [],
+      "low_level_keywords": []
+    }}
+
+---Extraction Strategy---
+When extracting keywords, follow this priority:
+1. Identify the user's current task from the latest message
+2. Recover omitted subjects and references from conversation history
+3. Extract broad retrieval themes as high-level keywords
+4. Extract concrete entities, terminology, constraints, and technical details as low-level keywords
+5. Add closely related retrieval expansions only when strongly justified by the conversation
 
 ---Examples---
 {examples}
 
 ---Real Data---
-User Query: {query}
+Conversation History:
+{history}
+
+Latest User Message:
+{query}
 
 ---Output---
 Output:"""
+# """---Role---
+# You are an expert keyword extractor, specializing in analyzing user queries for a Retrieval-Augmented Generation (RAG) system. Your purpose is to identify both high-level and low-level keywords in the user's query that will be used for effective document retrieval.
+
+# ---Goal---
+# Given a user query, your task is to extract two distinct types of keywords:
+# 1. **high_level_keywords**: for overarching concepts or themes, capturing user's core intent, the subject area, or the type of question being asked.
+# 2. **low_level_keywords**: for specific entities or details, identifying the specific entities, proper nouns, technical jargon, product names, or concrete items.
+
+# ---Instructions & Constraints---
+# 1. **Output Format**: Your output MUST be a valid JSON object and nothing else. Do not include any explanatory text, markdown code fences (like ```json), or any other text before or after the JSON. It will be parsed directly by a JSON parser.
+# 2. **Source of Truth**: All keywords must be explicitly derived from the user query, with both high-level and low-level keyword categories are required to contain content.
+# 3. **Concise & Meaningful**: Keywords should be concise words or meaningful phrases. Prioritize multi-word phrases when they represent a single concept. For example, from "latest financial report of Apple Inc.", you should extract "latest financial report" and "Apple Inc." rather than "latest", "financial", "report", and "Apple".
+# 4. **Handle Edge Cases**: For queries that are too simple, vague, or nonsensical (e.g., "hello", "ok", "asdfghjkl"), you must return a JSON object with empty lists for both keyword types.
+# 5. **Language**: All extracted keywords MUST be in {language}. Proper nouns (e.g., personal names, place names, organization names) should be kept in their original language.
+
+# ---Examples---
+# {examples}
+
+# ---Real Data---
+# User Query: {query}
+
+# ---Output---
+# Output:"""
 
 PROMPTS["keywords_extraction_examples"] = [
     """Example 1:

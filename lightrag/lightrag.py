@@ -92,6 +92,7 @@ from lightrag.operate import (
     merge_nodes_and_edges,
     kg_query,
     naive_query,
+    normalize_query_input,
     rebuild_knowledge_from_chunks,
 )
 from lightrag.constants import GRAPH_FIELD_SEP
@@ -189,8 +190,13 @@ def _normalize_structured_document_segments(
             segment.get("image_base64"),
             segment.get("image_text"),
         )
+        normalized_text_source = (
+            resolved_image_text or ""
+            if resolved_image_base64 is not None
+            else raw_content
+        )
         normalized_text = sanitize_text_for_encoding(
-            resolved_image_text if resolved_image_base64 is not None else raw_content
+            normalized_text_source
         ).strip()
         content = normalized_text
         if not content and resolved_image_base64 is not None:
@@ -320,16 +326,16 @@ class LightRAG:
     # Storage
     # ---
 
-    kv_storage: str = field(default="JsonKVStorage")
+    kv_storage: str = field(default="PGKVStorage")
     """Storage backend for key-value data."""
 
-    vector_storage: str = field(default="NanoVectorDBStorage")
+    vector_storage: str = field(default="MilvusVectorDBStorage")
     """Storage backend for vector embeddings."""
 
-    graph_storage: str = field(default="NetworkXStorage")
+    graph_storage: str = field(default="Neo4JStorage")
     """Storage backend for knowledge graphs."""
 
-    doc_status_storage: str = field(default="JsonDocStatusStorage")
+    doc_status_storage: str = field(default="PGDocStatusStorage")
     """Storage type for tracking document processing statuses."""
 
     # Workspace
@@ -1851,6 +1857,7 @@ class LightRAG:
             )
             original_error = error_file.get("original_error", "Unknown error")
             file_size = error_file.get("file_size", 0)
+            error_metadata = dict(error_file.get("metadata", {}) or {})
 
             # Generate unique doc_id with "error-" prefix
             doc_id_content = f"{file_path}-{error_description}"
@@ -1868,6 +1875,7 @@ class LightRAG:
                 "track_id": track_id,
                 "metadata": {
                     "error_type": "file_extraction_error",
+                    **error_metadata,
                 },
             }
 
@@ -2167,6 +2175,7 @@ class LightRAG:
                     existing_metadata = dict(getattr(status_doc, "metadata", {}) or {})
                     first_stage_tasks = []
                     entity_relation_task = None
+                    chunks: dict[str, Any] = {}
 
                     async with semaphore:# 用信号量限制该函数并发数
                         nonlocal processed_count
@@ -2393,12 +2402,24 @@ class LightRAG:
 
                             # Record processing end time for failed case
                             processing_end_time = int(time.time())
+                            failed_chunks_count = (
+                                len(chunks)
+                                if chunks
+                                else getattr(status_doc, "chunks_count", None)
+                            )
+                            failed_chunks_list = (
+                                list(chunks.keys())
+                                if chunks
+                                else list(getattr(status_doc, "chunks_list", []) or [])
+                            )
 
                             # Update document status to failed
                             await self.doc_status.upsert(
                                 {
                                     doc_id: {
                                         "status": DocStatus.FAILED,
+                                        "chunks_count": failed_chunks_count,
+                                        "chunks_list": failed_chunks_list,
                                         "error_msg": str(e),
                                         "content_summary": status_doc.content_summary,
                                         "content_length": status_doc.content_length,
@@ -2522,12 +2543,26 @@ class LightRAG:
 
                                 # Record processing end time for failed case
                                 processing_end_time = int(time.time())
+                                failed_chunks_count = (
+                                    len(chunks)
+                                    if chunks
+                                    else getattr(status_doc, "chunks_count", None)
+                                )
+                                failed_chunks_list = (
+                                    list(chunks.keys())
+                                    if chunks
+                                    else list(
+                                        getattr(status_doc, "chunks_list", []) or []
+                                    )
+                                )
 
                                 # Update document status to failed
                                 await self.doc_status.upsert(
                                     {
                                         doc_id: {
                                             "status": DocStatus.FAILED,
+                                            "chunks_count": failed_chunks_count,
+                                            "chunks_list": failed_chunks_list,
                                             "error_msg": str(e),
                                             "content_summary": status_doc.content_summary,
                                             "content_length": status_doc.content_length,
@@ -2852,7 +2887,7 @@ class LightRAG:
 
     def query(
         self,
-        query: str,
+        query: str | dict[str, Any],
         param: QueryParam = QueryParam(),
         system_prompt: str | None = None,
     ) -> str | Iterator[str]:
@@ -2873,7 +2908,7 @@ class LightRAG:
 
     async def aquery(
         self,
-        query: str,
+        query: str | dict[str, Any],
         param: QueryParam = QueryParam(),
         system_prompt: str | None = None,
     ) -> str | AsyncIterator[str]:
@@ -2907,7 +2942,7 @@ class LightRAG:
 
     def query_data(
         self,
-        query: str,
+        query: str | dict[str, Any],
         param: QueryParam = QueryParam(),
     ) -> dict[str, Any]:
         """
@@ -2928,7 +2963,7 @@ class LightRAG:
 
     async def aquery_data(
         self,
-        query: str,
+        query: str | dict[str, Any],
         param: QueryParam = QueryParam(),
     ) -> dict[str, Any]:
         """
@@ -3039,26 +3074,34 @@ class LightRAG:
             fields at the top level.
         """
         global_config = asdict(self)
+        latest_query, effective_history = normalize_query_input(
+            query, fallback_history=param.conversation_history
+        )
+        effective_param = (
+            replace(param, conversation_history=effective_history)
+            if effective_history != param.conversation_history
+            else param
+        )
 
         # Create a copy of param to avoid modifying the original
         data_param = QueryParam(
-            mode=param.mode,
+            mode=effective_param.mode,
             only_need_context=True,  # Skip LLM generation, only get context and data
             only_need_prompt=False,
-            response_type=param.response_type,
+            response_type=effective_param.response_type,
             stream=False,  # Data retrieval doesn't need streaming
-            top_k=param.top_k,
-            chunk_top_k=param.chunk_top_k,
-            max_entity_tokens=param.max_entity_tokens,
-            max_relation_tokens=param.max_relation_tokens,
-            max_total_tokens=param.max_total_tokens,
-            hl_keywords=param.hl_keywords,
-            ll_keywords=param.ll_keywords,
-            conversation_history=param.conversation_history,
-            history_turns=param.history_turns,
-            model_func=param.model_func,
-            user_prompt=param.user_prompt,
-            enable_rerank=param.enable_rerank,
+            top_k=effective_param.top_k,
+            chunk_top_k=effective_param.chunk_top_k,
+            max_entity_tokens=effective_param.max_entity_tokens,
+            max_relation_tokens=effective_param.max_relation_tokens,
+            max_total_tokens=effective_param.max_total_tokens,
+            hl_keywords=effective_param.hl_keywords,
+            ll_keywords=effective_param.ll_keywords,
+            conversation_history=effective_param.conversation_history,
+            history_turns=effective_param.history_turns,
+            model_func=effective_param.model_func,
+            user_prompt=effective_param.user_prompt,
+            enable_rerank=effective_param.enable_rerank,
         )
 
         query_result = None
@@ -3066,7 +3109,7 @@ class LightRAG:
         if data_param.mode in ["local", "global", "hybrid", "mix"]:
             logger.debug(f"[aquery_data] Using kg_query for mode: {data_param.mode}")
             query_result = await kg_query(
-                query.strip(),
+                latest_query.strip(),
                 self.chunk_entity_relation_graph,
                 self.entities_vdb,
                 self.relationships_vdb,
@@ -3081,7 +3124,7 @@ class LightRAG:
         elif data_param.mode == "naive":
             logger.debug(f"[aquery_data] Using naive_query for mode: {data_param.mode}")
             query_result = await naive_query(
-                query.strip(),
+                latest_query.strip(),
                 self.chunks_vdb,
                 data_param,  # Use data_param with only_need_context=True
                 global_config,
@@ -3138,7 +3181,7 @@ class LightRAG:
 
     async def aquery_llm(
         self,
-        query: str,
+        query: str | dict[str, Any],
         param: QueryParam = QueryParam(),
         system_prompt: str | None = None,
     ) -> dict[str, Any]:
@@ -3159,47 +3202,57 @@ class LightRAG:
         logger.debug(f"[aquery_llm] Query param: {param}")
 
         global_config = asdict(self)
+        latest_query, effective_history = normalize_query_input(
+            query, fallback_history=param.conversation_history
+        )
+        effective_param = (
+            replace(param, conversation_history=effective_history)
+            if effective_history != param.conversation_history
+            else param
+        )
 
         try:
             query_result = None
 
-            if param.mode in ["local", "global", "hybrid", "mix"]:
+            if effective_param.mode in ["local", "global", "hybrid", "mix"]:
                 query_result = await kg_query(
-                    query.strip(),
+                    latest_query.strip(),
                     self.chunk_entity_relation_graph,
                     self.entities_vdb,
                     self.relationships_vdb,
                     self.text_chunks,
-                    param,
+                    effective_param,
                     global_config,
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
                     chunks_vdb=self.chunks_vdb,
                     doc_status_db=self.doc_status,
                 )
-            elif param.mode == "naive":
+            elif effective_param.mode == "naive":
                 query_result = await naive_query(
-                    query.strip(),
+                    latest_query.strip(),
                     self.chunks_vdb,
-                    param,
+                    effective_param,
                     global_config,
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
                     doc_status_db=self.doc_status,
                 )
-            elif param.mode == "bypass":
+            elif effective_param.mode == "bypass":
                 # Bypass mode: directly use LLM without knowledge retrieval
-                use_llm_func = param.model_func or global_config["llm_model_func"]
+                use_llm_func = effective_param.model_func or global_config["llm_model_func"]
                 # Apply higher priority (8) to entity/relation summary tasks
                 use_llm_func = partial(use_llm_func, _priority=8)
 
-                param.stream = True if param.stream is None else param.stream
+                effective_param.stream = (
+                    True if effective_param.stream is None else effective_param.stream
+                )
                 response = await use_llm_func(
-                    query.strip(),
+                    latest_query.strip(),
                     system_prompt=system_prompt,
-                    history_messages=param.conversation_history,
+                    history_messages=effective_param.conversation_history,
                     enable_cot=True,
-                    stream=param.stream,
+                    stream=effective_param.stream,
                 )
                 if type(response) is str:
                     return {
@@ -3226,7 +3279,7 @@ class LightRAG:
                         },
                     }
             else:
-                raise ValueError(f"Unknown mode {param.mode}")
+                raise ValueError(f"Unknown mode {effective_param.mode}")
 
             await self._query_done()
 
@@ -3238,7 +3291,7 @@ class LightRAG:
                     "data": {},
                     "metadata": {
                         "failure_reason": "no_results",
-                        "mode": param.mode,
+                        "mode": effective_param.mode,
                     },
                     "llm_response": {
                         "content": PROMPTS["fail_response"],

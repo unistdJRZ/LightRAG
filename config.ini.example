@@ -36,5 +36,12 @@ vchordrq_build_options =
 vchordrq_probes =
 vchordrq_epsilon = 1.9
 
+[milvus]
+uri = http://localhost:19530
+db_name = lightrag
+user =
+password =
+token =
+
 [memgraph]
 uri = bolt://localhost:7687

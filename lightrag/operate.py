@@ -8,6 +8,7 @@ import json_repair
 import os
 from typing import Any, AsyncIterator, overload, Literal
 from collections import Counter, defaultdict
+from dataclasses import replace
 
 from lightrag.exceptions import (
     PipelineCancelledException,
@@ -3414,7 +3415,7 @@ async def kg_query(
 
 
 async def get_keywords_from_query(
-    query: str,
+    query: str | dict[str, Any],
     query_param: QueryParam,
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
@@ -3426,7 +3427,7 @@ async def get_keywords_from_query(
     and if not, extracts them from the query text using LLM.
 
     Args:
-        query: The user's query text
+        query: The user's query text, or a structured payload with history/latest_query
         query_param: Query parameters that may contain pre-defined keywords
         global_config: Global configuration dictionary
         hashing_kv: Optional key-value storage for caching results
@@ -3438,11 +3439,70 @@ async def get_keywords_from_query(
     if query_param.hl_keywords or query_param.ll_keywords:
         return query_param.hl_keywords, query_param.ll_keywords
 
+    latest_query, query_history = normalize_query_input(
+        query, fallback_history=query_param.conversation_history
+    )
+    keyword_param = (
+        replace(query_param, conversation_history=query_history)
+        if query_history != query_param.conversation_history
+        else query_param
+    )
+
     # Extract keywords using extract_keywords_only function which already supports conversation history
     hl_keywords, ll_keywords = await extract_keywords_only(
-        query, query_param, global_config, hashing_kv
+        latest_query, keyword_param, global_config, hashing_kv
     )
     return hl_keywords, ll_keywords
+
+
+def normalize_query_input(
+    query: str | dict[str, Any],
+    fallback_history: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    if isinstance(query, str):
+        return query, list(fallback_history or [])
+
+    if not isinstance(query, dict):
+        raise TypeError(
+            f"query must be a string or dict with history/latest_query, got {type(query).__name__}"
+        )
+
+    latest_query = str(query.get("latest_query") or "").strip()
+    if not latest_query:
+        raise ValueError("query.latest_query cannot be empty")
+
+    history_value = query.get("history", fallback_history)
+    if history_value is None:
+        history_value = []
+    if not isinstance(history_value, list):
+        raise ValueError("query.history must be a list when provided")
+
+    normalized_history: list[dict[str, Any]] = []
+    for item in history_value:
+        if not isinstance(item, dict):
+            raise ValueError("Each history item must be an object")
+        normalized_history.append(item)
+
+    return latest_query, normalized_history
+
+
+def _serialize_keyword_history(history_messages: list[dict[str, Any]] | None) -> str:
+    if not history_messages:
+        return "[]"
+
+    normalized_history: list[dict[str, str]] = []
+    for msg in history_messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip()
+        content = str(msg.get("content") or "").strip()
+        if role and content:
+            normalized_history.append({"role": role, "content": content})
+
+    if not normalized_history:
+        return "[]"
+
+    return json.dumps(normalized_history, ensure_ascii=False, indent=2)
 
 
 async def extract_keywords_only(
@@ -3461,12 +3521,14 @@ async def extract_keywords_only(
     examples = "\n".join(PROMPTS["keywords_extraction_examples"])
 
     language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
+    serialized_history = _serialize_keyword_history(param.conversation_history)
 
     # 2. Handle cache if needed - add cache type for keywords
     args_hash = compute_args_hash(
         param.mode,
         text,
         language,
+        serialized_history,
     )
     cached_result = await handle_cache(
         hashing_kv, args_hash, text, param.mode, cache_type="keywords"
@@ -3485,6 +3547,7 @@ async def extract_keywords_only(
 
     # 3. Build the keyword-extraction prompt
     kw_prompt = PROMPTS["keywords_extraction"].format(
+        history=serialized_history,
         query=text,
         examples=examples,
         language=language,
@@ -3552,6 +3615,7 @@ async def extract_keywords_only(
 async def _get_vector_context(
     query: str,
     chunks_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
     query_embedding: list[float] = None,
 ) -> list[dict]:
@@ -3564,6 +3628,7 @@ async def _get_vector_context(
     Args:
         query: The query string to search for
         chunks_vdb: Vector database containing document chunks
+        text_chunks_db: Storage containing the full chunk payloads
         query_param: Query parameters including chunk_top_k and ids
         query_embedding: Optional pre-computed query embedding to avoid redundant embedding calls
 
@@ -3584,24 +3649,34 @@ async def _get_vector_context(
             )
             return []
 
+        chunk_ids = [result.get("id") for result in results if result.get("id")]
+        if not chunk_ids:
+            logger.info(
+                f"Naive query: 0 chunks with valid ids (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
+            )
+            return []
+
+        chunk_data_list = await text_chunks_db.get_by_ids(chunk_ids)
+        chunk_data_map = {
+            chunk_id: chunk_data
+            for chunk_id, chunk_data in zip(chunk_ids, chunk_data_list)
+            if chunk_data is not None and isinstance(chunk_data, dict)
+        }
+
         valid_chunks = []
         for result in results:
-            if "content" in result:
-                chunk_with_metadata = {
-                    "content": result["content"],
-                    "content_type": result.get("content_type"),
-                    "created_at": result.get("created_at", None),
-                    "file_path": result.get("file_path", "unknown_source"),
-                    "full_doc_id": result.get("full_doc_id"),
-                    "page_id": result.get("page_id"),
-                    "bbox": result.get("bbox"),
-                    "ocr_chunk_id": result.get("ocr_chunk_id"),
-                    "image_base64": result.get("image_base64"),
-                    "image_text": result.get("image_text"),
-                    "source_type": "vector",  # Mark the source type
-                    "chunk_id": result.get("id"),  # Add chunk_id for deduplication
-                }
-                valid_chunks.append(chunk_with_metadata)
+            chunk_id = result.get("id")
+            chunk_data = chunk_data_map.get(chunk_id)
+            if chunk_data is None or "content" not in chunk_data:
+                continue
+
+            chunk_with_metadata = chunk_data.copy()
+            chunk_with_metadata["created_at"] = result.get(
+                "created_at", chunk_with_metadata.get("created_at")
+            )
+            chunk_with_metadata["source_type"] = "vector"
+            chunk_with_metadata["chunk_id"] = chunk_id
+            valid_chunks.append(chunk_with_metadata)
 
         logger.info(
             f"Naive query: {len(valid_chunks)} chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
@@ -3698,6 +3773,7 @@ async def _perform_kg_search(
             vector_chunks = await _get_vector_context(
                 query,
                 chunks_vdb,
+                text_chunks_db,
                 query_param,
                 query_embedding,
             )
@@ -5101,7 +5177,9 @@ async def naive_query(
         logger.error("Tokenizer not found in global configuration.")
         return QueryResult(content=PROMPTS["fail_response"])
 
-    chunks = await _get_vector_context(query, chunks_vdb, query_param, None)
+    chunks = await _get_vector_context(
+        query, chunks_vdb, text_chunks_db, query_param, None
+    )
 
     if chunks is None or len(chunks) == 0:
         logger.info(

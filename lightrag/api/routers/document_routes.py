@@ -106,6 +106,7 @@ OCR_IMAGE_EXTENSIONS = (
 )
 
 OCR_POLL_INTERVAL_SECONDS = 2
+OCR_POLL_MAX_INTERVAL_SECONDS = 30
 OCR_MERGEABLE_CONTENT_TYPES = {"text", "list", "phonetic", "ref_text", "title", "index", "interline_equation"}
 
 
@@ -1420,6 +1421,17 @@ def _normalize_markdown_content_for_enqueue(markdown_text: str) -> str:
     return text.strip().lower()
 
 
+def _get_ocr_poll_delay_seconds(poll_attempt: int) -> float:
+    """Return OCR polling delay using exponential backoff capped at 30 seconds."""
+    base_interval = float(OCR_POLL_INTERVAL_SECONDS)
+    if base_interval <= 0:
+        return 0.0
+
+    safe_attempt = max(0, int(poll_attempt))
+    delay = base_interval * (2**safe_attempt)
+    return min(delay, float(OCR_POLL_MAX_INTERVAL_SECONDS))
+
+
 def _extract_structured_segments_from_ocr_chunks(
     ocr_chunks: Any,
 ) -> list[dict[str, Any]]:
@@ -1844,7 +1856,7 @@ async def _fetch_text_from_ocr_server(ocr_id: str) -> str | dict[str, Any]:
     if not ocr_server_url:
         raise ValueError("OCR_SERVER_URL is not configured")
     ocr_request_timeout_seconds = getattr(global_args, "ocr_request_timeout_seconds", 300)
-    ocr_poll_timeout_seconds = getattr(global_args, "ocr_poll_timeout_seconds", 300)
+    ocr_poll_timeout_seconds = getattr(global_args, "ocr_poll_timeout_seconds", 1800)
 
     base_url = ocr_server_url.rstrip("/")
     content_url = (
@@ -1853,6 +1865,7 @@ async def _fetch_text_from_ocr_server(ocr_id: str) -> str | dict[str, Any]:
     timeout = aiohttp.ClientTimeout(total=ocr_request_timeout_seconds)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + ocr_poll_timeout_seconds
+    poll_attempt = 0
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
@@ -1881,12 +1894,18 @@ async def _fetch_text_from_ocr_server(ocr_id: str) -> str | dict[str, Any]:
                         return _extract_text_from_ocr_payload(payload)
 
                     status = status_raw.strip().upper()
-                    if status == "PENDING":
-                        if loop.time() >= deadline:
+                    if status in {"PENDING", "RUNNING"}:
+                        now = loop.time()
+                        if now >= deadline:
                             raise TimeoutError(
                                 f"OCR polling timed out after {ocr_poll_timeout_seconds} seconds for ocr_id={ocr_id}"
                             )
-                        await asyncio.sleep(OCR_POLL_INTERVAL_SECONDS)
+                        sleep_seconds = min(
+                            _get_ocr_poll_delay_seconds(poll_attempt),
+                            max(0.0, deadline - now),
+                        )
+                        poll_attempt += 1
+                        await asyncio.sleep(sleep_seconds)
                         continue
 
                     if status == "FAIL":
@@ -1941,6 +1960,25 @@ async def pipeline_enqueue_file(
         ext = file_path.suffix.lower()
         effective_file_source = file_source or file_path.name
         file_size = 0
+        retryable_ocr_metadata = {}
+        if ocr_id:
+            retryable_ocr_metadata["ocr_id"] = ocr_id
+            if meta_info:
+                retryable_ocr_metadata["meta_info"] = dict(meta_info)
+            if file_source:
+                retryable_ocr_metadata["retry_source"] = "register_external_file"
+                retryable_ocr_metadata["retry_stage"] = "ocr_content_fetch"
+
+        async def _enqueue_errors(error_files: list[dict[str, Any]]) -> None:
+            if file_source:
+                for error_file in error_files:
+                    error_file["file_path"] = effective_file_source
+            if retryable_ocr_metadata:
+                for error_file in error_files:
+                    metadata = dict(error_file.get("metadata", {}) or {})
+                    metadata.update(retryable_ocr_metadata)
+                    error_file["metadata"] = metadata
+            await rag.apipeline_enqueue_error_documents(error_files, track_id)
 
         # Get file size for error reporting
         try:
@@ -1961,7 +1999,7 @@ async def pipeline_enqueue_file(
                     "file_size": file_size,
                 }
             ]
-            await rag.apipeline_enqueue_error_documents(error_files, track_id)
+            await _enqueue_errors(error_files)
             logger.error(
                 f"[File Extraction]Permission denied reading file: {file_path.name}"
             )
@@ -1975,7 +2013,7 @@ async def pipeline_enqueue_file(
                     "file_size": file_size,
                 }
             ]
-            await rag.apipeline_enqueue_error_documents(error_files, track_id)
+            await _enqueue_errors(error_files)
             logger.error(f"[File Extraction]File not found: {file_path.name}")
             return False, track_id
         except Exception as e:
@@ -1987,7 +2025,7 @@ async def pipeline_enqueue_file(
                     "file_size": file_size,
                 }
             ]
-            await rag.apipeline_enqueue_error_documents(error_files, track_id)
+            await _enqueue_errors(error_files)
             logger.error(
                 f"[File Extraction]Error reading file {file_path.name}: {str(e)}"
             )
@@ -2048,9 +2086,7 @@ async def pipeline_enqueue_file(
                                     "file_size": file_size,
                                 }
                             ]
-                            await rag.apipeline_enqueue_error_documents(
-                                error_files, track_id
-                            )
+                            await _enqueue_errors(error_files)
                             logger.error(
                                 f"[File Extraction]Empty content in file: {file_path.name}"
                             )
@@ -2066,9 +2102,7 @@ async def pipeline_enqueue_file(
                                     "file_size": file_size,
                                 }
                             ]
-                            await rag.apipeline_enqueue_error_documents(
-                                error_files, track_id
-                            )
+                            await _enqueue_errors(error_files)
                             logger.error(
                                 f"[File Extraction]File {file_path.name} appears to contain binary data representation instead of text"
                             )
@@ -2083,9 +2117,7 @@ async def pipeline_enqueue_file(
                                 "file_size": file_size,
                             }
                         ]
-                        await rag.apipeline_enqueue_error_documents(
-                            error_files, track_id
-                        )
+                        await _enqueue_errors(error_files)
                         logger.error(
                             f"[File Extraction]File {file_path.name} is not valid UTF-8 encoded text. Please convert it to UTF-8 before processing."
                         )
@@ -2130,9 +2162,7 @@ async def pipeline_enqueue_file(
                                 "file_size": file_size,
                             }
                         ]
-                        await rag.apipeline_enqueue_error_documents(
-                            error_files, track_id
-                        )
+                        await _enqueue_errors(error_files)
                         logger.error(
                             f"[File Extraction]Error processing PDF {file_path.name}: {str(e)}"
                         )
@@ -2156,9 +2186,7 @@ async def pipeline_enqueue_file(
                                 "file_size": file_size,
                             }
                         ]
-                        await rag.apipeline_enqueue_error_documents(
-                            error_files, track_id
-                        )
+                        await _enqueue_errors(error_files)
                         logger.error(
                             f"[File Extraction]Error processing image {file_path.name}: {str(e)}"
                         )
@@ -2193,9 +2221,7 @@ async def pipeline_enqueue_file(
                                 "file_size": file_size,
                             }
                         ]
-                        await rag.apipeline_enqueue_error_documents(
-                            error_files, track_id
-                        )
+                        await _enqueue_errors(error_files)
                         logger.error(
                             f"[File Extraction]Error processing DOCX {file_path.name}: {str(e)}"
                         )
@@ -2230,9 +2256,7 @@ async def pipeline_enqueue_file(
                                 "file_size": file_size,
                             }
                         ]
-                        await rag.apipeline_enqueue_error_documents(
-                            error_files, track_id
-                        )
+                        await _enqueue_errors(error_files)
                         logger.error(
                             f"[File Extraction]Error processing PPTX {file_path.name}: {str(e)}"
                         )
@@ -2267,9 +2291,7 @@ async def pipeline_enqueue_file(
                                 "file_size": file_size,
                             }
                         ]
-                        await rag.apipeline_enqueue_error_documents(
-                            error_files, track_id
-                        )
+                        await _enqueue_errors(error_files)
                         logger.error(
                             f"[File Extraction]Error processing XLSX {file_path.name}: {str(e)}"
                         )
@@ -2284,7 +2306,7 @@ async def pipeline_enqueue_file(
                             "file_size": file_size,
                         }
                     ]
-                    await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                    await _enqueue_errors(error_files)
                     logger.error(
                         f"[File Extraction]Unsupported file type: {file_path.name} (extension {ext})"
                     )
@@ -2299,7 +2321,7 @@ async def pipeline_enqueue_file(
                     "file_size": file_size,
                 }
             ]
-            await rag.apipeline_enqueue_error_documents(error_files, track_id)
+            await _enqueue_errors(error_files)
             logger.error(
                 f"[File Extraction]Unexpected error during {file_path.name} extracting: {str(e)}"
             )
@@ -2334,7 +2356,7 @@ async def pipeline_enqueue_file(
                             "file_size": file_size,
                         }
                     ]
-                    await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                    await _enqueue_errors(error_files)
                     logger.warning(
                         f"[File Extraction]Structured OCR chunk content is empty: {file_path.name}"
                     )
@@ -2350,7 +2372,7 @@ async def pipeline_enqueue_file(
                         "file_size": file_size,
                     }
                 ]
-                await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                await _enqueue_errors(error_files)
                 logger.warning(
                     f"[File Extraction]File contains only whitespace characters: {file_path.name}"
                 )
@@ -2369,7 +2391,7 @@ async def pipeline_enqueue_file(
                         "file_size": file_size,
                     }
                 ]
-                await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                await _enqueue_errors(error_files)
                 logger.warning(
                     f"[File Extraction]Structured OCR content is empty: {file_path.name}"
                 )
@@ -2424,7 +2446,7 @@ async def pipeline_enqueue_file(
                         "file_size": file_size,
                     }
                 ]
-                await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                await _enqueue_errors(error_files)
                 logger.error(f"Error enqueueing document {file_path.name}: {str(e)}")
                 return False, track_id
         else:
@@ -2436,7 +2458,7 @@ async def pipeline_enqueue_file(
                     "file_size": file_size,
                 }
             ]
-            await rag.apipeline_enqueue_error_documents(error_files, track_id)
+            await _enqueue_errors(error_files)
             logger.error(f"No content extracted from file: {file_path.name}")
             return False, track_id
 
@@ -2455,7 +2477,7 @@ async def pipeline_enqueue_file(
                 "file_size": file_size,
             }
         ]
-        await rag.apipeline_enqueue_error_documents(error_files, track_id)
+        await _enqueue_errors(error_files)
         logger.error(f"Enqueuing file {file_path.name} error: {str(e)}")
         logger.error(traceback.format_exc())
         return False, track_id
@@ -2513,6 +2535,57 @@ async def pipeline_index_registered_file(
             f"Error indexing registered file {file_path.name} (source={file_source}): {str(e)}"
         )
         logger.error(traceback.format_exc())
+
+
+async def retry_failed_registered_ocr_documents(rag: LightRAG) -> int:
+    """Retry failed /documents/register OCR fetches that never reached enqueue."""
+    failed_docs = await rag.doc_status.get_docs_by_status(DocStatus.FAILED)
+    retried_count = 0
+
+    for error_doc_id, status_doc in failed_docs.items():
+        metadata = dict(getattr(status_doc, "metadata", {}) or {})
+        if metadata.get("retry_source") != "register_external_file":
+            continue
+
+        ocr_id = str(metadata.get("ocr_id", "") or "").strip()
+        file_path_raw = str(getattr(status_doc, "file_path", "") or "").strip()
+        if not ocr_id or not file_path_raw:
+            continue
+
+        content_data = await rag.full_docs.get_by_id(error_doc_id)
+        if content_data:
+            continue
+
+        meta_info = metadata.get("meta_info")
+        if not isinstance(meta_info, dict):
+            meta_info = None
+
+        resolved_file_path = Path(file_path_raw).expanduser().resolve(strict=False)
+        success, _ = await pipeline_enqueue_file(
+            rag,
+            resolved_file_path,
+            track_id=getattr(status_doc, "track_id", None),
+            file_source=file_path_raw,
+            ocr_id=ocr_id,
+            move_to_enqueued=False,
+            meta_info=meta_info,
+        )
+        if success:
+            await rag.doc_status.delete([error_doc_id])
+            retried_count += 1
+
+    return retried_count
+
+
+async def reprocess_failed_documents_with_ocr_retry(rag: LightRAG) -> None:
+    """Retry OCR fetch for failed registered files, then process normal queue."""
+    retried_count = await retry_failed_registered_ocr_documents(rag)
+    if retried_count:
+        logger.info(
+            "Retried OCR content fetch for %d failed registered document(s)",
+            retried_count,
+        )
+    await rag.apipeline_process_enqueue_documents()
 
 
 async def pipeline_index_files(
@@ -2591,6 +2664,14 @@ async def run_scanning_process(
         new_files = doc_manager.scan_directory_for_new_files()
         total_files = len(new_files)
         logger.info(f"Found {total_files} files to index.")
+        retried_failed_registered_docs = await retry_failed_registered_ocr_documents(
+            rag
+        )
+        if retried_failed_registered_docs:
+            logger.info(
+                "Re-enqueued %d failed registered OCR document(s) before scanning",
+                retried_failed_registered_docs,
+            )
 
         if new_files:
             # Check for files with PROCESSED status and filter them out
@@ -2621,14 +2702,27 @@ async def run_scanning_process(
                         f"Scanning process completed: {len(valid_files)} files Processed."
                     )
             else:
-                logger.info(
-                    "No files to process after filtering already processed files."
-                )
+                if retried_failed_registered_docs:
+                    logger.info(
+                        "No new files to process after filtering; processing %d retried registered OCR document(s).",
+                        retried_failed_registered_docs,
+                    )
+                    await rag.apipeline_process_enqueue_documents()
+                else:
+                    logger.info(
+                        "No files to process after filtering already processed files."
+                    )
         else:
-            # No new files to index, check if there are any documents in the queue
-            logger.info(
-                "No upload file found, check if there are any documents in the queue..."
-            )
+            if retried_failed_registered_docs:
+                logger.info(
+                    "No upload file found, processing %d retried registered OCR document(s)...",
+                    retried_failed_registered_docs,
+                )
+            else:
+                # No new files to index, check if there are any documents in the queue
+                logger.info(
+                    "No upload file found, check if there are any documents in the queue..."
+                )
             await rag.apipeline_process_enqueue_documents()
 
     except Exception as e:
@@ -4205,7 +4299,9 @@ def create_document_routes(
         try:
             # Start the reprocessing in the background
             # Note: Reprocessed documents retain their original track_id from initial upload
-            background_tasks.add_task(_active_rag().apipeline_process_enqueue_documents)
+            background_tasks.add_task(
+                reprocess_failed_documents_with_ocr_retry, _active_rag()
+            )
             logger.info("Reprocessing of failed documents initiated")
 
             return ReprocessResponse(

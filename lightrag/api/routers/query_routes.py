@@ -23,15 +23,46 @@ from pydantic import BaseModel, Field, field_validator
 router = APIRouter(tags=["query"])
 
 
+class QueryInputPayload(BaseModel):
+    history: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Conversation history for keyword extraction and, by default, LLM response context.",
+    )
+    latest_query: str = Field(
+        description="The latest user message to execute against the knowledge base.",
+    )
+
+    @field_validator("latest_query", mode="after")
+    @classmethod
+    def latest_query_strip_after(cls, latest_query: str) -> str:
+        latest_query = latest_query.strip()
+        if len(latest_query) < 3:
+            raise ValueError("latest_query must be at least 3 characters long")
+        return latest_query
+
+    @field_validator("history", mode="after")
+    @classmethod
+    def history_role_check(
+        cls, history: List[Dict[str, Any]] | None
+    ) -> List[Dict[str, Any]]:
+        if history is None:
+            return []
+        for msg in history:
+            if "role" not in msg:
+                raise ValueError("Each message must have a 'role' key.")
+            if not isinstance(msg["role"], str) or not msg["role"].strip():
+                raise ValueError("Each message 'role' must be a non-empty string.")
+        return history
+
+
 class QueryRequest(BaseModel):
     workspace: Optional[str] = Field(
         default=None,
         description="Target workspace for this request. If omitted, falls back to query/header/default routing.",
     )
 
-    query: str = Field(
-        min_length=3,
-        description="The query text",
+    query: str | QueryInputPayload = Field(
+        description="The query text, or an object with `history` and `latest_query` for history-aware keyword extraction.",
     )
 
     mode: Literal["local", "global", "hybrid", "naive", "mix", "bypass"] = Field(
@@ -122,8 +153,14 @@ class QueryRequest(BaseModel):
 
     @field_validator("query", mode="after")
     @classmethod
-    def query_strip_after(cls, query: str) -> str:
-        return query.strip()
+    def query_strip_after(
+        cls, query: str | QueryInputPayload
+    ) -> str | QueryInputPayload:
+        if isinstance(query, str):
+            query = query.strip()
+            if len(query) < 3:
+                raise ValueError("query must be at least 3 characters long")
+        return query
 
     @field_validator("conversation_history", mode="after")
     @classmethod
@@ -145,10 +182,25 @@ class QueryRequest(BaseModel):
         # Exclude API-level parameters that don't belong in QueryParam
         request_data = self.model_dump(exclude_none=True, exclude={"query", "workspace"})
 
+        if self.conversation_history is None:
+            request_data["conversation_history"] = self.get_effective_history()
+
         # Ensure `mode` and `stream` are set explicitly
         param = QueryParam(**request_data)
         param.stream = is_stream
         return param
+
+    def get_query_text(self) -> str:
+        if isinstance(self.query, QueryInputPayload):
+            return self.query.latest_query
+        return self.query
+
+    def get_effective_history(self) -> List[Dict[str, Any]]:
+        if self.conversation_history is not None:
+            return self.conversation_history
+        if isinstance(self.query, QueryInputPayload):
+            return self.query.history
+        return []
 
 
 class ReferenceItem(BaseModel):

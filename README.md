@@ -959,6 +959,33 @@ MongoDocStatusStorage       MongoDB
 Example connection configurations for each storage type can be found in the `env.example` file. The database instance in the connection string needs to be created by you on the database server beforehand. LightRAG is only responsible for creating tables within the database instance, not for creating the database instance itself. If using Redis as storage, remember to configure automatic data persistence rules for Redis, otherwise data will be lost after the Redis service restarts. If using PostgreSQL, it is recommended to use version 16.6 or above.
 
 <details>
+<summary> <b>Using Milvus Standalone Storage</b> </summary>
+
+For Milvus Standalone, configure `MILVUS_URI` to the service endpoint exposed by the standalone container, which is typically `http://localhost:19530` on Windows. The official Windows deployment guide uses Docker Desktop with WSL 2 and exposes Milvus on port `19530`, with WebUI on `9091`.
+
+```python
+import os
+
+os.environ["MILVUS_URI"] = "http://localhost:19530"
+os.environ["MILVUS_DB_NAME"] = "lightrag"
+
+rag = LightRAG(
+    working_dir="./rag_storage",
+    vector_storage="MilvusVectorDBStorage",
+)
+```
+
+To start Milvus Standalone on Windows, follow the official guide or use the compose file in this repository:
+
+```bash
+docker compose -f docker-compose.milvus-standalone.yml up -d
+```
+
+After Milvus is ready, point LightRAG at `http://localhost:19530`.
+
+</details>
+
+<details>
 <summary> <b>Using Neo4J Storage</b> </summary>
 
 * For production level scenarios you will most likely want to leverage an enterprise solution

@@ -23,8 +23,6 @@ os.environ["NEO4J_PASSWORD"] = "12345678"
 
 # milvus
 os.environ["MILVUS_URI"] = "http://localhost:19530"
-os.environ["MILVUS_USER"] = "root"
-os.environ["MILVUS_PASSWORD"] = "Milvus"
 os.environ["MILVUS_DB_NAME"] = "lightrag"
 
 
