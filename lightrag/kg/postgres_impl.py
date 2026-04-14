@@ -1015,10 +1015,16 @@ class PostgreSQLDB:
             )
 
     async def _migrate_text_chunks_add_layout_metadata(self):
-        """Add page_id and bbox columns to LIGHTRAG_DOC_CHUNKS table if needed"""
+        """Add text chunk metadata columns to LIGHTRAG_DOC_CHUNKS table if needed"""
         columns_to_add = (
             ("page_id", "INTEGER NULL"),
             ("bbox", "JSONB NULL"),
+            ("page_size", "JSONB NULL"),
+            ("content_type", "TEXT NULL"),
+            ("ocr_chunk_id", "TEXT NULL"),
+            ("image_base64", "TEXT NULL"),
+            ("image_text", "TEXT NULL"),
+            ("segment_order_index", "INTEGER NULL"),
         )
         for column_name, column_type in columns_to_add:
             try:
@@ -2049,6 +2055,13 @@ class PGKVStorage(BaseKVStorage):
                 except json.JSONDecodeError:
                     bbox = None
             response["bbox"] = bbox
+            page_size = response.get("page_size")
+            if isinstance(page_size, str):
+                try:
+                    page_size = json.loads(page_size)
+                except json.JSONDecodeError:
+                    page_size = None
+            response["page_size"] = page_size
             response["translated_cn"] = response.get("translated_cn")
             create_time = response.get("create_time", 0)
             update_time = response.get("update_time", 0)
@@ -2200,6 +2213,13 @@ class PGKVStorage(BaseKVStorage):
                     except json.JSONDecodeError:
                         bbox = None
                 result["bbox"] = bbox
+                page_size = result.get("page_size")
+                if isinstance(page_size, str):
+                    try:
+                        page_size = json.loads(page_size)
+                    except json.JSONDecodeError:
+                        page_size = None
+                result["page_size"] = page_size
                 result["translated_cn"] = result.get("translated_cn")
                 create_time = result.get("create_time", 0)
                 update_time = result.get("update_time", 0)
@@ -2356,6 +2376,18 @@ class PGKVStorage(BaseKVStorage):
                     "bbox": json.dumps(v.get("bbox"))
                     if v.get("bbox") is not None
                     else None,
+                    "page_size": json.dumps(v.get("page_size"))
+                    if v.get("page_size") is not None
+                    else None,
+                    "content_type": v.get("content_type"),
+                    "ocr_chunk_id": (
+                        str(v.get("ocr_chunk_id"))
+                        if v.get("ocr_chunk_id") is not None
+                        else None
+                    ),
+                    "image_base64": v.get("image_base64"),
+                    "image_text": v.get("image_text"),
+                    "segment_order_index": v.get("segment_order_index"),
                     "llm_cache_list": json.dumps(v.get("llm_cache_list", [])),
                     "translated_cn": v.get("translated_cn"),
                     "create_time": current_time,
@@ -5646,6 +5678,12 @@ TABLES = {
                     file_path TEXT NULL,
                     page_id INTEGER NULL,
                     bbox JSONB NULL,
+                    page_size JSONB NULL,
+                    content_type TEXT NULL,
+                    ocr_chunk_id TEXT NULL,
+                    image_base64 TEXT NULL,
+                    image_text TEXT NULL,
+                    segment_order_index INTEGER NULL,
                     translated_cn TEXT NULL,
                     llm_cache_list JSONB NULL DEFAULT '[]'::jsonb,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
@@ -5786,7 +5824,8 @@ SQL_TEMPLATES = {
                                 FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id=$2
                             """,
     "get_by_id_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
-                                chunk_order_index, full_doc_id, file_path, page_id, bbox, translated_cn,
+                                chunk_order_index, full_doc_id, file_path, page_id, bbox, page_size,
+                                content_type, ocr_chunk_id, image_base64, image_text, segment_order_index, translated_cn,
                                 COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
@@ -5803,7 +5842,8 @@ SQL_TEMPLATES = {
                                  FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id = ANY($2)
                             """,
     "get_by_ids_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
-                                  chunk_order_index, full_doc_id, file_path, page_id, bbox, translated_cn,
+                                  chunk_order_index, full_doc_id, file_path, page_id, bbox, page_size,
+                                  content_type, ocr_chunk_id, image_base64, image_text, segment_order_index, translated_cn,
                                   COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
                                   EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                   EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
@@ -5874,9 +5914,10 @@ SQL_TEMPLATES = {
                                       update_time = CURRENT_TIMESTAMP
                                      """,
     "upsert_text_chunk": """INSERT INTO LIGHTRAG_DOC_CHUNKS (workspace, id, tokens,
-                      chunk_order_index, full_doc_id, content, file_path, page_id, bbox, llm_cache_list,
+                      chunk_order_index, full_doc_id, content, file_path, page_id, bbox, page_size,
+                      content_type, ocr_chunk_id, image_base64, image_text, segment_order_index, llm_cache_list,
                       translated_cn, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET tokens=EXCLUDED.tokens,
                       chunk_order_index=EXCLUDED.chunk_order_index,
@@ -5885,6 +5926,12 @@ SQL_TEMPLATES = {
                       file_path=EXCLUDED.file_path,
                       page_id=EXCLUDED.page_id,
                       bbox=EXCLUDED.bbox,
+                      page_size=EXCLUDED.page_size,
+                      content_type=EXCLUDED.content_type,
+                      ocr_chunk_id=EXCLUDED.ocr_chunk_id,
+                      image_base64=EXCLUDED.image_base64,
+                      image_text=EXCLUDED.image_text,
+                      segment_order_index=EXCLUDED.segment_order_index,
                       llm_cache_list=EXCLUDED.llm_cache_list,
                       translated_cn=EXCLUDED.translated_cn,
                       update_time = EXCLUDED.update_time
