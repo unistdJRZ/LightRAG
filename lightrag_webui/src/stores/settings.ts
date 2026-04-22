@@ -144,7 +144,8 @@ const useSettingsStoreBase = create<SettingsState>()(
         stream: true,
         history_turns: 0,
         user_prompt: '',
-        enable_rerank: true
+        enable_rerank: true,
+        agent_search: false
       },
 
       setTheme: (theme: Theme) => set({ theme }),
@@ -279,7 +280,7 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 21,
+      version: 22,
       migrate: (state: any, version: number) => {
         if (version < 2) {
           state.showEdgeLabel = false
@@ -410,6 +411,11 @@ const useSettingsStoreBase = create<SettingsState>()(
               return null
             })
             .filter((item: WorkspaceOption | null): item is WorkspaceOption => item !== null)
+        }
+        if (version < 22) {
+          if (state.querySettings) {
+            state.querySettings.agent_search = false
+          }
         }
         return state
       }

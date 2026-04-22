@@ -54,6 +54,7 @@ from lightrag.api.routers.document_routes import (
     DocumentManager,
     create_document_routes,
 )
+from lightrag.api.agent import create_agent_routes
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
@@ -1649,6 +1650,15 @@ def create_app(args):
     )
     app.include_router(
         create_graph_routes(
+            workspace_rags,
+            api_key,
+            workspace=default_workspace_name,
+            workspace_aliases=workspace_aliases,
+        ),
+        prefix="/api",
+    )
+    app.include_router(
+        create_agent_routes(
             workspace_rags,
             api_key,
             workspace=default_workspace_name,

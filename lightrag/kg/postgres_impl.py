@@ -1527,6 +1527,14 @@ class PostgreSQLDB:
                 f"PostgreSQL, Failed to create full entities/relations tables: {e}"
             )
 
+        # Create TTL cleanup indexes for agent submit cache table
+        try:
+            await self._create_agent_submit_cache_indexes()
+        except Exception as e:
+            logger.error(
+                f"PostgreSQL, Failed to create agent submit cache indexes: {e}"
+            )
+
     async def _migrate_create_full_entities_relations_tables(self):
         """Create LIGHTRAG_FULL_ENTITIES and LIGHTRAG_FULL_RELATIONS tables if they don't exist"""
         tables_to_check = [
@@ -1648,6 +1656,48 @@ class PostgreSQLDB:
 
             except Exception as e:
                 logger.warning(f"Failed to create index {index['name']}: {e}")
+
+    async def _create_agent_submit_cache_indexes(self):
+        """Create indexes to support TTL cleanup on LIGHTRAG_AGENT_SUBMIT_CACHE."""
+        indexes = [
+            {
+                "table": "lightrag_agent_submit_cache",
+                "name": "idx_lightrag_agent_submit_cache_expires_at",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_lightrag_agent_submit_cache_expires_at ON LIGHTRAG_AGENT_SUBMIT_CACHE (expires_at)",
+                "description": "Index for TTL cleanup by expires_at",
+            },
+            {
+                "table": "lightrag_agent_submit_cache",
+                "name": "idx_lightrag_agent_submit_cache_workspace_expires_at",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_lightrag_agent_submit_cache_workspace_expires_at ON LIGHTRAG_AGENT_SUBMIT_CACHE (workspace, expires_at)",
+                "description": "Composite index for workspace-aware expiration scans",
+            },
+        ]
+
+        for index in indexes:
+            try:
+                existing = await self.query(
+                    """
+                    SELECT indexname
+                    FROM pg_indexes
+                    WHERE tablename = $1
+                    AND indexname = $2
+                    """,
+                    [index["table"], index["name"]],
+                )
+
+                if not existing:
+                    logger.info(
+                        "Creating agent submit cache index: %s",
+                        index["description"],
+                    )
+                    await self.execute(index["sql"])
+            except Exception as e:
+                logger.warning(
+                    "Failed to create agent submit cache index %s: %s",
+                    index["name"],
+                    e,
+                )
 
     async def _create_vector_index(self, table_name: str, embedding_dim: int):
         """
@@ -5811,6 +5861,18 @@ TABLES = {
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     CONSTRAINT LIGHTRAG_RELATION_CHUNKS_PK PRIMARY KEY (workspace, id)
+                    )"""
+    },
+    "LIGHTRAG_AGENT_SUBMIT_CACHE": {
+        "ddl": """CREATE TABLE LIGHTRAG_AGENT_SUBMIT_CACHE (
+                    workspace VARCHAR(255) NOT NULL,
+                    id VARCHAR(255) NOT NULL,
+                    entity_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    chunk_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    created_at TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP(0) NOT NULL,
+                    CONSTRAINT LIGHTRAG_AGENT_SUBMIT_CACHE_PK PRIMARY KEY (workspace, id)
                     )"""
     },
 }

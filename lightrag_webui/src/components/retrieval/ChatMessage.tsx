@@ -1,5 +1,5 @@
 import { ReactNode, useEffect, useMemo, useRef, memo, useState } from 'react' // Import useMemo
-import { Message } from '@/api/lightrag'
+import { Message, QueryAgentSearchResult, QueryReference } from '@/api/lightrag'
 import useTheme from '@/hooks/useTheme'
 import { cn } from '@/lib/utils'
 
@@ -32,6 +32,9 @@ export type MessageWithError = Message & {
   id: string // Unique identifier for stable React keys
   isError?: boolean
   isThinking?: boolean // Flag to indicate if the message is in a "thinking" state
+  references?: QueryReference[]
+  agentSearchResult?: QueryAgentSearchResult | null
+  agentStatuses?: Array<Record<string, any>>
   /**
    * Indicates if the mermaid diagram in this message has been rendered.
    * Used to persist the rendering state across updates and prevent flickering.

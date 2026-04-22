@@ -1495,19 +1495,10 @@ def render_chunk_content_for_text(chunk: dict[str, Any] | Any) -> str:
     if not is_image_content_type(chunk.get("content_type")):
         return content
 
-    metadata_parts: list[str] = []
-    page_id = chunk.get("page_id")
-    if page_id is not None:
-        metadata_parts.append(f"page={page_id}")
-    ocr_chunk_id = chunk.get("ocr_chunk_id")
-    if ocr_chunk_id is not None:
-        metadata_parts.append(f"ocr_chunk_id={ocr_chunk_id}")
-    bbox = chunk.get("bbox")
-    if bbox is not None:
-        metadata_parts.append(f"bbox={bbox}")
-
-    suffix = f" | {' | '.join(metadata_parts)}" if metadata_parts else ""
-    return f"[image chunk omitted{suffix}]"
+    _, resolved_image_text = get_chunk_image_fields(chunk)
+    if resolved_image_text:
+        return f"[this is an image chunk | {resolved_image_text}]"
+    return "[this is an image chunk]"
 
 
 def is_float_regex(value: str) -> bool:

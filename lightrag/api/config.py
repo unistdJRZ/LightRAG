@@ -240,6 +240,32 @@ def parse_args() -> argparse.Namespace:
         default=get_env_value("WORKSPACE", ""),
         help="Default workspace for all storage",
     )
+    parser.add_argument(
+        "--opencode-server-url",
+        default=get_env_value("OPENCODE_SERVER_URL", None, special_none=True),
+        help="Base URL for the OpenCode server used by agent_search (for example http://127.0.0.1:4096)",
+    )
+    parser.add_argument(
+        "--opencode-server-username",
+        default=get_env_value("OPENCODE_SERVER_USERNAME", "opencode"),
+        help="HTTP basic auth username for the OpenCode server",
+    )
+    parser.add_argument(
+        "--opencode-server-password",
+        default=get_env_value("OPENCODE_SERVER_PASSWORD", None, special_none=True),
+        help="HTTP basic auth password for the OpenCode server",
+    )
+    parser.add_argument(
+        "--opencode-rag-agent",
+        default=get_env_value("OPENCODE_RAG_AGENT", None, special_none=True),
+        help="Agent id/name exposed by the OpenCode server for LightRAG agent_search",
+    )
+    parser.add_argument(
+        "--opencode-timeout",
+        type=float,
+        default=get_env_value("OPENCODE_TIMEOUT", 120.0, float),
+        help="Timeout in seconds for a single OpenCode agent_search request",
+    )
 
     # Server workers configuration
     parser.add_argument(

@@ -138,6 +138,8 @@ export type QueryRequest = {
   user_prompt?: string
   /** Enable reranking for retrieved text chunks. If True but no rerank model is configured, a warning will be issued. Default is True. */
   enable_rerank?: boolean
+  /** If True, forwards history + query to the configured OpenCode RAG search agent and merges its submitted results into the final output. */
+  agent_search?: boolean
 }
 
 export type QueryReference = {
@@ -146,12 +148,38 @@ export type QueryReference = {
   file_path: string
   file_id?: string | null
   content_type?: string | null
+  page_id?: number | null
+  bbox?: number[] | null
   content: string
+  image_base64?: string | null
+  image_text?: string | null
+}
+
+export type QueryAgentSearchResult = {
+  agent_search_id: string
+  workspace: string
+  retrieval_target: string
+  status: 'completed' | 'missing_submit' | 'failed'
+  submitted: boolean
+  entity_count: number
+  chunk_count: number
+  opencode_session_id?: string | null
+  opencode_output?: string | null
+  error?: string | null
 }
 
 export type QueryResponse = {
   response: string
   references?: QueryReference[] | null
+  agent_search_result?: QueryAgentSearchResult | null
+}
+
+export type QueryStreamEvent = {
+  response?: string
+  references?: QueryReference[]
+  error?: string
+  agent_status?: Record<string, any>
+  agent_search_result?: QueryAgentSearchResult
 }
 
 export type EntityUpdateResponse = {
@@ -286,6 +314,60 @@ export type ChunksRequest = {
 export type PaginatedChunksResponse = {
   chunks: ChunkPreview[]
   pagination: PaginationInfo
+}
+
+export type AgentChunkSearchRequest = {
+  workspace?: string | null
+  chunk_id?: string | null
+  doc_id?: string | null
+  full_doc_id?: string | null
+  content?: string | null
+  content_like?: string | null
+  content_type?: string | string[] | null
+  top_k?: number
+}
+
+export type AgentChunkSearchResult = {
+  chunk_id: string
+  doc_id: string
+  content: string
+  content_type?: string | null
+}
+
+export type AgentEntitySearchRequest = {
+  workspace?: string | null
+  description?: string | null
+  description_like?: string | null
+  entity_name?: string | null
+  entity_id?: string | null
+  entity_name_like?: string | null
+  entity_type?: string | string[] | null
+  entity_type_like?: string | string[] | null
+}
+
+export type AgentEntitySearchResult = {
+  description: string
+  entity_name: string
+  source_id: string[]
+  entity_type?: string | null
+}
+
+export type AgentSubmitRequest = {
+  workspace?: string | null
+  agent_submit_id: string
+  entity_id?: string | null
+  entity_ids?: string | string[] | null
+  chunk_id?: string | null
+  chunk_ids?: string | string[] | null
+}
+
+export type AgentSubmitResponse = {
+  status: string
+  workspace: string
+  agent_submit_id: string
+  entity_ids: string[]
+  chunk_ids: string[]
+  expires_at: string
 }
 
 export type PaginatedDocsResponse = {
@@ -627,10 +709,75 @@ export const queryText = async (request: QueryRequest): Promise<QueryResponse> =
   return response.data
 }
 
+const handleQueryStreamEvent = (
+  parsed: QueryStreamEvent,
+  onChunk: (chunk: string) => void,
+  onError?: (error: string) => void,
+  onEvent?: (event: QueryStreamEvent) => void
+) => {
+  onEvent?.(parsed)
+  if (parsed.response) {
+    onChunk(parsed.response)
+  }
+  if (parsed.error && onError) {
+    onError(parsed.error)
+  }
+}
+
+const processQueryStreamResponse = async (
+  response: Response,
+  onChunk: (chunk: string) => void,
+  onError?: (error: string) => void,
+  onEvent?: (event: QueryStreamEvent) => void
+) => {
+  if (!response.body) {
+    throw new Error('Response body is null')
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) {
+      break
+    }
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+
+    for (const line of lines) {
+      if (!line.trim()) {
+        continue
+      }
+      try {
+        const parsed = JSON.parse(line) as QueryStreamEvent
+        handleQueryStreamEvent(parsed, onChunk, onError, onEvent)
+      } catch (parseError) {
+        console.error('Error parsing stream chunk:', line, parseError)
+        onError?.(`Error parsing server response: ${line}`)
+      }
+    }
+  }
+
+  if (buffer.trim()) {
+    try {
+      const parsed = JSON.parse(buffer) as QueryStreamEvent
+      handleQueryStreamEvent(parsed, onChunk, onError, onEvent)
+    } catch (parseError) {
+      console.error('Error parsing final chunk:', buffer, parseError)
+      onError?.(`Error parsing final server response: ${buffer}`)
+    }
+  }
+}
+
 export const queryTextStream = async (
   request: QueryRequest,
   onChunk: (chunk: string) => void,
-  onError?: (error: string) => void
+  onError?: (error: string) => void,
+  onEvent?: (event: QueryStreamEvent) => void
 ) => {
   const apiKey = useSettingsStore.getState().apiKey;
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
@@ -685,54 +832,7 @@ export const queryTextStream = async (
               throw new Error(`HTTP error! status: ${retryResponse.status}`);
             }
 
-            // Retry successful, process stream response
-            // Re-execute the stream processing logic with retryResponse
-            if (!retryResponse.body) {
-              throw new Error('Response body is null');
-            }
-
-            const reader = retryResponse.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-
-              buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.split('\n');
-              buffer = lines.pop() || '';
-
-              for (const line of lines) {
-                if (line.trim()) {
-                  try {
-                    const parsed = JSON.parse(line);
-                    if (parsed.response) {
-                      onChunk(parsed.response);
-                    } else if (parsed.error) {
-                      onError?.(parsed.error);
-                    }
-                  } catch (parseError) {
-                    console.error('Failed to parse JSON:', parseError, 'Line:', line);
-                    onError?.(`JSON parse error: ${parseError}`);
-                  }
-                }
-              }
-            }
-
-            // Process any remaining data in buffer
-            if (buffer.trim()) {
-              try {
-                const parsed = JSON.parse(buffer);
-                if (parsed.response) {
-                  onChunk(parsed.response);
-                } else if (parsed.error) {
-                  onError?.(parsed.error);
-                }
-              } catch (parseError) {
-                console.error('Failed to parse final buffer:', parseError);
-              }
-            }
+            await processQueryStreamResponse(retryResponse, onChunk, onError, onEvent)
 
             return; // Successfully completed retry
           } catch (refreshError) {
@@ -765,58 +865,7 @@ export const queryTextStream = async (
       );
     }
 
-    if (!response.body) {
-      throw new Error('Response body is null');
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break; // Stream finished
-      }
-
-      // Decode the chunk and add to buffer
-      buffer += decoder.decode(value, { stream: true }); // stream: true handles multi-byte chars split across chunks
-
-      // Process complete lines (NDJSON)
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || ''; // Keep potentially incomplete line in buffer
-
-      for (const line of lines) {
-        if (line.trim()) {
-          try {
-            const parsed = JSON.parse(line);
-            if (parsed.response) {
-              onChunk(parsed.response);
-            } else if (parsed.error && onError) {
-              onError(parsed.error);
-            }
-          } catch (error) {
-            console.error('Error parsing stream chunk:', line, error);
-            if (onError) onError(`Error parsing server response: ${line}`);
-          }
-        }
-      }
-    }
-
-    // Process any remaining data in the buffer after the stream ends
-    if (buffer.trim()) {
-      try {
-        const parsed = JSON.parse(buffer);
-        if (parsed.response) {
-          onChunk(parsed.response);
-        } else if (parsed.error && onError) {
-          onError(parsed.error);
-        }
-      } catch (error) {
-        console.error('Error parsing final chunk:', buffer, error);
-        if (onError) onError(`Error parsing final server response: ${buffer}`);
-      }
-    }
+    await processQueryStreamResponse(response, onChunk, onError, onEvent)
 
   } catch (error) {
     const message = errorMessage(error);
@@ -1144,6 +1193,27 @@ export const getDocumentsPaginated = async (request: DocumentsRequest): Promise<
 
 export const getChunksPaginated = async (request: ChunksRequest): Promise<PaginatedChunksResponse> => {
   const response = await axiosInstance.post('/chunks/paginated', request)
+  return response.data
+}
+
+export const searchAgentChunks = async (
+  request: AgentChunkSearchRequest
+): Promise<AgentChunkSearchResult[]> => {
+  const response = await axiosInstance.post('/agent/chunk_search', request)
+  return response.data
+}
+
+export const searchAgentEntities = async (
+  request: AgentEntitySearchRequest
+): Promise<AgentEntitySearchResult[]> => {
+  const response = await axiosInstance.post('/agent/entity_serach', request)
+  return response.data
+}
+
+export const submitAgentSelection = async (
+  request: AgentSubmitRequest
+): Promise<AgentSubmitResponse> => {
+  const response = await axiosInstance.post('/agent/submit', request)
   return response.data
 }
 

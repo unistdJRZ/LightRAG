@@ -196,8 +196,8 @@ export default function ChunksExplorer() {
   }, [fetchChunks, pagination.page, pagination.page_size])
 
   return (
-    <div className="flex h-full flex-col gap-4 p-4">
-      <Card className="border-border/60 bg-background/70">
+    <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden p-4">
+      <Card className="shrink-0 border-border/60 bg-background/70">
         <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <CardTitle>{t('chunksPanel.title', 'Chunks')}</CardTitle>
@@ -231,15 +231,15 @@ export default function ChunksExplorer() {
         />
       ) : (
         <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(360px,0.9fr)]">
-          <Card className="min-h-0 min-w-0 overflow-hidden">
-            <CardHeader>
+          <Card className="flex min-h-0 min-w-0 flex-col overflow-hidden">
+            <CardHeader className="shrink-0">
               <CardTitle>{t('chunksPanel.listTitle', 'Chunk List')}</CardTitle>
               <CardDescription>
                 {t('chunksPanel.listDescription', 'Select a chunk to inspect its stored payload and metadata.')}
               </CardDescription>
             </CardHeader>
-            <CardContent className="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
-              <div className="min-h-0 flex-1 overflow-hidden rounded-md border">
+            <CardContent className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-hidden">
+              <div className="min-h-0 flex-1 overflow-auto rounded-md border">
                 <Table className="table-fixed">
                   <TableHeader>
                     <TableRow>
@@ -295,8 +295,8 @@ export default function ChunksExplorer() {
             </CardContent>
           </Card>
 
-          <Card className="min-h-0 min-w-0 overflow-hidden">
-            <CardHeader>
+          <Card className="flex min-h-0 min-w-0 flex-col overflow-hidden">
+            <CardHeader className="shrink-0">
               <CardTitle>{t('chunksPanel.previewTitle', 'Preview')}</CardTitle>
               <CardDescription>
                 {selectedChunk
@@ -308,9 +308,9 @@ export default function ChunksExplorer() {
                   : t('chunksPanel.previewEmpty', 'Select a chunk to preview its content.')}
               </CardDescription>
             </CardHeader>
-            <CardContent className="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
+            <CardContent className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-hidden">
               {selectedChunk ? (
-                <>
+                <div className="min-h-0 flex flex-1 flex-col gap-4 overflow-auto pr-1">
                   <div className="grid gap-3 rounded-md border bg-muted/20 p-3 text-sm sm:grid-cols-2">
                     {selectedChunkMetadata.map((item) => (
                       <div key={item.label} className="min-w-0">
@@ -346,7 +346,7 @@ export default function ChunksExplorer() {
                   )}
 
                   {!isImageChunk(selectedChunk) && (
-                    <div className="min-h-0 flex-1 overflow-auto rounded-md border bg-muted/10 p-3">
+                    <div className="rounded-md border bg-muted/10 p-3">
                       <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
                         {t('chunksPanel.previewFields.content', 'Content')}
                       </div>
@@ -355,7 +355,7 @@ export default function ChunksExplorer() {
                       </pre>
                     </div>
                   )}
-                </>
+                </div>
               ) : (
                 <EmptyCard
                   title={t('chunksPanel.previewEmptyTitle', 'Nothing selected')}

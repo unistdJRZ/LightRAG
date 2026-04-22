@@ -42,6 +42,8 @@ from lightrag.utils import (
     merge_source_ids,
     make_relation_chunk_key,
     render_chunk_content_for_text,
+    get_chunk_image_fields,
+    is_image_content_type,
 )
 from lightrag.base import (
     BaseGraphStorage,
@@ -3213,6 +3215,7 @@ async def kg_query(
     system_prompt: str | None = None,
     chunks_vdb: BaseVectorStorage = None,
     doc_status_db: DocStatusStorage | None = None,
+    agent_context: dict[str, Any] | None = None,
 ) -> QueryResult | None:
     """
     Execute knowledge graph query and return unified QueryResult object.
@@ -3289,6 +3292,7 @@ async def kg_query(
         query_param,
         chunks_vdb,
         doc_status_db,
+        agent_context=agent_context,
     )
 
     if context_result is None:
@@ -3343,6 +3347,7 @@ async def kg_query(
         ll_keywords_str,
         query_param.user_prompt or "",
         query_param.enable_rerank,
+        (agent_context or {}).get("signature", ""),
     )
 
     cached_result = await handle_cache(
@@ -4047,6 +4052,25 @@ async def _merge_all_chunks(
     if chunk_tracking is None:
         chunk_tracking = {}
 
+    def _build_merged_chunk(chunk: dict[str, Any], chunk_id: str) -> dict[str, Any]:
+        merged_chunk = {
+            "content": chunk["content"],
+            "file_path": chunk.get("file_path", "unknown_source"),
+            "full_doc_id": chunk.get("full_doc_id"),
+            "page_id": chunk.get("page_id"),
+            "bbox": chunk.get("bbox"),
+            "chunk_id": chunk_id,
+        }
+        if chunk.get("content_type") is not None:
+            merged_chunk["content_type"] = chunk.get("content_type")
+        if chunk.get("ocr_chunk_id") is not None:
+            merged_chunk["ocr_chunk_id"] = chunk.get("ocr_chunk_id")
+        if chunk.get("image_base64") is not None:
+            merged_chunk["image_base64"] = chunk.get("image_base64")
+        if chunk.get("image_text") is not None:
+            merged_chunk["image_text"] = chunk.get("image_text")
+        return merged_chunk
+
     # Get chunks from entities
     entity_chunks = []
     if filtered_entities and text_chunks_db:
@@ -4088,16 +4112,7 @@ async def _merge_all_chunks(
             chunk_id = chunk.get("chunk_id") or chunk.get("id")
             if chunk_id and chunk_id not in seen_chunk_ids:
                 seen_chunk_ids.add(chunk_id)
-                merged_chunks.append(
-                    {
-                        "content": chunk["content"],
-                        "file_path": chunk.get("file_path", "unknown_source"),
-                        "full_doc_id": chunk.get("full_doc_id"),
-                        "page_id": chunk.get("page_id"),
-                        "bbox": chunk.get("bbox"),
-                        "chunk_id": chunk_id,
-                    }
-                )
+                merged_chunks.append(_build_merged_chunk(chunk, chunk_id))
 
         # Add from entity chunks (Local mode)
         if i < len(entity_chunks):
@@ -4105,16 +4120,7 @@ async def _merge_all_chunks(
             chunk_id = chunk.get("chunk_id") or chunk.get("id")
             if chunk_id and chunk_id not in seen_chunk_ids:
                 seen_chunk_ids.add(chunk_id)
-                merged_chunks.append(
-                    {
-                        "content": chunk["content"],
-                        "file_path": chunk.get("file_path", "unknown_source"),
-                        "full_doc_id": chunk.get("full_doc_id"),
-                        "page_id": chunk.get("page_id"),
-                        "bbox": chunk.get("bbox"),
-                        "chunk_id": chunk_id,
-                    }
-                )
+                merged_chunks.append(_build_merged_chunk(chunk, chunk_id))
 
         # Add from relation chunks (Global mode)
         if i < len(relation_chunks):
@@ -4122,16 +4128,7 @@ async def _merge_all_chunks(
             chunk_id = chunk.get("chunk_id") or chunk.get("id")
             if chunk_id and chunk_id not in seen_chunk_ids:
                 seen_chunk_ids.add(chunk_id)
-                merged_chunks.append(
-                    {
-                        "content": chunk["content"],
-                        "file_path": chunk.get("file_path", "unknown_source"),
-                        "full_doc_id": chunk.get("full_doc_id"),
-                        "page_id": chunk.get("page_id"),
-                        "bbox": chunk.get("bbox"),
-                        "chunk_id": chunk_id,
-                    }
-                )
+                merged_chunks.append(_build_merged_chunk(chunk, chunk_id))
 
     logger.info(
         f"Round-robin merged chunks: {origin_len} -> {len(merged_chunks)} (deduplicated {origin_len - len(merged_chunks)})"
@@ -4151,6 +4148,8 @@ async def _build_context_str(
     chunk_tracking: dict = None,
     entity_id_to_original: dict = None,
     relation_id_to_original: dict = None,
+    preserved_entities: list[dict] | None = None,
+    preserved_chunks: list[dict] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """
     Build the final LLM context string with token processing.
@@ -4241,10 +4240,21 @@ async def _build_context_str(
         truncated_chunks, doc_status_storage=doc_status_db
     )
 
+    preserved_reference_entries, preserved_chunks_with_ref_ids = (
+        await _generate_preserved_reference_list_from_chunks(
+            preserved_chunks or [],
+            start_reference_index=len(reference_entries) + 1,
+            doc_status_storage=doc_status_db,
+        )
+    )
+    all_reference_entries = reference_entries + preserved_reference_entries
+    all_chunks_with_refs = truncated_chunks + preserved_chunks_with_ref_ids
+    chunk_id_to_reference_id = _build_chunk_reference_lookup(all_chunks_with_refs)
+
     # Rebuild chunks_context with truncated chunks
     # The actual tokens may be slightly less than available_chunk_tokens due to deduplication logic
     chunks_context = []
-    for i, chunk in enumerate(truncated_chunks):
+    for i, chunk in enumerate(all_chunks_with_refs):
         chunks_context.append(
             {
                 "reference_id": chunk["reference_id"],
@@ -4260,9 +4270,15 @@ async def _build_context_str(
         _annotate_related_chunks_for_prompt(
             entities_context,
             relations_context,
-            truncated_chunks,
+            all_chunks_with_refs,
             entity_id_to_original=entity_id_to_original,
             relation_id_to_original=relation_id_to_original,
+        )
+    )
+    prompt_entities_context.extend(
+        _build_preserved_prompt_entities(
+            preserved_entities or [],
+            chunk_id_to_reference_id,
         )
     )
     entities_str = "\n".join(
@@ -4274,16 +4290,16 @@ async def _build_context_str(
 
     reference_list_str = "\n".join(
         f"[{ref['reference_id']}] {ref.get('chunk_id')} | {ref['file_path']} | file_id: {ref.get('file_id')}"
-        for ref in reference_entries
+        for ref in all_reference_entries
         if ref["reference_id"]
     )
 
     logger.info(
-        f"Final context: {len(entities_context)} entities, {len(relations_context)} relations, {len(chunks_context)} chunks"
+        f"Final context: {len(prompt_entities_context)} entities, {len(relations_context)} relations, {len(chunks_context)} chunks"
     )
 
     # not necessary to use LLM to generate a response
-    if not entities_context and not relations_context and not chunks_context:
+    if not prompt_entities_context and not relations_context and not chunks_context:
         # Return empty raw data structure when no entities/relations
         empty_raw_data = convert_to_user_format(
             [],
@@ -4298,9 +4314,9 @@ async def _build_context_str(
 
     # output chunks tracking infomations
     # format: <source><frequency>/<order> (e.g., E5/2 R2/1 C1/1)
-    if truncated_chunks and chunk_tracking:
+    if all_chunks_with_refs and chunk_tracking:
         chunk_tracking_log = []
-        for chunk in truncated_chunks:
+        for chunk in all_chunks_with_refs:
             chunk_id = chunk.get("chunk_id")
             if chunk_id and chunk_id in chunk_tracking:
                 tracking_info = chunk_tracking[chunk_id]
@@ -4334,8 +4350,23 @@ async def _build_context_str(
         entity_id_to_original,
         relation_id_to_original,
     )
+    data = final_data.setdefault("data", {})
+    if isinstance(data, dict):
+        data.setdefault("entities", [])
+        data.setdefault("chunks", [])
+        data.setdefault("references", [])
+        data["entities"].extend(
+            _format_preserved_entities_for_user(
+                preserved_entities or [],
+                chunk_id_to_reference_id,
+            )
+        )
+        data["chunks"].extend(
+            _format_preserved_chunks_for_user(preserved_chunks_with_ref_ids)
+        )
+        data["references"].extend(preserved_reference_entries)
     logger.debug(
-        f"[_build_context_str] Final data after conversion: {len(final_data.get('entities', []))} entities, {len(final_data.get('relationships', []))} relationships, {len(final_data.get('chunks', []))} chunks"
+        f"[_build_context_str] Final data after conversion: {len(final_data.get('data', {}).get('entities', []))} entities, {len(final_data.get('data', {}).get('relationships', []))} relationships, {len(final_data.get('data', {}).get('chunks', []))} chunks"
     )
     return result, final_data
 
@@ -4417,6 +4448,231 @@ def _annotate_related_chunks_for_prompt(
     return prompt_entities_context, prompt_relations_context
 
 
+def _normalize_preserved_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
+    normalized_chunk = {
+        "content": chunk.get("content", ""),
+        "file_path": chunk.get("file_path", "unknown_source"),
+        "full_doc_id": chunk.get("full_doc_id"),
+        "page_id": chunk.get("page_id"),
+        "bbox": chunk.get("bbox"),
+        "chunk_id": chunk.get("chunk_id") or chunk.get("id") or "",
+    }
+    if chunk.get("content_type") is not None:
+        normalized_chunk["content_type"] = chunk.get("content_type")
+    if chunk.get("ocr_chunk_id") is not None:
+        normalized_chunk["ocr_chunk_id"] = chunk.get("ocr_chunk_id")
+    if chunk.get("image_base64") is not None:
+        normalized_chunk["image_base64"] = chunk.get("image_base64")
+    if chunk.get("image_text") is not None:
+        normalized_chunk["image_text"] = chunk.get("image_text")
+    return normalized_chunk
+
+
+def _build_chunk_reference_lookup(chunks: list[dict[str, Any]]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for chunk in chunks:
+        chunk_id = str(chunk.get("chunk_id", "") or "").strip()
+        reference_id = str(chunk.get("reference_id", "") or "").strip()
+        if chunk_id and reference_id and chunk_id not in lookup:
+            lookup[chunk_id] = reference_id
+    return lookup
+
+
+def _resolve_related_chunk_reference(
+    source_id: Any,
+    chunk_id_to_reference_id: dict[str, str],
+    missing_message: str,
+) -> str:
+    if not isinstance(source_id, str) or not source_id.strip():
+        return missing_message
+
+    for chunk_id in split_string_by_multi_markers(source_id, [GRAPH_FIELD_SEP]):
+        reference_id = chunk_id_to_reference_id.get(chunk_id)
+        if reference_id:
+            return reference_id
+
+    return missing_message
+
+
+def _normalize_preserved_created_at(created_at: Any) -> Any:
+    if isinstance(created_at, (int, float)):
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_at))
+    return created_at
+
+
+def _build_preserved_prompt_entities(
+    preserved_entities: list[dict[str, Any]],
+    chunk_id_to_reference_id: dict[str, str],
+) -> list[dict[str, Any]]:
+    prompt_entities: list[dict[str, Any]] = []
+    for entity in preserved_entities:
+        entity_name = str(entity.get("entity_name", "") or "").strip()
+        if not entity_name:
+            continue
+        source_id = entity.get("source_id", "")
+        prompt_entities.append(
+            {
+                "entity": entity_name,
+                "type": entity.get("entity_type", "UNKNOWN"),
+                "description": entity.get("description", "UNKNOWN"),
+                "created_at": _normalize_preserved_created_at(
+                    entity.get("created_at", "UNKNOWN")
+                ),
+                "file_path": entity.get("file_path", "unknown_source"),
+                "source_id": source_id,
+                "related_chunk": _resolve_related_chunk_reference(
+                    source_id,
+                    chunk_id_to_reference_id,
+                    "鏈疄浣?浠呯敤浜庣煡璇嗚ˉ鍏咃紝绂佹寮曠敤銆?",
+                ),
+            }
+        )
+    return prompt_entities
+
+
+def _format_preserved_entities_for_user(
+    preserved_entities: list[dict[str, Any]],
+    chunk_id_to_reference_id: dict[str, str],
+) -> list[dict[str, Any]]:
+    formatted_entities: list[dict[str, Any]] = []
+    for entity in preserved_entities:
+        entity_name = str(entity.get("entity_name", "") or "").strip()
+        if not entity_name:
+            continue
+        source_id = entity.get("source_id", "")
+        formatted_entities.append(
+            {
+                "entity_name": entity_name,
+                "entity_type": entity.get("entity_type", "UNKNOWN"),
+                "description": entity.get("description", ""),
+                "source_id": source_id,
+                "file_path": entity.get("file_path", "unknown_source"),
+                "created_at": entity.get("created_at", ""),
+                "related_chunk": _resolve_related_chunk_reference(
+                    source_id,
+                    chunk_id_to_reference_id,
+                    "鏈疄浣?浠呯敤浜庣煡璇嗚ˉ鍏咃紝绂佹寮曠敤銆?",
+                ),
+            }
+        )
+    return formatted_entities
+
+
+def _format_preserved_chunks_for_user(
+    preserved_chunks_with_ref_ids: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    formatted_chunks: list[dict[str, Any]] = []
+    for chunk in preserved_chunks_with_ref_ids:
+        resolved_image_base64, resolved_image_text = get_chunk_image_fields(chunk)
+        chunk_content = chunk.get("content", "")
+        if is_image_content_type(chunk.get("content_type")) and resolved_image_base64:
+            chunk_content = resolved_image_base64
+        chunk_data = {
+            "reference_id": chunk.get("reference_id", ""),
+            "content": chunk_content,
+            "file_path": chunk.get("file_path", "unknown_source"),
+            "chunk_id": chunk.get("chunk_id", ""),
+        }
+        if chunk.get("content_type") is not None:
+            chunk_data["content_type"] = chunk.get("content_type")
+        if chunk.get("page_id") is not None:
+            chunk_data["page_id"] = chunk.get("page_id")
+        if chunk.get("bbox") is not None:
+            chunk_data["bbox"] = chunk.get("bbox")
+        if chunk.get("ocr_chunk_id") is not None:
+            chunk_data["ocr_chunk_id"] = chunk.get("ocr_chunk_id")
+        if resolved_image_base64 is not None:
+            chunk_data["image_base64"] = resolved_image_base64
+        if resolved_image_text is not None:
+            chunk_data["image_text"] = resolved_image_text
+        formatted_chunks.append(chunk_data)
+    return formatted_chunks
+
+
+def _extract_file_id_from_doc_status(doc_status: Any) -> str | None:
+    if not isinstance(doc_status, dict):
+        return None
+
+    metadata = doc_status.get("metadata", {})
+    if not isinstance(metadata, dict):
+        return None
+
+    meta_info = metadata.get("meta_info", {})
+    if isinstance(meta_info, dict) and meta_info.get("file_id") is not None:
+        return str(meta_info.get("file_id"))
+
+    if metadata.get("file_id") is not None:
+        return str(metadata.get("file_id"))
+
+    return None
+
+
+async def _generate_preserved_reference_list_from_chunks(
+    chunks: list[dict[str, Any]],
+    start_reference_index: int,
+    doc_status_storage: Any | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not chunks:
+        return [], []
+
+    resolved_chunks = [_normalize_preserved_chunk(chunk) for chunk in chunks]
+    reference_entries: list[dict[str, Any]] = []
+    chunks_with_ref_ids: list[dict[str, Any]] = []
+    doc_status_by_doc_id: dict[str, Any] = {}
+    doc_status_by_file_path: dict[str, Any] = {}
+
+    for index, chunk in enumerate(resolved_chunks, start=start_reference_index):
+        chunk_copy = chunk.copy()
+        chunk_id = str(chunk_copy.get("chunk_id", "") or "").strip()
+        if not chunk_id:
+            chunk_id = f"chunk-unknown-{index}"
+            chunk_copy["chunk_id"] = chunk_id
+
+        chunk_copy["reference_id"] = str(index)
+        chunks_with_ref_ids.append(chunk_copy)
+
+        reference_entry = {
+            "reference_id": str(index),
+            "chunk_id": chunk_id,
+            "file_path": chunk_copy.get("file_path", "unknown_source"),
+            "page_id": chunk_copy.get("page_id"),
+            "bbox": chunk_copy.get("bbox"),
+        }
+
+        resolved_file_id: str | None = None
+        full_doc_id = chunk_copy.get("full_doc_id")
+        file_path = reference_entry["file_path"]
+        if doc_status_storage is not None:
+            if isinstance(full_doc_id, str) and full_doc_id:
+                if full_doc_id not in doc_status_by_doc_id:
+                    try:
+                        doc_status_by_doc_id[full_doc_id] = await doc_status_storage.get_by_id(
+                            full_doc_id
+                        )
+                    except Exception:
+                        doc_status_by_doc_id[full_doc_id] = None
+                resolved_file_id = _extract_file_id_from_doc_status(
+                    doc_status_by_doc_id.get(full_doc_id)
+                )
+
+            if resolved_file_id is None and file_path and file_path != "unknown_source":
+                if file_path not in doc_status_by_file_path:
+                    try:
+                        doc_status_by_file_path[file_path] = (
+                            await doc_status_storage.get_doc_by_file_path(file_path)
+                        )
+                    except Exception:
+                        doc_status_by_file_path[file_path] = None
+                resolved_file_id = _extract_file_id_from_doc_status(
+                    doc_status_by_file_path.get(file_path)
+                )
+
+        reference_entry["file_id"] = resolved_file_id
+        reference_entries.append(reference_entry)
+
+    return reference_entries, chunks_with_ref_ids
+
+
 # Now let's update the old _build_query_context to use the new architecture
 async def _build_query_context(
     query: str,
@@ -4429,6 +4685,7 @@ async def _build_query_context(
     query_param: QueryParam,
     chunks_vdb: BaseVectorStorage = None,
     doc_status_db: DocStatusStorage | None = None,
+    agent_context: dict[str, Any] | None = None,
 ) -> QueryContextResult | None:
     """
     Main query context building function using the new 4-stage architecture:
@@ -4454,12 +4711,25 @@ async def _build_query_context(
         chunks_vdb,
     )
 
+    preserved_entities = [
+        entity
+        for entity in (agent_context or {}).get("entities", [])
+        if isinstance(entity, dict)
+    ]
+    preserved_chunks = [
+        chunk for chunk in (agent_context or {}).get("chunks", []) if isinstance(chunk, dict)
+    ]
+
     if not search_result["final_entities"] and not search_result["final_relations"]:
-        if query_param.mode != "mix":
+        if query_param.mode != "mix" and not preserved_entities and not preserved_chunks:
             return None
-        else:
-            if not search_result["chunk_tracking"]:
-                return None
+        if (
+            query_param.mode == "mix"
+            and not search_result["chunk_tracking"]
+            and not preserved_entities
+            and not preserved_chunks
+        ):
+            return None
 
     # Stage 2: Apply token truncation for LLM efficiency
     truncation_result = await _apply_token_truncation(
@@ -4481,11 +4751,12 @@ async def _build_query_context(
         chunk_tracking=search_result["chunk_tracking"],
         query_embedding=search_result["query_embedding"],
     )
-
     if (
         not merged_chunks
         and not truncation_result["entities_context"]
         and not truncation_result["relations_context"]
+        and not preserved_entities
+        and not preserved_chunks
     ):
         return None
 
@@ -4502,6 +4773,8 @@ async def _build_query_context(
         chunk_tracking=search_result["chunk_tracking"],
         entity_id_to_original=truncation_result["entity_id_to_original"],
         relation_id_to_original=truncation_result["relation_id_to_original"],
+        preserved_entities=preserved_entities,
+        preserved_chunks=preserved_chunks,
     )
 
     # Convert keywords strings to lists and add complete metadata to raw_data
@@ -4526,8 +4799,10 @@ async def _build_query_context(
         "relations_after_truncation": len(
             truncation_result.get("filtered_relations", [])
         ),
-        "merged_chunks_count": len(merged_chunks),
+        "merged_chunks_count": len(merged_chunks) + len(preserved_chunks),
         "final_chunks_count": len(raw_data.get("data", {}).get("chunks", [])),
+        "preserved_agent_entities_count": len(preserved_entities),
+        "preserved_agent_chunks_count": len(preserved_chunks),
     }
 
     logger.debug(
@@ -5109,6 +5384,7 @@ async def _find_related_text_unit_from_relations(
 async def naive_query(
     query: str,
     chunks_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
@@ -5122,6 +5398,7 @@ async def naive_query(
 async def naive_query(
     query: str,
     chunks_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
@@ -5134,11 +5411,13 @@ async def naive_query(
 async def naive_query(
     query: str,
     chunks_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
     doc_status_db: DocStatusStorage | None = None,
+    agent_context: dict[str, Any] | None = None,
 ) -> QueryResult | None:
     """
     Execute naive query and return unified QueryResult object.
@@ -5177,11 +5456,18 @@ async def naive_query(
         logger.error("Tokenizer not found in global configuration.")
         return QueryResult(content=PROMPTS["fail_response"])
 
-    chunks = await _get_vector_context(
-        query, chunks_vdb, text_chunks_db, query_param, None
-    )
+    chunks = await _get_vector_context(query, chunks_vdb, text_chunks_db, query_param, None)
+    chunks = chunks or []
+    preserved_entities = [
+        entity
+        for entity in (agent_context or {}).get("entities", [])
+        if isinstance(entity, dict)
+    ]
+    preserved_chunks = [
+        chunk for chunk in (agent_context or {}).get("chunks", []) if isinstance(chunk, dict)
+    ]
 
-    if chunks is None or len(chunks) == 0:
+    if (chunks is None or len(chunks) == 0) and not preserved_entities and not preserved_chunks:
         logger.info(
             "[naive_query] No relevant document chunks found; returning no-result."
         )
@@ -5240,17 +5526,42 @@ async def naive_query(
     reference_entries, processed_chunks_with_ref_ids = await generate_reference_list_from_chunks(
         processed_chunks, doc_status_storage=doc_status_db
     )
+    preserved_reference_entries, preserved_chunks_with_ref_ids = (
+        await _generate_preserved_reference_list_from_chunks(
+            preserved_chunks,
+            start_reference_index=len(reference_entries) + 1,
+            doc_status_storage=doc_status_db,
+        )
+    )
+    all_reference_entries = reference_entries + preserved_reference_entries
+    all_chunks_with_ref_ids = processed_chunks_with_ref_ids + preserved_chunks_with_ref_ids
 
-    logger.info(f"Final context: {len(processed_chunks_with_ref_ids)} chunks")
+    logger.info(f"Final context: {len(all_chunks_with_ref_ids)} chunks")
 
     # Build raw data structure for naive mode using processed chunks with reference IDs
     raw_data = convert_to_user_format(
-        [],  # naive mode has no entities
+        [],  # base naive mode has no entities
         [],  # naive mode has no relationships
         processed_chunks_with_ref_ids,
         reference_entries,
         "naive",
     )
+    raw_data_data = raw_data.setdefault("data", {})
+    if isinstance(raw_data_data, dict):
+        raw_data_data.setdefault("entities", [])
+        raw_data_data.setdefault("chunks", [])
+        raw_data_data.setdefault("references", [])
+        chunk_id_to_reference_id = _build_chunk_reference_lookup(all_chunks_with_ref_ids)
+        raw_data_data["entities"].extend(
+            _format_preserved_entities_for_user(
+                preserved_entities,
+                chunk_id_to_reference_id,
+            )
+        )
+        raw_data_data["chunks"].extend(
+            _format_preserved_chunks_for_user(preserved_chunks_with_ref_ids)
+        )
+        raw_data_data["references"].extend(preserved_reference_entries)
 
     # Add complete metadata for naive mode
     if "metadata" not in raw_data:
@@ -5260,13 +5571,15 @@ async def naive_query(
         "low_level": [],  # naive mode has no keyword extraction
     }
     raw_data["metadata"]["processing_info"] = {
-        "total_chunks_found": len(chunks),
-        "final_chunks_count": len(processed_chunks_with_ref_ids),
+        "total_chunks_found": len(chunks) + len(preserved_chunks),
+        "final_chunks_count": len(all_chunks_with_ref_ids),
+        "preserved_agent_entities_count": len(preserved_entities),
+        "preserved_agent_chunks_count": len(preserved_chunks),
     }
 
     # Build chunks_context from processed chunks with reference IDs
     chunks_context = []
-    for i, chunk in enumerate(processed_chunks_with_ref_ids):
+    for i, chunk in enumerate(all_chunks_with_ref_ids):
         chunks_context.append(
             {
                 "reference_id": chunk["reference_id"],
@@ -5279,7 +5592,7 @@ async def naive_query(
     )
     reference_list_str = "\n".join(
         f"[{ref['reference_id']}] {ref.get('chunk_id')} | {ref['file_path']} | file_id: {ref.get('file_id')}"
-        for ref in reference_entries
+        for ref in all_reference_entries
         if ref["reference_id"]
     )
 
@@ -5316,6 +5629,7 @@ async def naive_query(
         query_param.max_total_tokens,
         query_param.user_prompt or "",
         query_param.enable_rerank,
+        (agent_context or {}).get("signature", ""),
     )
     cached_result = await handle_cache(
         hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"

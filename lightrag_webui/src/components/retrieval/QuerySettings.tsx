@@ -379,6 +379,30 @@ export default function QuerySettings() {
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>
+                      <label htmlFor="agent_search" className="flex-1 ml-1 cursor-help">
+                        {t('retrievePanel.querySettings.agentSearch', 'Agent Search')}
+                      </label>
+                    </TooltipTrigger>
+                    <TooltipContent side="left">
+                      <p>{t(
+                        'retrievePanel.querySettings.agentSearchTooltip',
+                        'Forward history + query to the configured agent search pipeline and merge its submitted entities/chunks into the final retrieval result.'
+                      )}</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+                <Checkbox
+                  className="mr-10 cursor-pointer"
+                  id="agent_search"
+                  checked={querySettings.agent_search ?? false}
+                  onCheckedChange={(checked) => handleChange('agent_search', checked)}
+                />
+              </div>
+
+              <div className="flex items-center gap-2">
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
                       <label htmlFor="only_need_context" className="flex-1 ml-1 cursor-help">
                         {t('retrievePanel.querySettings.onlyNeedContext')}
                       </label>

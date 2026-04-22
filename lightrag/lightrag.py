@@ -2965,6 +2965,7 @@ class LightRAG:
         self,
         query: str | dict[str, Any],
         param: QueryParam = QueryParam(),
+        agent_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Asynchronous data retrieval API: returns structured retrieval results without LLM generation.
@@ -3120,17 +3121,20 @@ class LightRAG:
                 system_prompt=None,
                 chunks_vdb=self.chunks_vdb,
                 doc_status_db=self.doc_status,
+                agent_context=agent_context,
             )
         elif data_param.mode == "naive":
             logger.debug(f"[aquery_data] Using naive_query for mode: {data_param.mode}")
             query_result = await naive_query(
                 latest_query.strip(),
                 self.chunks_vdb,
+                self.text_chunks,
                 data_param,  # Use data_param with only_need_context=True
                 global_config,
                 hashing_kv=self.llm_response_cache,
                 system_prompt=None,
                 doc_status_db=self.doc_status,
+                agent_context=agent_context,
             )
         elif data_param.mode == "bypass":
             logger.debug("[aquery_data] Using bypass mode")
@@ -3184,6 +3188,7 @@ class LightRAG:
         query: str | dict[str, Any],
         param: QueryParam = QueryParam(),
         system_prompt: str | None = None,
+        agent_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Asynchronous complete query API: returns structured retrieval results with LLM generation.
@@ -3227,16 +3232,19 @@ class LightRAG:
                     system_prompt=system_prompt,
                     chunks_vdb=self.chunks_vdb,
                     doc_status_db=self.doc_status,
+                    agent_context=agent_context,
                 )
             elif effective_param.mode == "naive":
                 query_result = await naive_query(
                     latest_query.strip(),
                     self.chunks_vdb,
+                    self.text_chunks,
                     effective_param,
                     global_config,
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
                     doc_status_db=self.doc_status,
+                    agent_context=agent_context,
                 )
             elif effective_param.mode == "bypass":
                 # Bypass mode: directly use LLM without knowledge retrieval

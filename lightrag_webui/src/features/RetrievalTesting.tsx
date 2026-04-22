@@ -3,17 +3,22 @@ import Input from '@/components/ui/Input'
 import Button from '@/components/ui/Button'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { throttle } from '@/lib/utils'
-import { queryText, queryTextStream } from '@/api/lightrag'
+import {
+  queryText,
+  queryTextStream,
+  QueryStreamEvent,
+} from '@/api/lightrag'
 import { errorMessage } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { useDebounce } from '@/hooks/useDebounce'
 import QuerySettings from '@/components/retrieval/QuerySettings'
 import { ChatMessage, MessageWithError } from '@/components/retrieval/ChatMessage'
-import { EraserIcon, SendIcon, CopyIcon } from 'lucide-react'
+import { EraserIcon, SendIcon, CopyIcon, ChevronDownIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { copyToClipboard } from '@/utils/clipboard'
 import type { QueryMode } from '@/api/lightrag'
+import { cn } from '@/lib/utils'
 
 // Helper function to generate unique IDs with browser compatibility
 const generateUniqueId = () => {
@@ -99,6 +104,108 @@ const parseCOTContent = (content: string) => {
     displayContent,
     hasValidThinkBlock: hasThinkStart && hasThinkEnd && startMatches.length === endMatches.length
   }
+}
+
+const toPersistedMessages = (history: MessageWithError[]) =>
+  history.map((message) => ({
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    thinkingContent: message.thinkingContent,
+    displayContent: message.displayContent,
+    thinkingTime: message.thinkingTime,
+    mermaidRendered: message.mermaidRendered,
+    latexRendered: message.latexRendered,
+    isError: message.isError,
+    isThinking: false,
+  }))
+
+function hasStructuredRetrievalData(message: MessageWithError): boolean {
+  return Boolean(
+    message.agentSearchResult ||
+    (message.agentStatuses && message.agentStatuses.length > 0)
+  )
+}
+
+function RetrievalResultCard({
+  message,
+  t
+}: {
+  message: MessageWithError
+  t: ReturnType<typeof useTranslation>['t']
+}) {
+  const [open, setOpen] = useState(true)
+  const agentSearchResult = message.agentSearchResult
+  const agentStatuses = message.agentStatuses || []
+
+  if (!hasStructuredRetrievalData(message)) {
+    return null
+  }
+
+  return (
+    <div className="mt-2 w-[95%] rounded-lg border bg-background/85 p-3 text-sm shadow-sm">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="flex w-full items-center justify-between gap-3 text-left"
+      >
+        <div className="min-w-0">
+          <div className="font-medium">
+            {t('retrievePanel.retrieval.resultTitle', 'Agent Search Result')}
+          </div>
+          <div className="mt-1 flex flex-wrap gap-2 text-xs text-muted-foreground">
+            {agentSearchResult && (
+              <span>
+                {t('retrievePanel.retrieval.resultAgentStatus', {
+                  defaultValue: 'Agent Search: {{status}}',
+                  status: agentSearchResult.status
+                })}
+              </span>
+            )}
+          </div>
+        </div>
+        <ChevronDownIcon className={cn('size-4 shrink-0 transition-transform', open && 'rotate-180')} />
+      </button>
+
+      {open && (
+        <div className="mt-3 space-y-4">
+          {(agentSearchResult || agentStatuses.length > 0) && (
+            <section className="space-y-2">
+              <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                {t('retrievePanel.retrieval.agentSection', 'Agent Search')}
+              </div>
+              {agentSearchResult && (
+                <div className="rounded-md border bg-muted/20 p-3 text-xs">
+                  <div>{t('retrievePanel.retrieval.agentPipeline', { defaultValue: 'Pipeline status: {{status}}', status: agentSearchResult.status })}</div>
+                  <div>{t('retrievePanel.retrieval.agentSubmitted', { defaultValue: 'Submitted: {{value}}', value: agentSearchResult.submitted ? 'yes' : 'no' })}</div>
+                  <div>{t('retrievePanel.retrieval.agentEntityCount', { defaultValue: 'Entity count: {{count}}', count: agentSearchResult.entity_count })}</div>
+                  <div>{t('retrievePanel.retrieval.agentChunkCount', { defaultValue: 'Chunk count: {{count}}', count: agentSearchResult.chunk_count })}</div>
+                  {agentSearchResult.error && (
+                    <div className="text-red-500">{agentSearchResult.error}</div>
+                  )}
+                </div>
+              )}
+              {agentStatuses.length > 0 && (
+                <div className="rounded-md border bg-muted/10 p-3">
+                  <div className="mb-2 text-xs font-medium text-muted-foreground">
+                    {t('retrievePanel.retrieval.agentTimeline', 'Runtime status')}
+                  </div>
+                  <div className="space-y-2 text-xs">
+                    {agentStatuses.map((status, index) => (
+                      <div key={`${message.id}-agent-status-${index}`} className="rounded border bg-background/60 p-2">
+                        <div className="font-medium">{String(status.phase || status.event_type || '-')}</div>
+                        <div className="text-muted-foreground">{String(status.message || '-')}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+        </div>
+      )}
+    </div>
+  )
 }
 
 export default function RetrievalTesting() {
@@ -337,6 +444,18 @@ export default function RetrievalTesting() {
         }
       }
 
+      const updateAssistantMetadata = (updates: Partial<MessageWithError>) => {
+        Object.assign(assistantMessage, updates)
+        setMessages((prev) => {
+          const newMessages = [...prev]
+          const lastMessage = newMessages[newMessages.length - 1]
+          if (lastMessage && lastMessage.id === assistantMessage.id) {
+            Object.assign(lastMessage, updates)
+          }
+          return newMessages
+        })
+      }
+
       // Prepare query parameters
       const state = useSettingsStore.getState()
 
@@ -371,9 +490,27 @@ export default function RetrievalTesting() {
         // Run query
         if (state.querySettings.stream) {
           let errorMessage = ''
-          await queryTextStream(queryParams, updateAssistantMessage, (error) => {
-            errorMessage += error
-          })
+          await queryTextStream(
+            queryParams,
+            updateAssistantMessage,
+            (error) => {
+              errorMessage += error
+            },
+            (event: QueryStreamEvent) => {
+              if (event.references) {
+                updateAssistantMetadata({
+                  references: event.references
+                })
+              }
+              if (event.agent_search_result) {
+                updateAssistantMetadata({ agentSearchResult: event.agent_search_result })
+              }
+              if (event.agent_status) {
+                const nextAgentStatuses = [...(assistantMessage.agentStatuses || []), event.agent_status]
+                updateAssistantMetadata({ agentStatuses: nextAgentStatuses })
+              }
+            }
+          )
           if (errorMessage) {
             if (assistantMessage.content) {
               errorMessage = assistantMessage.content + '\n' + errorMessage
@@ -383,6 +520,10 @@ export default function RetrievalTesting() {
         } else {
           const response = await queryText(queryParams)
           updateAssistantMessage(response.response)
+          updateAssistantMetadata({
+            references: response.references || undefined,
+            agentSearchResult: response.agent_search_result || null
+          })
         }
       } catch (err) {
         // Handle error
@@ -424,7 +565,9 @@ export default function RetrievalTesting() {
         try {
           useSettingsStore
             .getState()
-            .setRetrievalHistory([...prevMessages, userMessage, assistantMessage])
+            .setRetrievalHistory(
+              toPersistedMessages([...prevMessages, userMessage, assistantMessage])
+            )
         } catch (error) {
           console.error('Error saving retrieval history:', error)
         }
@@ -721,7 +864,12 @@ export default function RetrievalTesting() {
                           <CopyIcon className="size-4" />
                         </Button>
                       )}
-                      <ChatMessage message={message} isTabActive={isRetrievalTabActive} />
+                      <div className={cn('flex min-w-0 flex-col', message.role === 'assistant' ? 'items-start' : 'items-end')}>
+                        <ChatMessage message={message} isTabActive={isRetrievalTabActive} />
+                        {message.role === 'assistant' && (
+                          <RetrievalResultCard message={message} t={t} />
+                        )}
+                      </div>
                       {message.role === 'assistant' && (
                         <Button
                           onClick={() => handleCopyMessage(message)}

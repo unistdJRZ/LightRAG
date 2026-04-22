@@ -620,6 +620,15 @@ EMBEDDING_BINDING_HOST=http://localhost:11434
 # TOKEN_SECRET=your-key-for-LightRAG-API-Server-xxx
 # TOKEN_EXPIRE_HOURS=48
 
+### For OpenCode agent_search integration
+# When running `opencode serve --hostname 0.0.0.0 --port 4096` in WSL,
+# access it from LightRAG via localhost on Windows.
+OPENCODE_SERVER_URL=http://localhost:4096
+OPENCODE_SERVER_USERNAME=opencode
+OPENCODE_SERVER_PASSWORD=opencodepasswd
+OPENCODE_RAG_AGENT=RAG search
+OPENCODE_TIMEOUT=90
+
 # LIGHTRAG_API_KEY=your-secure-api-key-here-123
 # WHITELIST_PATHS=/api/*
 # WHITELIST_PATHS=/health,/api/*

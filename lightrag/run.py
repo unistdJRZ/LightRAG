@@ -53,6 +53,11 @@ def main():
         default=None,
         help="Override workspace from config (comma-separated for multi-workspace)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Run backend with DEBUG logging and verbose request diagnostics.",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -96,6 +101,8 @@ def main():
         workspace,
         "--no-webui-dev",
     ]
+    if args.debug:
+        backend_cmd.extend(["--log-level", "DEBUG", "--verbose"])
     frontend_cmd = [
         bun_bin,
         "run",

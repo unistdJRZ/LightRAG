@@ -2,11 +2,25 @@
 This module contains all query-related routes for the LightRAG API.
 """
 
+import asyncio
 import json
+import logging
+from dataclasses import dataclass
 from contextvars import ContextVar
 from typing import Any, Dict, List, Literal, Mapping, Optional
+from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException
 from lightrag.base import QueryParam
+from lightrag.api.agent.routes import (
+    _get_agent_submit_payload,
+    _resolve_graph_storage,
+)
+from lightrag.api.config import global_args
+from lightrag.api.opencode_client import (
+    OpencodeStatusEvent,
+    is_opencode_enabled,
+    run_agent_search,
+)
 from lightrag.api.utils_api import (
     get_combined_auth_dependency,
     WorkspaceObjectProxy,
@@ -21,6 +35,24 @@ from lightrag.utils import (
 from pydantic import BaseModel, Field, field_validator
 
 router = APIRouter(tags=["query"])
+
+
+def _log_query_request(endpoint: str, request: "QueryRequest") -> None:
+    """Emit request parameters when DEBUG logging is enabled."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    try:
+        payload = request.model_dump(exclude_none=False)
+    except Exception as exc:
+        logger.debug("Failed to serialize %s request payload: %s", endpoint, exc)
+        return
+
+    logger.debug(
+        "Received %s request params: %s",
+        endpoint,
+        json.dumps(payload, ensure_ascii=False, default=str),
+    )
 
 
 class QueryInputPayload(BaseModel):
@@ -150,6 +182,10 @@ class QueryRequest(BaseModel):
         default=True,
         description="If True, enables streaming output for real-time responses. Only affects /query/stream endpoint.",
     )
+    agent_search: bool = Field(
+        default=False,
+        description="If True, dispatches the combined history and query to the configured OpenCode RAG search agent and merges its submitted results into the final output.",
+    )
 
     @field_validator("query", mode="after")
     @classmethod
@@ -180,7 +216,10 @@ class QueryRequest(BaseModel):
         """Converts a QueryRequest instance into a QueryParam instance."""
         # Use Pydantic's `.model_dump(exclude_none=True)` to remove None values automatically
         # Exclude API-level parameters that don't belong in QueryParam
-        request_data = self.model_dump(exclude_none=True, exclude={"query", "workspace"})
+        request_data = self.model_dump(
+            exclude_none=True,
+            exclude={"query", "workspace", "agent_search"},
+        )
 
         if self.conversation_history is None:
             request_data["conversation_history"] = self.get_effective_history()
@@ -244,6 +283,10 @@ class QueryResponse(BaseModel):
         default=None,
         description="Reference list (Disabled when include_references=False, /query/data always includes references.)",
     )
+    agent_search_result: Optional["AgentSearchResultPayload"] = Field(
+        default=None,
+        description="Final agent_search execution status and summary when enabled.",
+    )
 
 
 class QueryDataResponse(BaseModel):
@@ -254,6 +297,10 @@ class QueryDataResponse(BaseModel):
     )
     metadata: Dict[str, Any] = Field(
         description="Query metadata including mode, keywords, and processing information"
+    )
+    agent_search_result: Optional["AgentSearchResultPayload"] = Field(
+        default=None,
+        description="Final agent_search execution status and summary when enabled.",
     )
 
 
@@ -270,6 +317,66 @@ class StreamChunkResponse(BaseModel):
     error: Optional[str] = Field(
         default=None, description="Error message if processing fails"
     )
+    agent_status: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Runtime status emitted by OpenCode agent_search while the query is in progress.",
+    )
+    agent_search_result: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Final agent_search execution status and summary when enabled.",
+    )
+
+
+class AgentSearchResultPayload(BaseModel):
+    agent_search_id: str = Field(description="Generated id used to correlate the OpenCode search and LightRAG submit cache.")
+    workspace: str = Field(description="Resolved workspace used for the agent search.")
+    retrieval_target: str = Field(description="Combined history and latest query sent to the OpenCode agent.")
+    status: Literal["completed", "missing_submit", "failed"] = Field(
+        description="Final status of the OpenCode agent_search pipeline."
+    )
+    submitted: bool = Field(description="Whether a matching /api/agent/submit payload was found.")
+    entity_count: int = Field(default=0, description="Number of submitted entities merged into the RAG retrieval context.")
+    chunk_count: int = Field(default=0, description="Number of submitted chunks merged into the RAG retrieval context.")
+    prior_rag_used: bool = Field(
+        default=False,
+        description="Whether a server-side prior RAG data pass was summarized and injected into the agent prompt.",
+    )
+    prior_rag_entity_count: int = Field(
+        default=0,
+        description="Number of entity items included in the prior RAG summary passed to the agent.",
+    )
+    prior_rag_relation_count: int = Field(
+        default=0,
+        description="Number of relationship items included in the prior RAG summary passed to the agent.",
+    )
+    prior_rag_chunk_count: int = Field(
+        default=0,
+        description="Number of chunk items included in the prior RAG summary passed to the agent.",
+    )
+    opencode_session_id: str | None = Field(
+        default=None,
+        description="OpenCode session id used for the search run.",
+    )
+    opencode_output: str | None = Field(
+        default=None,
+        description="Final text output returned by OpenCode for this search run.",
+    )
+    error: str | None = Field(
+        default=None,
+        description="Failure reason when agent_search did not complete successfully.",
+    )
+
+
+@dataclass(slots=True)
+class AgentSearchMergeBundle:
+    public_result: AgentSearchResultPayload
+    search_entities: list[dict[str, Any]]
+    search_chunks: list[dict[str, Any]]
+    cache_signature: str = ""
+
+
+QueryResponse.model_rebuild()
+QueryDataResponse.model_rebuild()
 
 
 def _enrich_references_with_chunk_preview(
@@ -412,6 +519,537 @@ def _normalize_chunk_level_references(data: Dict[str, Any]) -> List[Dict[str, An
         ref_copy.setdefault("chunk_id", "")
         fallback.append(ref_copy)
     return fallback
+
+
+def _build_agent_search_id() -> str:
+    return f"agent-search-{uuid4().hex}"
+
+
+def _get_agent_search_timeout_seconds() -> float:
+    configured = float(getattr(global_args, "opencode_timeout", 120.0) or 120.0)
+    return max(configured + 5.0, 10.0)
+
+
+def _build_retrieval_target(request: QueryRequest) -> str:
+    sections: list[str] = []
+    history = request.get_effective_history()
+    if history:
+        history_lines: list[str] = []
+        for message in history:
+            role = str(message.get("role", "user") or "user").strip() or "user"
+            content = str(message.get("content", "") or "").strip()
+            if content:
+                history_lines.append(f"{role}: {content}")
+        if history_lines:
+            sections.append("[history]")
+            sections.extend(history_lines)
+
+    query_text = request.get_query_text().strip()
+    sections.extend(["[latest_query]", query_text])
+    return "\n".join(sections)
+
+
+def _summarize_prior_rag_data(
+    result: dict[str, Any] | None,
+    *,
+    max_entities: int = 5,
+    max_relations: int = 5,
+    max_chunks: int = 5,
+) -> tuple[str | None, dict[str, int]]:
+    empty_counts = {
+        "entities": 0,
+        "relationships": 0,
+        "chunks": 0,
+    }
+    if not isinstance(result, dict):
+        return None, empty_counts
+
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return None, empty_counts
+
+    entities = [
+        item for item in (data.get("entities") or []) if isinstance(item, dict)
+    ][:max_entities]
+    relationships = [
+        item for item in (data.get("relationships") or []) if isinstance(item, dict)
+    ][:max_relations]
+    chunks = [item for item in (data.get("chunks") or []) if isinstance(item, dict)][
+        :max_chunks
+    ]
+
+    if not entities and not relationships and not chunks:
+        return None, empty_counts
+
+    lines: list[str] = []
+    if entities:
+        lines.append("[entities]")
+        for item in entities:
+            entity_name = str(item.get("entity_name", "") or "").strip()
+            entity_type = str(item.get("entity_type", "") or "").strip()
+            description = get_content_summary(
+                str(item.get("description", "") or "").strip()
+            )
+            source_id = str(item.get("source_id", "") or "").strip()
+            parts = [entity_name]
+            if entity_type:
+                parts.append(f"type={entity_type}")
+            if description:
+                parts.append(f"description={description}")
+            if source_id:
+                parts.append(f"source_id={source_id}")
+            lines.append(" - " + " | ".join(part for part in parts if part))
+
+    if relationships:
+        lines.append("[relationships]")
+        for item in relationships:
+            src_id = str(item.get("src_id", "") or "").strip()
+            tgt_id = str(item.get("tgt_id", "") or "").strip()
+            description = get_content_summary(
+                str(item.get("description", "") or "").strip()
+            )
+            keywords = str(item.get("keywords", "") or "").strip()
+            parts = [f"{src_id} -> {tgt_id}".strip()]
+            if description:
+                parts.append(f"description={description}")
+            if keywords:
+                parts.append(f"keywords={keywords}")
+            lines.append(" - " + " | ".join(part for part in parts if part))
+
+    if chunks:
+        lines.append("[chunks]")
+        for item in chunks:
+            chunk_id = str(item.get("chunk_id", "") or "").strip()
+            file_path = str(item.get("file_path", "") or "").strip()
+            content = get_content_summary(str(item.get("content", "") or "").strip())
+            parts = [chunk_id]
+            if file_path:
+                parts.append(f"file_path={file_path}")
+            if content:
+                parts.append(f"content={content}")
+            lines.append(" - " + " | ".join(part for part in parts if part))
+
+    summary = "\n".join(lines).strip()
+    if not summary:
+        return None, empty_counts
+
+    return summary, {
+        "entities": len(entities),
+        "relationships": len(relationships),
+        "chunks": len(chunks),
+    }
+
+
+async def _build_prior_rag_context(
+    rag: Any,
+    request: QueryRequest,
+    param: QueryParam,
+) -> tuple[str | None, dict[str, int]]:
+    prior_param = QueryParam(**param.__dict__)
+    prior_param.stream = False
+    try:
+        result = await rag.aquery_data(
+            request.query,
+            param=prior_param,
+            agent_context=None,
+        )
+    except Exception as exc:
+        logger.warning("Prior RAG context generation failed before agent_search: %s", exc)
+        return None, {"entities": 0, "relationships": 0, "chunks": 0}
+
+    return _summarize_prior_rag_data(result)
+
+
+async def _emit_agent_status(
+    queue: asyncio.Queue[dict[str, Any]] | None,
+    status: OpencodeStatusEvent,
+) -> None:
+    if queue is None:
+        return
+    await queue.put(
+        {
+            "agent_search_id": status.agent_search_id,
+            "phase": status.phase,
+            "message": status.message,
+            "event_type": status.event_type,
+            "opencode_session_id": status.session_id,
+        }
+    )
+
+
+def _dedupe_records(
+    items: list[dict[str, Any]],
+    key_fields: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = ""
+        for field in key_fields:
+            value = str(item.get(field, "") or "").strip()
+            if value:
+                key = f"{field}:{value}"
+                break
+        if not key:
+            key = json.dumps(item, sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _split_source_id(value: Any) -> list[str]:
+    if not isinstance(value, str) or not value.strip():
+        return []
+    return [item for item in value.split("<SEP>") if item]
+
+
+async def _wait_for_agent_submit_payload(
+    rag: Any,
+    agent_search_id: str,
+    timeout_seconds: float = 5.0,
+    interval_seconds: float = 0.5,
+) -> tuple[dict[str, Any] | None, str]:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    last_workspace = ""
+
+    while True:
+        payload, workspace = await _get_agent_submit_payload(rag, agent_search_id)
+        last_workspace = workspace
+        if payload is not None:
+            return payload, workspace
+        if asyncio.get_running_loop().time() >= deadline:
+            return None, last_workspace
+        await asyncio.sleep(interval_seconds)
+
+
+def _build_agent_cache_signature(
+    entity_ids: list[str],
+    chunk_ids: list[str],
+) -> str:
+    return json.dumps(
+        {
+            "entity_ids": entity_ids,
+            "chunk_ids": chunk_ids,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+async def _load_agent_entities(entity_ids: list[str], rag: Any) -> list[dict[str, Any]]:
+    if not entity_ids:
+        return []
+
+    graph_storage = _resolve_graph_storage(rag)
+    nodes = await graph_storage.get_nodes_batch(entity_ids)
+    records: list[dict[str, Any]] = []
+    for entity_id in entity_ids:
+        node = nodes.get(entity_id)
+        if not isinstance(node, dict):
+            continue
+        records.append(
+            {
+                "entity_name": node.get("entity_id") or entity_id,
+                "file_path": node.get("file_path", "unknown_source"),
+                "description": node.get("description"),
+                "source_id": node.get("source_id"),
+                "entity_type": node.get("entity_type"),
+                "created_at": node.get("created_at"),
+            }
+        )
+    return records
+
+
+async def _load_agent_chunks(chunk_ids: list[str], rag: Any) -> list[dict[str, Any]]:
+    if not chunk_ids:
+        return []
+
+    records = await rag.text_chunks.get_by_ids(chunk_ids)
+    if not isinstance(records, list):
+        return []
+
+    record_map: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        chunk_id = str(record.get("id") or record.get("chunk_id") or "").strip()
+        if chunk_id:
+            record_map[chunk_id] = record
+
+    chunk_payloads: list[dict[str, Any]] = []
+    for chunk_id in chunk_ids:
+        record = record_map.get(chunk_id)
+        if record is None:
+            continue
+        resolved_image_base64, resolved_image_text = get_chunk_image_fields(record)
+        chunk_content = record.get("content", "")
+        if is_image_content_type(record.get("content_type")) and resolved_image_base64:
+            chunk_content = resolved_image_base64
+        chunk_payload = {
+            "chunk_id": chunk_id,
+            "full_doc_id": record.get("full_doc_id"),
+            "content": str(chunk_content or ""),
+            "file_path": record.get("file_path", "unknown_source"),
+            "content_type": record.get("content_type"),
+            "page_id": record.get("page_id"),
+            "bbox": record.get("bbox"),
+        }
+        if resolved_image_base64 is not None:
+            chunk_payload["image_base64"] = resolved_image_base64
+        if resolved_image_text is not None:
+            chunk_payload["image_text"] = resolved_image_text
+        chunk_payloads.append(chunk_payload)
+    return chunk_payloads
+
+
+def _build_agent_context(
+    bundle: AgentSearchMergeBundle | None,
+) -> dict[str, Any] | None:
+    if bundle is None or not bundle.public_result.submitted:
+        return None
+
+    if not bundle.search_entities and not bundle.search_chunks:
+        return None
+
+    return {
+        "signature": bundle.cache_signature,
+        "entities": bundle.search_entities,
+        "chunks": bundle.search_chunks,
+    }
+
+
+async def _run_agent_search_pipeline(
+    rag: Any,
+    request: QueryRequest,
+    workspace: str,
+    param: QueryParam,
+    status_queue: asyncio.Queue[dict[str, Any]] | None = None,
+) -> AgentSearchMergeBundle | None:
+    if not request.agent_search:
+        return None
+
+    agent_search_id = _build_agent_search_id()
+    retrieval_target = _build_retrieval_target(request)
+    prior_rag_context: str | None = None
+    prior_rag_counts = {"entities": 0, "relationships": 0, "chunks": 0}
+
+    if status_queue is not None:
+        await status_queue.put(
+            {
+                "agent_search_id": agent_search_id,
+                "phase": "pre_rag",
+                "message": "building prior rag context for agent",
+                "event_type": "local.pre_rag_started",
+                "opencode_session_id": None,
+            }
+        )
+
+    prior_rag_context, prior_rag_counts = await _build_prior_rag_context(
+        rag,
+        request,
+        param,
+    )
+
+    if not is_opencode_enabled():
+        return AgentSearchMergeBundle(
+            public_result=AgentSearchResultPayload(
+                agent_search_id=agent_search_id,
+                workspace=workspace,
+                retrieval_target=retrieval_target,
+                status="failed",
+                submitted=False,
+                prior_rag_used=bool(prior_rag_context),
+                prior_rag_entity_count=prior_rag_counts["entities"],
+                prior_rag_relation_count=prior_rag_counts["relationships"],
+                prior_rag_chunk_count=prior_rag_counts["chunks"],
+                error="OpenCode integration is not configured",
+            ),
+            search_entities=[],
+            search_chunks=[],
+        )
+
+    opencode_result = await run_agent_search(
+        agent_search_id=agent_search_id,
+        workspace=workspace,
+        retrieval_target=retrieval_target,
+        prior_rag_context=prior_rag_context,
+        callback=(
+            None
+            if status_queue is None
+            else lambda status: _emit_agent_status(status_queue, status)
+        ),
+    )
+
+    if not opencode_result.ok:
+        return AgentSearchMergeBundle(
+            public_result=AgentSearchResultPayload(
+                agent_search_id=agent_search_id,
+                workspace=workspace,
+                retrieval_target=retrieval_target,
+                status="failed",
+                submitted=False,
+                prior_rag_used=bool(prior_rag_context),
+                prior_rag_entity_count=prior_rag_counts["entities"],
+                prior_rag_relation_count=prior_rag_counts["relationships"],
+                prior_rag_chunk_count=prior_rag_counts["chunks"],
+                opencode_session_id=opencode_result.session_id,
+                opencode_output=opencode_result.final_output,
+                error=opencode_result.error,
+            ),
+            search_entities=[],
+            search_chunks=[],
+        )
+
+    submit_timeout = float(getattr(global_args, "opencode_timeout", 120.0) or 120.0)
+    submit_payload, resolved_workspace = await _wait_for_agent_submit_payload(
+        rag,
+        agent_search_id,
+        timeout_seconds=min(max(submit_timeout / 6.0, 1.0), 10.0),
+    )
+    if submit_payload is None:
+        return AgentSearchMergeBundle(
+            public_result=AgentSearchResultPayload(
+                agent_search_id=agent_search_id,
+                workspace=resolved_workspace or workspace,
+                retrieval_target=retrieval_target,
+                status="missing_submit",
+                submitted=False,
+                prior_rag_used=bool(prior_rag_context),
+                prior_rag_entity_count=prior_rag_counts["entities"],
+                prior_rag_relation_count=prior_rag_counts["relationships"],
+                prior_rag_chunk_count=prior_rag_counts["chunks"],
+                opencode_session_id=opencode_result.session_id,
+                opencode_output=opencode_result.final_output,
+                error="OpenCode finished but no matching /api/agent/submit payload was found",
+            ),
+            search_entities=[],
+            search_chunks=[],
+        )
+
+    entity_ids = [
+        str(item).strip()
+        for item in submit_payload.get("entity_ids", [])
+        if str(item).strip()
+    ]
+    chunk_ids = [
+        str(item).strip()
+        for item in submit_payload.get("chunk_ids", [])
+        if str(item).strip()
+    ]
+
+    search_entities = await _load_agent_entities(entity_ids, rag)
+    search_chunks = await _load_agent_chunks(chunk_ids, rag)
+    cache_signature = _build_agent_cache_signature(entity_ids, chunk_ids)
+
+    return AgentSearchMergeBundle(
+        public_result=AgentSearchResultPayload(
+            agent_search_id=agent_search_id,
+            workspace=resolved_workspace or workspace,
+            retrieval_target=retrieval_target,
+            status="completed",
+            submitted=True,
+            entity_count=len(search_entities),
+            chunk_count=len(search_chunks),
+            prior_rag_used=bool(prior_rag_context),
+            prior_rag_entity_count=prior_rag_counts["entities"],
+            prior_rag_relation_count=prior_rag_counts["relationships"],
+            prior_rag_chunk_count=prior_rag_counts["chunks"],
+            opencode_session_id=opencode_result.session_id,
+            opencode_output=opencode_result.final_output,
+        ),
+        search_entities=search_entities,
+        search_chunks=search_chunks,
+        cache_signature=cache_signature,
+    )
+
+
+async def _run_agent_search_pipeline_guarded(
+    rag: Any,
+    request: QueryRequest,
+    workspace: str,
+    param: QueryParam,
+    status_queue: asyncio.Queue[dict[str, Any]] | None = None,
+) -> AgentSearchMergeBundle | None:
+    try:
+        return await asyncio.wait_for(
+            _run_agent_search_pipeline(
+                rag,
+                request,
+                workspace=workspace,
+                param=param,
+                status_queue=status_queue,
+            ),
+            timeout=_get_agent_search_timeout_seconds(),
+        )
+    except asyncio.TimeoutError:
+        agent_search_id = _build_agent_search_id()
+        retrieval_target = _build_retrieval_target(request)
+        if status_queue is not None:
+            await status_queue.put(
+                {
+                    "agent_search_id": agent_search_id,
+                    "phase": "failed",
+                    "message": "agent_search timed out",
+                    "event_type": "timeout",
+                    "opencode_session_id": None,
+                }
+            )
+        return AgentSearchMergeBundle(
+            public_result=AgentSearchResultPayload(
+                agent_search_id=agent_search_id,
+                workspace=workspace,
+                retrieval_target=retrieval_target,
+                status="failed",
+                submitted=False,
+                prior_rag_used=False,
+                error="agent_search timed out",
+            ),
+            search_entities=[],
+            search_chunks=[],
+        )
+
+
+async def _run_query_with_agent_context(
+    rag: Any,
+    request: QueryRequest,
+    workspace: str,
+    *,
+    param: QueryParam,
+    data_only: bool = False,
+    status_queue: asyncio.Queue[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], AgentSearchMergeBundle | None]:
+    agent_bundle = (
+        await _run_agent_search_pipeline_guarded(
+            rag,
+            request,
+            workspace=workspace,
+            param=param,
+            status_queue=status_queue,
+        )
+        if request.agent_search
+        else None
+    )
+    agent_context = _build_agent_context(agent_bundle)
+
+    if data_only:
+        result = await rag.aquery_data(
+            request.query,
+            param=param,
+            agent_context=agent_context,
+        )
+    else:
+        result = await rag.aquery_llm(
+            request.query,
+            param=param,
+            agent_context=agent_context,
+        )
+
+    return result, agent_bundle
 
 
 def create_query_routes(
@@ -669,14 +1307,23 @@ def create_query_routes(
                 - 500: Internal processing error (e.g., LLM service unavailable)
         """
         try:
+            _log_query_request("/query", request)
+            current_rag = rag.resolve_current()
+            current_workspace = str(
+                getattr(getattr(current_rag, "text_chunks", None), "workspace", default_workspace)
+                or default_workspace
+            )
             param = request.to_query_params(
                 False
             )  # Ensure stream=False for non-streaming endpoint
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
-
-            # Unified approach: always use aquery_llm for both cases
-            result = await rag.aquery_llm(request.query, param=param)
+            result, agent_bundle = await _run_query_with_agent_context(
+                current_rag,
+                request,
+                current_workspace,
+                param=param,
+            )
 
             # Extract LLM response and references from unified result
             llm_response = result.get("llm_response", {})
@@ -695,9 +1342,21 @@ def create_query_routes(
 
             # Return response with or without references based on request
             if request.include_references:
-                return QueryResponse(response=response_content, references=references)
+                return QueryResponse(
+                    response=response_content,
+                    references=references,
+                    agent_search_result=(
+                        agent_bundle.public_result if agent_bundle is not None else None
+                    ),
+                )
             else:
-                return QueryResponse(response=response_content, references=None)
+                return QueryResponse(
+                    response=response_content,
+                    references=None,
+                    agent_search_result=(
+                        agent_bundle.public_result if agent_bundle is not None else None
+                    ),
+                )
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -909,52 +1568,132 @@ def create_query_routes(
             Use streaming mode for real-time interfaces and non-streaming for batch processing.
         """
         try:
+            _log_query_request("/query/stream", request)
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
+            current_rag = rag.resolve_current()
+            current_workspace = str(
+                getattr(getattr(current_rag, "text_chunks", None), "workspace", default_workspace)
+                or default_workspace
+            )
             param = request.to_query_params(stream_mode)
 
             from fastapi.responses import StreamingResponse
 
-            # Unified approach: always use aquery_llm for all cases
-            result = await rag.aquery_llm(request.query, param=param)
-
             async def stream_generator():
-                # Extract references and LLM response from unified result
-                data = result.get("data", {})
-                references = _normalize_chunk_level_references(data)
-                llm_response = result.get("llm_response", {})
+                status_queue: asyncio.Queue[dict[str, Any]] | None = (
+                    asyncio.Queue() if request.agent_search else None
+                )
+                agent_bundle: AgentSearchMergeBundle | None = None
+                result: dict[str, Any] | None = None
 
-                if request.include_references:
-                    references = _enrich_references_with_chunk_preview(
-                        references, data.get("chunks", [])
+                try:
+                    if request.agent_search:
+                        loop = asyncio.get_running_loop()
+                        heartbeat_interval_seconds = 5.0
+                        last_heartbeat_at = loop.time()
+                        yield (
+                            f"{json.dumps({'agent_status': {'agent_search_id': None, 'phase': 'starting', 'message': 'agent_search started', 'event_type': 'local.started', 'opencode_session_id': None}})}\n"
+                        )
+                        agent_task = asyncio.create_task(
+                            _run_agent_search_pipeline_guarded(
+                                current_rag,
+                                request,
+                                workspace=current_workspace,
+                                param=param,
+                                status_queue=status_queue,
+                            )
+                        )
+
+                        while not agent_task.done():
+                            if status_queue is None:
+                                await asyncio.sleep(0.01)
+                                continue
+                            try:
+                                agent_status = await asyncio.wait_for(
+                                    status_queue.get(), timeout=0.1
+                                )
+                                last_heartbeat_at = loop.time()
+                                yield f"{json.dumps({'agent_status': agent_status})}\n"
+                            except asyncio.TimeoutError:
+                                now = loop.time()
+                                if (
+                                    now - last_heartbeat_at
+                                    >= heartbeat_interval_seconds
+                                ):
+                                    last_heartbeat_at = now
+                                    yield (
+                                        f"{json.dumps({'agent_status': {'agent_search_id': None, 'phase': 'waiting', 'message': 'agent_search is still running', 'event_type': 'local.heartbeat', 'opencode_session_id': None}})}\n"
+                                    )
+                                await asyncio.sleep(0.01)
+
+                        agent_bundle = await agent_task
+                        if status_queue is not None:
+                            while not status_queue.empty():
+                                agent_status = status_queue.get_nowait()
+                                yield f"{json.dumps({'agent_status': agent_status})}\n"
+
+                    if agent_bundle is not None:
+                        yield (
+                            f"{json.dumps({'agent_status': {'agent_search_id': agent_bundle.public_result.agent_search_id, 'phase': 'rag_started', 'message': 'agent_search completed, starting rag query', 'event_type': 'local.rag_started', 'opencode_session_id': agent_bundle.public_result.opencode_session_id}})}\n"
+                        )
+
+                    result = await current_rag.aquery_llm(
+                        request.query,
+                        param=param,
+                        agent_context=_build_agent_context(agent_bundle),
                     )
 
-                if llm_response.get("is_streaming"):
-                    # Streaming mode: send references first, then stream response chunks
+                    # Extract references and LLM response from unified result
+                    data = (result or {}).get("data", {})
+                    references = _normalize_chunk_level_references(data)
+                    llm_response = (result or {}).get("llm_response", {})
+
                     if request.include_references:
-                        yield f"{json.dumps({'references': references})}\n"
+                        references = _enrich_references_with_chunk_preview(
+                            references, data.get("chunks", [])
+                        )
 
-                    response_stream = llm_response.get("response_iterator")
-                    if response_stream:
-                        try:
-                            async for chunk in response_stream:
-                                if chunk:  # Only send non-empty content
-                                    yield f"{json.dumps({'response': chunk})}\n"
-                        except Exception as e:
-                            logger.error(f"Streaming error: {str(e)}")
-                            yield f"{json.dumps({'error': str(e)})}\n"
-                else:
-                    # Non-streaming mode: send complete response in one message
-                    response_content = llm_response.get("content", "")
-                    if not response_content:
-                        response_content = "No relevant context found for the query."
+                    if llm_response.get("is_streaming"):
+                        first_payload: dict[str, Any] = {}
+                        if request.include_references:
+                            first_payload["references"] = references
+                        if agent_bundle is not None:
+                            first_payload["agent_search_result"] = (
+                                agent_bundle.public_result.model_dump(exclude_none=True)
+                            )
+                        if first_payload:
+                            yield f"{json.dumps(first_payload)}\n"
 
-                    # Create complete response object
-                    complete_response = {"response": response_content}
-                    if request.include_references:
-                        complete_response["references"] = references
+                        response_stream = llm_response.get("response_iterator")
+                        if response_stream:
+                            try:
+                                async for chunk in response_stream:
+                                    if chunk:
+                                        yield f"{json.dumps({'response': chunk})}\n"
+                            except Exception as e:
+                                logger.error(f"Streaming error: {str(e)}")
+                                yield f"{json.dumps({'error': str(e)})}\n"
+                    else:
+                        response_content = llm_response.get("content", "")
+                        if not response_content:
+                            response_content = "No relevant context found for the query."
 
-                    yield f"{json.dumps(complete_response)}\n"
+                        complete_response: dict[str, Any] = {"response": response_content}
+                        if request.include_references:
+                            complete_response["references"] = references
+                        if agent_bundle is not None:
+                            complete_response["agent_search_result"] = (
+                                agent_bundle.public_result.model_dump(exclude_none=True)
+                            )
+
+                        yield f"{json.dumps(complete_response)}\n"
+                except Exception as e:
+                    logger.error(
+                        f"Error during streaming query generation: {str(e)}",
+                        exc_info=True,
+                    )
+                    yield f"{json.dumps({'error': str(e)})}\n"
 
             return StreamingResponse(
                 stream_generator(),
@@ -1370,11 +2109,27 @@ def create_query_routes(
             as structured data analysis typically requires source attribution.
         """
         try:
+            _log_query_request("/query/data", request)
+            current_rag = rag.resolve_current()
+            current_workspace = str(
+                getattr(getattr(current_rag, "text_chunks", None), "workspace", default_workspace)
+                or default_workspace
+            )
             param = request.to_query_params(False)  # No streaming for data endpoint
-            response = await rag.aquery_data(request.query, param=param)
+            response, agent_bundle = await _run_query_with_agent_context(
+                current_rag,
+                request,
+                current_workspace,
+                param=param,
+                data_only=True,
+            )
 
             # aquery_data returns the new format with status, message, data, and metadata
             if isinstance(response, dict):
+                if agent_bundle is not None:
+                    response["agent_search_result"] = agent_bundle.public_result.model_dump(
+                        exclude_none=True
+                    )
                 return QueryDataResponse(**response)
             else:
                 # Handle unexpected response format
@@ -1382,6 +2137,7 @@ def create_query_routes(
                     status="failure",
                     message="Invalid response type",
                     data={},
+                    metadata={},
                 )
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)

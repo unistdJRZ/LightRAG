@@ -205,11 +205,11 @@ function App() {
               onValueChange={handleTabChange}
             >
               <SiteHeader />
-              <div className="relative grow" key={`workspace-${workspace ?? 'default'}`}>
+              <div className="relative grow min-h-0" key={`workspace-${workspace ?? 'default'}`}>
                 <TabsContent value="documents" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
                   <DocumentManager />
                 </TabsContent>
-                <TabsContent value="chunks" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
+                <TabsContent value="chunks" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <ChunksExplorer />
                 </TabsContent>
                 <TabsContent value="knowledge-graph" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
