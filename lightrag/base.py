@@ -90,6 +90,18 @@ class TextChunkSchema(TypedDict):
     translated_cn: NotRequired[str]
 
 
+class ConversationHistoryReference(TypedDict):
+    reference_id: str
+    chunk_id: str
+    workspace: str
+
+
+class ConversationHistoryMessage(TypedDict):
+    role: str
+    content: str
+    references: NotRequired[list[ConversationHistoryReference]]
+
+
 T = TypeVar("T")
 
 
@@ -148,9 +160,9 @@ class QueryParam:
     """List of low-level keywords to refine retrieval focus."""
 
     # History mesages is only send to LLM for context, not used for retrieval
-    conversation_history: list[dict[str, str]] = field(default_factory=list)
+    conversation_history: list[ConversationHistoryMessage] = field(default_factory=list)
     """Stores past conversation history to maintain context.
-    Format: [{"role": "user/assistant", "content": "message"}].
+    Format: [{"role": "user/assistant", "content": "message", "references": [...]}].
     """
 
     # TODO: deprecated. No longer used in the codebase, all conversation_history messages is send to LLM
@@ -179,6 +191,9 @@ class QueryParam:
     This parameter controls whether the API response includes a references field
     containing citation information for the retrieved content.
     """
+
+    query_ref: list[str] = field(default_factory=list)
+    """Chunk IDs explicitly referenced by the query."""
 
 
 @dataclass
@@ -926,11 +941,13 @@ class QueryContextResult:
 
     Attributes:
         context: LLM context string
+        response_context: Context string returned by context-only query APIs
         raw_data: Complete structured data including reference_list
     """
 
     context: str
     raw_data: Dict[str, Any]
+    response_context: Optional[str] = None
 
     @property
     def reference_list(self) -> List[Dict[str, Any]]:

@@ -28,6 +28,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             return {"entity_name"}
         if self.namespace.endswith("relationships"):
             return {"src_id", "tgt_id"}
+        if self.namespace.endswith("qa_pairs"):
+            return {"doc_id", "qa_id"}
         return set()
 
     def _get_output_fields(self) -> list[str]:
@@ -105,6 +107,23 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         elif self.namespace.endswith("chunks"):
             specific_fields = []
             description = "LightRAG chunks vector storage"
+
+        elif self.namespace.endswith("qa_pairs"):
+            specific_fields = [
+                FieldSchema(
+                    name="doc_id",
+                    dtype=DataType.VARCHAR,
+                    max_length=1024,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="qa_id",
+                    dtype=DataType.VARCHAR,
+                    max_length=1024,
+                    nullable=True,
+                ),
+            ]
+            description = "LightRAG QA pairs vector storage"
 
         else:
             # Default generic schema (backward compatibility)
@@ -1080,6 +1099,44 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             data=embedding,
             limit=top_k,
             output_fields=output_fields,
+            search_params={
+                "metric_type": "COSINE",
+                "params": {"radius": self.cosine_better_than_threshold},
+            },
+        )
+        return [
+            {
+                **dp.get("entity", {}),
+                "id": dp["id"],
+                "distance": dp["distance"],
+                "created_at": dp.get("entity", {}).get("created_at"),
+            }
+            for dp in results[0]
+        ]
+
+    async def query_by_doc_id(
+        self,
+        query: str,
+        doc_id: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+    ) -> list[dict[str, Any]]:
+        if not self.namespace.endswith("qa_pairs"):
+            raise ValueError("query_by_doc_id is only supported for QA pair vectors")
+
+        self._ensure_collection_loaded()
+        if query_embedding is not None:
+            embedding = [query_embedding]
+        else:
+            embedding = await self.embedding_func([query], _priority=5)
+
+        safe_doc_id = doc_id.replace("\\", "\\\\").replace('"', '\\"')
+        results = self._client.search(
+            collection_name=self.final_namespace,
+            data=embedding,
+            limit=top_k,
+            output_fields=self._get_output_fields(),
+            filter=f'doc_id == "{safe_doc_id}"',
             search_params={
                 "metric_type": "COSINE",
                 "params": {"radius": self.cosine_better_than_threshold},

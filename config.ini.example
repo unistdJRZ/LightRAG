@@ -10,15 +10,8 @@ max_connection_lifetime = 300.0
 liveness_check_timeout = 30.0
 keep_alive = true
 
-[mongodb]
-uri = mongodb+srv://name:password@your-cluster-address
-database = lightrag
-
 [redis]
 uri=redis://localhost:6379/1
-
-[qdrant]
-uri = http://localhost:16333
 
 [postgres]
 host = localhost
@@ -42,6 +35,3 @@ db_name = lightrag
 user =
 password =
 token =
-
-[memgraph]
-uri = bolt://localhost:7687

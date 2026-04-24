@@ -1,5 +1,5 @@
 from lightrag.constants import GRAPH_FIELD_SEP
-from lightrag.utils import convert_to_user_format
+from lightrag.utils import convert_to_user_format, truncate_source_id_for_display
 
 
 def test_convert_to_user_format_adds_related_chunk_reference_ids():
@@ -111,3 +111,40 @@ def test_convert_to_user_format_uses_original_source_ids_for_related_chunk():
 
     assert result["data"]["entities"][0]["related_chunk"] == "7"
     assert result["data"]["relationships"][0]["related_chunk"] == "7"
+
+
+def test_convert_to_user_format_limits_displayed_source_ids_to_ten():
+    source_ids = [f"chunk-{index}" for index in range(12)]
+    long_source_id = GRAPH_FIELD_SEP.join(source_ids)
+
+    result = convert_to_user_format(
+        entities_context=[{"entity": "Entity A", "source_id": long_source_id}],
+        relations_context=[
+            {
+                "entity1": "Entity A",
+                "entity2": "Entity B",
+                "source_id": long_source_id,
+            }
+        ],
+        chunks=[
+            {
+                "reference_id": "11",
+                "chunk_id": "chunk-10",
+                "content": "hidden by display truncation but still resolvable",
+            }
+        ],
+        references=[],
+        query_mode="mix",
+    )
+
+    expected_display = GRAPH_FIELD_SEP.join(source_ids[:10])
+    assert result["data"]["entities"][0]["source_id"] == expected_display
+    assert result["data"]["relationships"][0]["source_id"] == expected_display
+    assert result["data"]["entities"][0]["related_chunk"] == "11"
+    assert result["data"]["relationships"][0]["related_chunk"] == "11"
+
+
+def test_truncate_source_id_for_display_leaves_short_lists_unchanged():
+    source_id = GRAPH_FIELD_SEP.join([f"chunk-{index}" for index in range(10)])
+
+    assert truncate_source_id_for_display(source_id) == source_id

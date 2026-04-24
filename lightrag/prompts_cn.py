@@ -356,6 +356,27 @@ PROMPTS["kg_query_context"] = """
 
 """
 
+PROMPTS["kg_query_context_response"] = """
+知识图谱数据（实体）：
+
+```json
+{entities_str}
+```
+
+知识图谱数据（关系）：
+
+```json
+{relations_str}
+```
+
+文档片段：
+
+```json
+{text_chunks_str}
+```
+
+"""
+
 PROMPTS["naive_query_context"] = """
 文档片段（每条包含 reference_id，对应 `Reference Document List`）：
 
@@ -367,6 +388,15 @@ PROMPTS["naive_query_context"] = """
 
 ```
 {reference_list_str}
+```
+
+"""
+
+PROMPTS["naive_query_context_response"] = """
+文档片段：
+
+```json
+{text_chunks_str}
 ```
 
 """

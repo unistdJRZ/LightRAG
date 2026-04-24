@@ -1346,6 +1346,7 @@ class PostgreSQLDB:
             "LIGHTRAG_VDB_CHUNKS",
             "LIGHTRAG_VDB_ENTITY",
             "LIGHTRAG_VDB_RELATION",
+            "LIGHTRAG_VDB_QA_PAIRS",
         }
 
         # First create all tables (except vector tables)
@@ -1535,6 +1536,11 @@ class PostgreSQLDB:
                 f"PostgreSQL, Failed to create agent submit cache indexes: {e}"
             )
 
+        try:
+            await self._create_doc_qa_pair_indexes()
+        except Exception as e:
+            logger.error(f"PostgreSQL, Failed to create doc QA pair indexes: {e}")
+
     async def _migrate_create_full_entities_relations_tables(self):
         """Create LIGHTRAG_FULL_ENTITIES and LIGHTRAG_FULL_RELATIONS tables if they don't exist"""
         tables_to_check = [
@@ -1695,6 +1701,41 @@ class PostgreSQLDB:
             except Exception as e:
                 logger.warning(
                     "Failed to create agent submit cache index %s: %s",
+                    index["name"],
+                    e,
+                )
+
+    async def _create_doc_qa_pair_indexes(self):
+        """Create indexes to query document QA pairs by workspace and document."""
+        indexes = [
+            {
+                "table": "lightrag_doc_qa_pairs",
+                "name": "idx_lightrag_doc_qa_pairs_workspace_doc_id",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_lightrag_doc_qa_pairs_workspace_doc_id ON LIGHTRAG_DOC_QA_PAIRS(workspace, doc_id)",
+            },
+            {
+                "table": "lightrag_doc_qa_pairs",
+                "name": "idx_lightrag_doc_qa_pairs_workspace_scope",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_lightrag_doc_qa_pairs_workspace_scope ON LIGHTRAG_DOC_QA_PAIRS(workspace, scope)",
+            },
+        ]
+
+        for index in indexes:
+            try:
+                existing = await self.query(
+                    """
+                    SELECT indexname
+                    FROM pg_indexes
+                    WHERE tablename = $1
+                    AND indexname = $2
+                    """,
+                    [index["table"], index["name"]],
+                )
+                if not existing:
+                    await self.execute(index["sql"])
+            except Exception as e:
+                logger.warning(
+                    "Failed to create doc QA pair index %s: %s",
                     index["name"],
                     e,
                 )
@@ -3089,6 +3130,11 @@ class PGVectorStorage(BaseVectorStorage):
                 legacy_table_name=self.legacy_table_name,
                 base_table=self.legacy_table_name,  # base_table for DDL template lookup
             )
+            if is_namespace(self.namespace, NameSpace.VECTOR_STORE_QA_PAIRS):
+                index_name = _safe_index_name(self.table_name, "workspace_doc_id")
+                await self.db.execute(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} ON {self.table_name}(workspace, doc_id)"
+                )
 
     async def finalize(self):
         if self.db is not None:
@@ -3191,6 +3237,26 @@ class PGVectorStorage(BaseVectorStorage):
         )
         return upsert_sql, values
 
+    def _upsert_qa_pairs(
+        self, item: dict[str, Any], current_time: datetime.datetime
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Prepare upsert data for independent QA question vectors."""
+
+        upsert_sql = SQL_TEMPLATES["upsert_qa_pair"].format(
+            table_name=self.table_name
+        )
+        values: tuple[Any, ...] = (
+            self.workspace,
+            item["__id__"],
+            item["doc_id"],
+            item.get("qa_id") or item["__id__"],
+            item["content"],
+            item["__vector__"],
+            current_time,
+            current_time,
+        )
+        return upsert_sql, values
+
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         logger.debug(f"[{self.workspace}] Inserting {len(data)} to {self.namespace}")
         if not data:
@@ -3276,6 +3342,8 @@ class PGVectorStorage(BaseVectorStorage):
                 upsert_sql, values = self._upsert_entities(item, current_time)
             elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_RELATIONSHIPS):
                 upsert_sql, values = self._upsert_relationships(item, current_time)
+            elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_QA_PAIRS):
+                upsert_sql, values = self._upsert_qa_pairs(item, current_time)
             else:
                 raise ValueError(f"{self.namespace} is not supported")
 
@@ -3323,6 +3391,37 @@ class PGVectorStorage(BaseVectorStorage):
                     bbox = None
             result["bbox"] = bbox
         return results
+
+    async def query_by_doc_id(
+        self,
+        query: str,
+        doc_id: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+    ) -> list[dict[str, Any]]:
+        """Query QA question vectors within a single document."""
+
+        if not is_namespace(self.namespace, NameSpace.VECTOR_STORE_QA_PAIRS):
+            raise ValueError("query_by_doc_id is only supported for QA pair vectors")
+
+        if query_embedding is not None:
+            embedding = query_embedding
+        else:
+            embeddings = await self.embedding_func([query], _priority=5)
+            embedding = embeddings[0]
+
+        embedding_string = ",".join(map(str, embedding))
+        sql = SQL_TEMPLATES["qa_pairs_by_doc_id"].format(
+            embedding_string=embedding_string,
+            table_name=self.table_name,
+        )
+        params = {
+            "workspace": self.workspace,
+            "doc_id": doc_id,
+            "closer_than_threshold": 1 - self.cosine_better_than_threshold,
+            "top_k": top_k,
+        }
+        return await self.db.query(sql, params=list(params.values()), multirows=True)
 
     async def index_done_callback(self) -> None:
         # PG handles persistence automatically
@@ -5693,6 +5792,7 @@ NAMESPACE_TABLE_MAP = {
     NameSpace.VECTOR_STORE_CHUNKS: "LIGHTRAG_VDB_CHUNKS",
     NameSpace.VECTOR_STORE_ENTITIES: "LIGHTRAG_VDB_ENTITY",
     NameSpace.VECTOR_STORE_RELATIONSHIPS: "LIGHTRAG_VDB_RELATION",
+    NameSpace.VECTOR_STORE_QA_PAIRS: "LIGHTRAG_VDB_QA_PAIRS",
     NameSpace.DOC_STATUS: "LIGHTRAG_DOC_STATUS",
 }
 
@@ -5787,6 +5887,19 @@ TABLES = {
 	                CONSTRAINT LIGHTRAG_VDB_RELATION_PK PRIMARY KEY (workspace, id)
                     )"""
     },
+    "LIGHTRAG_VDB_QA_PAIRS": {
+        "ddl": """CREATE TABLE LIGHTRAG_VDB_QA_PAIRS (
+                    id VARCHAR(255),
+                    workspace VARCHAR(255),
+                    doc_id VARCHAR(255) NOT NULL,
+                    qa_id VARCHAR(255) NOT NULL,
+                    content TEXT,
+                    content_vector VECTOR(dimension),
+                    create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT LIGHTRAG_VDB_QA_PAIRS_PK PRIMARY KEY (workspace, id)
+                    )"""
+    },
     "LIGHTRAG_LLM_CACHE": {
         "ddl": """CREATE TABLE LIGHTRAG_LLM_CACHE (
 	                workspace varchar(255) NOT NULL,
@@ -5873,6 +5986,23 @@ TABLES = {
                     updated_at TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     expires_at TIMESTAMP(0) NOT NULL,
                     CONSTRAINT LIGHTRAG_AGENT_SUBMIT_CACHE_PK PRIMARY KEY (workspace, id)
+                    )"""
+    },
+    "LIGHTRAG_DOC_QA_PAIRS": {
+        "ddl": """CREATE TABLE LIGHTRAG_DOC_QA_PAIRS (
+                    workspace VARCHAR(255) NOT NULL,
+                    id VARCHAR(255) NOT NULL,
+                    doc_id VARCHAR(255) NOT NULL,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    question_type VARCHAR(128) NULL,
+                    scope VARCHAR(32) NULL,
+                    source_preference VARCHAR(128) NULL,
+                    quality_score REAL NULL,
+                    metadata JSONB NULL DEFAULT '{}'::jsonb,
+                    create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT LIGHTRAG_DOC_QA_PAIRS_PK PRIMARY KEY (workspace, id)
                     )"""
     },
 }
@@ -6069,6 +6199,16 @@ SQL_TEMPLATES = {
                       file_path=EXCLUDED.file_path,
                       update_time = EXCLUDED.update_time
                      """,
+    "upsert_qa_pair": """INSERT INTO {table_name} (workspace, id, doc_id, qa_id,
+                      content, content_vector, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                      ON CONFLICT (workspace,id) DO UPDATE
+                      SET doc_id=EXCLUDED.doc_id,
+                      qa_id=EXCLUDED.qa_id,
+                      content=EXCLUDED.content,
+                      content_vector=EXCLUDED.content_vector,
+                      update_time=EXCLUDED.update_time
+                     """,
     "relationships": """
                      SELECT r.source_id AS src_id,
                             r.target_id AS tgt_id,
@@ -6101,6 +6241,29 @@ SQL_TEMPLATES = {
                 AND c.content_vector <=> '[{embedding_string}]'::vector < $2
               ORDER BY c.content_vector <=> '[{embedding_string}]'::vector
               LIMIT $3;
+              """,
+    "qa_pairs": """
+              SELECT q.qa_id,
+                     q.doc_id,
+                     q.id,
+                     EXTRACT(EPOCH FROM q.create_time)::BIGINT AS created_at
+              FROM {table_name} q
+              WHERE q.workspace = $1
+                AND q.content_vector <=> '[{embedding_string}]'::vector < $2
+              ORDER BY q.content_vector <=> '[{embedding_string}]'::vector
+              LIMIT $3;
+              """,
+    "qa_pairs_by_doc_id": """
+              SELECT q.qa_id,
+                     q.doc_id,
+                     q.id,
+                     EXTRACT(EPOCH FROM q.create_time)::BIGINT AS created_at
+              FROM {table_name} q
+              WHERE q.workspace = $1
+                AND q.doc_id = $2
+                AND q.content_vector <=> '[{embedding_string}]'::vector < $3
+              ORDER BY q.content_vector <=> '[{embedding_string}]'::vector
+              LIMIT $4;
               """,
     # DROP tables
     "drop_specifiy_table_workspace": """

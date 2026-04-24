@@ -94,6 +94,13 @@ from lightrag.operate import (
     naive_query,
     normalize_query_input,
     rebuild_knowledge_from_chunks,
+    sanitize_history_messages_for_llm,
+)
+from lightrag.qa_extraction import (
+    build_doc_qa_vector_data,
+    extract_doc_qa_pairs,
+    get_doc_qa_pairs_by_ids,
+    replace_doc_qa_pairs,
 )
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.utils import (
@@ -841,6 +848,12 @@ class LightRAG:
                 "image_text",
             },
         )
+        self.qa_pairs_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
+            namespace=NameSpace.VECTOR_STORE_QA_PAIRS,
+            workspace=self.workspace,
+            embedding_func=self.embedding_func,
+            meta_fields={"doc_id", "qa_id"},
+        )
 
         # Initialize document status storage
         self.doc_status: DocStatusStorage = self.doc_status_storage_cls(
@@ -897,6 +910,7 @@ class LightRAG:
                 self.entities_vdb,
                 self.relationships_vdb,
                 self.chunks_vdb,
+                self.qa_pairs_vdb,
                 self.chunk_entity_relation_graph,
                 self.llm_response_cache,
                 self.doc_status,
@@ -921,6 +935,7 @@ class LightRAG:
                 ("entities_vdb", self.entities_vdb),
                 ("relationships_vdb", self.relationships_vdb),
                 ("chunks_vdb", self.chunks_vdb),
+                ("qa_pairs_vdb", self.qa_pairs_vdb),
                 ("chunk_entity_relation_graph", self.chunk_entity_relation_graph),
                 ("llm_response_cache", self.llm_response_cache),
                 ("doc_status", self.doc_status),
@@ -1289,28 +1304,9 @@ class LightRAG:
         )
 
     def _get_storage_class(self, storage_name: str) -> Callable[..., Any]:
-        # Direct imports for default storage implementations
-        if storage_name == "JsonKVStorage":
-            from lightrag.kg.json_kv_impl import JsonKVStorage
-
-            return JsonKVStorage
-        elif storage_name == "NanoVectorDBStorage":
-            from lightrag.kg.nano_vector_db_impl import NanoVectorDBStorage
-
-            return NanoVectorDBStorage
-        elif storage_name == "NetworkXStorage":
-            from lightrag.kg.networkx_impl import NetworkXStorage
-
-            return NetworkXStorage
-        elif storage_name == "JsonDocStatusStorage":
-            from lightrag.kg.json_doc_status_impl import JsonDocStatusStorage
-
-            return JsonDocStatusStorage
-        else:
-            # Fallback to dynamic import for other storage implementations
-            import_path = STORAGES[storage_name]
-            storage_class = lazy_external_import(import_path, storage_name)
-            return storage_class
+        import_path = STORAGES[storage_name]
+        storage_class = lazy_external_import(import_path, storage_name)
+        return storage_class
 
     def insert(
         self,
@@ -2470,6 +2466,11 @@ class LightRAG:
                                     file_path=file_path,
                                 )
 
+                                await self._process_doc_qa_pairs(
+                                    doc_id=doc_id,
+                                    document_text=content,
+                                )
+
                                 # Record processing end time
                                 processing_end_time = int(time.time())
 
@@ -2673,6 +2674,323 @@ class LightRAG:
                 pipeline_status["history_messages"].append(error_msg)
             raise e
 
+    async def _process_doc_qa_pairs(
+        self,
+        *,
+        doc_id: str,
+        document_text: str,
+    ) -> int:
+        """Extract and store final QA pairs for one processed document."""
+
+        enabled = os.getenv("QA_PAIR_EXTRACTION_ENABLED", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not enabled:
+            logger.debug("QA pair extraction disabled by QA_PAIR_EXTRACTION_ENABLED")
+            return 0
+
+        db = getattr(self.full_docs, "db", None)
+        if db is None:
+            logger.warning(
+                "Skipping QA pair extraction for doc_id=%s because PostgreSQL storage is not available",
+                doc_id,
+            )
+            return 0
+
+        if not callable(self.llm_model_func):
+            raise ValueError("llm_model_func is required for QA pair extraction")
+
+        logger.info("Starting QA pair extraction for doc_id=%s", doc_id)
+        existing_vector_ids = await self._get_doc_qa_vector_ids(doc_id)
+        extraction_result = await extract_doc_qa_pairs(
+            doc_id=doc_id,
+            document_text=document_text,
+            llm_model_func=self.llm_model_func,
+        )
+        inserted = await replace_doc_qa_pairs(
+            db=db,
+            workspace=self.full_docs.workspace,
+            doc_id=doc_id,
+            extraction_result=extraction_result,
+        )
+        vector_data = build_doc_qa_vector_data(
+            doc_id=doc_id,
+            extraction_result=extraction_result,
+        )
+        if self.qa_pairs_vdb:
+            if existing_vector_ids:
+                await self.qa_pairs_vdb.delete(existing_vector_ids)
+            await self.qa_pairs_vdb.upsert(vector_data)
+        return inserted
+
+    async def _get_doc_qa_vector_ids(self, doc_id: str) -> list[str]:
+        db = getattr(self.full_docs, "db", None)
+        if db is None:
+            return []
+        table_name = getattr(self.qa_pairs_vdb, "table_name", None)
+        if table_name:
+            rows = await db.query(
+                f"SELECT id FROM {table_name} WHERE workspace=$1 AND doc_id=$2",
+                [self.full_docs.workspace, doc_id],
+                multirows=True,
+            )
+            return [str(row["id"]) for row in rows or []]
+
+        rows = await db.query(
+            "SELECT id FROM LIGHTRAG_DOC_QA_PAIRS WHERE workspace=$1 AND doc_id=$2",
+            [self.full_docs.workspace, doc_id],
+            multirows=True,
+        )
+        return [str(row["id"]) for row in rows or []]
+
+    async def query_doc_qa_pairs(
+        self,
+        *,
+        doc_id: str,
+        query: str,
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Search QA pairs within one document by question embedding, then return full PG rows."""
+
+        db = getattr(self.full_docs, "db", None)
+        if db is None:
+            raise ValueError("PostgreSQL storage is required to load QA pair details")
+
+        if hasattr(self.qa_pairs_vdb, "query_by_doc_id"):
+            vector_results = await self.qa_pairs_vdb.query_by_doc_id(
+                query=query,
+                doc_id=doc_id,
+                top_k=top_k,
+            )
+        else:
+            vector_results = await self.qa_pairs_vdb.query(query=query, top_k=top_k * 5)
+            vector_results = [
+                result
+                for result in vector_results
+                if str(result.get("doc_id") or "") == doc_id
+            ][:top_k]
+
+        qa_ids = [
+            str(result.get("qa_id") or result.get("id"))
+            for result in vector_results
+            if result.get("qa_id") or result.get("id")
+        ]
+        rows = await get_doc_qa_pairs_by_ids(
+            db=db,
+            workspace=self.full_docs.workspace,
+            qa_ids=qa_ids,
+        )
+        distance_by_id = {
+            str(result.get("qa_id") or result.get("id")): result.get("distance")
+            for result in vector_results
+        }
+        for row in rows:
+            row["distance"] = distance_by_id.get(str(row.get("id")))
+        return rows
+
+    async def _resolve_query_ref_doc_scope(
+        self, query_ref: list[str] | None,
+    ) -> tuple[list[str], dict[str, str]]:
+        chunk_ids: list[str] = []
+        for item in query_ref or []:
+            chunk_id = str(item or "").strip()
+            if chunk_id and chunk_id not in chunk_ids:
+                chunk_ids.append(chunk_id)
+        if not chunk_ids:
+            return [], {}
+
+        records = await self.text_chunks.get_by_ids(chunk_ids)
+        if not isinstance(records, list):
+            return [], {}
+
+        record_by_chunk_id: dict[str, dict[str, Any]] = {}
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            record_chunk_id = str(record.get("id") or record.get("chunk_id") or "").strip()
+            if record_chunk_id:
+                record_by_chunk_id[record_chunk_id] = record
+
+        doc_ids: list[str] = []
+        belong_chunk_by_doc_id: dict[str, str] = {}
+        for chunk_id in chunk_ids:
+            record = record_by_chunk_id.get(chunk_id)
+            if not record:
+                continue
+            doc_id = str(record.get("full_doc_id") or record.get("doc_id") or "").strip()
+            if not doc_id:
+                continue
+            if doc_id not in doc_ids:
+                doc_ids.append(doc_id)
+                belong_chunk_by_doc_id[doc_id] = chunk_id
+
+        return doc_ids, belong_chunk_by_doc_id
+
+    async def query_doc_qa_pairs_for_refs(
+        self,
+        *,
+        query_ref: list[str] | None,
+        query: str,
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Search QA pairs in all documents referenced by query chunk IDs."""
+
+        doc_ids, belong_chunk_by_doc_id = await self._resolve_query_ref_doc_scope(query_ref)
+        if not doc_ids:
+            return []
+
+        db = getattr(self.full_docs, "db", None)
+        if db is None:
+            logger.warning(
+                "Skipping referenced document QA retrieval because PostgreSQL storage is not available"
+            )
+            return []
+
+        doc_id_set = set(doc_ids)
+        overfetch_top_k = max(top_k * max(len(doc_ids), 1) * 20, top_k)
+        try:
+            vector_results = await self.qa_pairs_vdb.query(
+                query=query,
+                top_k=overfetch_top_k,
+            )
+        except Exception as exc:
+            logger.warning("Referenced document QA vector retrieval failed: %s", exc)
+            vector_results = []
+
+        filtered_vector_results = [
+            result
+            for result in vector_results
+            if str(result.get("doc_id") or "") in doc_id_set
+        ][:top_k]
+        qa_ids = [
+            str(result.get("qa_id") or result.get("id"))
+            for result in filtered_vector_results
+            if result.get("qa_id") or result.get("id")
+        ]
+        rows = await get_doc_qa_pairs_by_ids(
+            db=db,
+            workspace=self.full_docs.workspace,
+            qa_ids=qa_ids,
+        )
+        distance_by_id = {
+            str(result.get("qa_id") or result.get("id")): result.get("distance")
+            for result in filtered_vector_results
+        }
+        merged: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for row in rows:
+            row_id = str(row.get("id") or "").strip()
+            if row_id and row_id in seen_ids:
+                continue
+            if row_id:
+                seen_ids.add(row_id)
+            row_copy = dict(row)
+            doc_id = str(row_copy.get("doc_id") or "").strip()
+            row_copy["belong_chunk"] = belong_chunk_by_doc_id.get(doc_id, "")
+            row_copy["distance"] = distance_by_id.get(row_id)
+            merged.append(row_copy)
+
+        if len(merged) < top_k:
+            per_doc_results = await asyncio.gather(
+                *[
+                    self.query_doc_qa_pairs(doc_id=doc_id, query=query, top_k=top_k)
+                    for doc_id in doc_ids
+                ],
+                return_exceptions=True,
+            )
+        else:
+            per_doc_results = []
+
+        for result in per_doc_results:
+            if isinstance(result, Exception):
+                logger.warning("Referenced document QA retrieval failed: %s", result)
+                continue
+            for row in result:
+                if not isinstance(row, dict):
+                    continue
+                row_id = str(row.get("id") or "").strip()
+                if row_id and row_id in seen_ids:
+                    continue
+                if row_id:
+                    seen_ids.add(row_id)
+                row_copy = dict(row)
+                doc_id = str(row_copy.get("doc_id") or "").strip()
+                row_copy["belong_chunk"] = belong_chunk_by_doc_id.get(doc_id, "")
+                merged.append(row_copy)
+        return merged[:top_k]
+
+    @staticmethod
+    def _format_query_ref_doc_qa_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        formatted: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            question = str(row.get("question") or "").strip()
+            answer = str(row.get("answer") or "").strip()
+            if not question or not answer:
+                continue
+            formatted.append(
+                {
+                    "belong_chunk": str(row.get("belong_chunk") or "").strip(),
+                    "doc_id": str(row.get("doc_id") or "").strip(),
+                    "question": question,
+                    "answer": answer,
+                }
+            )
+        return formatted
+
+    @staticmethod
+    def _format_query_ref_doc_qa_appendix(rows: list[dict[str, Any]]) -> str:
+        formatted = LightRAG._format_query_ref_doc_qa_rows(rows)
+        if not formatted:
+            return ""
+
+        items = []
+        for row in formatted:
+            belong_chunk = row["belong_chunk"]
+            belong = f"{belong_chunk}所属文章" if belong_chunk else row["doc_id"]
+            items.append(
+                "{belong: "
+                + belong
+                + ", question: "
+                + row["question"]
+                + "，answer: "
+                + row["answer"]
+                + "}"
+            )
+        return (
+            "\n------------预设问题与参考信息--------------\n"
+            + "，... ，".join(items)
+            + "\n----------结束----------\n"
+        )
+
+    @staticmethod
+    async def _append_query_ref_doc_qa_to_stream(
+        response_iterator: AsyncIterator[str],
+        appendix: str,
+    ) -> AsyncIterator[str]:
+        async for chunk in response_iterator:
+            yield chunk
+        if appendix:
+            yield appendix
+
+    async def _delete_doc_qa_pairs(self, doc_id: str) -> None:
+        db = getattr(self.full_docs, "db", None)
+        if db is None:
+            return
+
+        qa_ids = await self._get_doc_qa_vector_ids(doc_id)
+        if qa_ids and self.qa_pairs_vdb:
+            await self.qa_pairs_vdb.delete(qa_ids)
+
+        await db.execute(
+            "DELETE FROM LIGHTRAG_DOC_QA_PAIRS WHERE workspace=$1 AND doc_id=$2",
+            {"workspace": self.full_docs.workspace, "doc_id": doc_id},
+        )
+
     async def _insert_done(
         self, pipeline_status=None, pipeline_status_lock=None
     ) -> None:
@@ -2690,6 +3008,7 @@ class LightRAG:
                 self.entities_vdb,
                 self.relationships_vdb,
                 self.chunks_vdb,
+                self.qa_pairs_vdb,
                 self.chunk_entity_relation_graph,
             ]
             if storage_inst is not None
@@ -3103,6 +3422,8 @@ class LightRAG:
             model_func=effective_param.model_func,
             user_prompt=effective_param.user_prompt,
             enable_rerank=effective_param.enable_rerank,
+            include_references=effective_param.include_references,
+            query_ref=effective_param.query_ref,
         )
 
         query_result = None
@@ -3179,6 +3500,25 @@ class LightRAG:
                 )
             else:
                 logger.warning("[aquery_data] No data section found in query result")
+
+        data_section = final_data.setdefault("data", {})
+        if isinstance(data_section, dict):
+            data_section.setdefault("doc_qa", [])
+
+        doc_qa_rows = await self.query_doc_qa_pairs_for_refs(
+            query_ref=data_param.query_ref,
+            query=latest_query.strip(),
+            top_k=5,
+        )
+        doc_qa = self._format_query_ref_doc_qa_rows(doc_qa_rows)
+        if doc_qa:
+            if isinstance(data_section, dict):
+                data_section["doc_qa"] = doc_qa
+            metadata_section = final_data.setdefault("metadata", {})
+            if isinstance(metadata_section, dict):
+                processing_info = metadata_section.setdefault("processing_info", {})
+                if isinstance(processing_info, dict):
+                    processing_info["doc_qa_count"] = len(doc_qa)
 
         await self._query_done()
         return final_data
@@ -3258,31 +3598,53 @@ class LightRAG:
                 response = await use_llm_func(
                     latest_query.strip(),
                     system_prompt=system_prompt,
-                    history_messages=effective_param.conversation_history,
+                    history_messages=sanitize_history_messages_for_llm(
+                        effective_param.conversation_history
+                    ),
                     enable_cot=True,
                     stream=effective_param.stream,
                 )
+                doc_qa_rows = await self.query_doc_qa_pairs_for_refs(
+                    query_ref=effective_param.query_ref,
+                    query=latest_query.strip(),
+                    top_k=5,
+                )
+                doc_qa_appendix = self._format_query_ref_doc_qa_appendix(doc_qa_rows)
+                doc_qa_data = self._format_query_ref_doc_qa_rows(doc_qa_rows)
                 if type(response) is str:
                     return {
                         "status": "success",
                         "message": "Bypass mode LLM non streaming response",
-                        "data": {},
-                        "metadata": {},
+                        "data": {"doc_qa": doc_qa_data} if doc_qa_data else {},
+                        "metadata": (
+                            {"processing_info": {"doc_qa_count": len(doc_qa_data)}}
+                            if doc_qa_data
+                            else {}
+                        ),
                         "llm_response": {
-                            "content": response,
+                            "content": response + doc_qa_appendix,
                             "response_iterator": None,
                             "is_streaming": False,
                         },
                     }
                 else:
+                    response_iterator = (
+                        self._append_query_ref_doc_qa_to_stream(response, doc_qa_appendix)
+                        if doc_qa_appendix
+                        else response
+                    )
                     return {
                         "status": "success",
                         "message": "Bypass mode LLM streaming response",
-                        "data": {},
-                        "metadata": {},
+                        "data": {"doc_qa": doc_qa_data} if doc_qa_data else {},
+                        "metadata": (
+                            {"processing_info": {"doc_qa_count": len(doc_qa_data)}}
+                            if doc_qa_data
+                            else {}
+                        ),
                         "llm_response": {
                             "content": None,
-                            "response_iterator": response,
+                            "response_iterator": response_iterator,
                             "is_streaming": True,
                         },
                     }
@@ -3313,11 +3675,43 @@ class LightRAG:
             if isinstance(raw_data.get("data"), dict):
                 # Convenience alias for callers that read references directly.
                 raw_data["references"] = raw_data["data"].get("references", [])
+
+            doc_qa_rows = await self.query_doc_qa_pairs_for_refs(
+                query_ref=effective_param.query_ref,
+                query=latest_query.strip(),
+                top_k=5,
+            )
+            doc_qa_appendix = self._format_query_ref_doc_qa_appendix(doc_qa_rows)
+            if doc_qa_rows and isinstance(raw_data.get("data"), dict):
+                raw_data["data"]["doc_qa"] = self._format_query_ref_doc_qa_rows(
+                    doc_qa_rows
+                )
+                metadata_section = raw_data.setdefault("metadata", {})
+                if isinstance(metadata_section, dict):
+                    processing_info = metadata_section.setdefault("processing_info", {})
+                    if isinstance(processing_info, dict):
+                        processing_info["doc_qa_count"] = len(doc_qa_rows)
+
+            response_content = (
+                query_result.content + doc_qa_appendix
+                if not query_result.is_streaming and query_result.content is not None
+                else query_result.content
+            )
+            response_iterator = (
+                self._append_query_ref_doc_qa_to_stream(
+                    query_result.response_iterator,
+                    doc_qa_appendix,
+                )
+                if query_result.is_streaming
+                and query_result.response_iterator is not None
+                and doc_qa_appendix
+                else query_result.response_iterator
+            )
             raw_data["llm_response"] = {
-                "content": query_result.content
+                "content": response_content
                 if not query_result.is_streaming
                 else None,
-                "response_iterator": query_result.response_iterator
+                "response_iterator": response_iterator
                 if query_result.is_streaming
                 else None,
                 "is_streaming": query_result.is_streaming,
@@ -3631,6 +4025,7 @@ class LightRAG:
                 deletion_operations_started = True
                 try:
                     # Still need to delete the doc status and full doc
+                    await self._delete_doc_qa_pairs(doc_id)
                     await self.full_docs.delete([doc_id])
                     await self.doc_status.delete([doc_id])
                 except Exception as e:
@@ -3657,6 +4052,7 @@ class LightRAG:
 
             # Mark that deletion operations have started
             deletion_operations_started = True
+            await self._delete_doc_qa_pairs(doc_id)
 
             if delete_llm_cache and chunk_ids:
                 if not self.llm_response_cache:

@@ -296,6 +296,55 @@ def test_query_endpoint_accepts_structured_query_payload():
     ]
 
 
+def test_query_endpoint_accepts_history_references():
+    client, fake_rag = _build_test_client(
+        {
+            "llm_response": {"content": "answer", "response_iterator": None, "is_streaming": False},
+            "data": {"chunks": [], "references": []},
+        }
+    )
+
+    response = _post_with_timeout(
+        client,
+        "/query",
+        {
+            "query": "How does keyword extraction work?",
+            "mode": "mix",
+            "include_references": False,
+            "conversation_history": [
+                {
+                    "role": "assistant",
+                    "content": "LightRAG retrieved two chunks for the previous answer.",
+                    "references": [
+                        {
+                            "reference_id": "1",
+                            "chunk_id": "chunk-1",
+                            "workspace": "default",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["response"] == "answer"
+    assert fake_rag.last_param is not None
+    assert fake_rag.last_param.conversation_history == [
+        {
+            "role": "assistant",
+            "content": "LightRAG retrieved two chunks for the previous answer.",
+            "references": [
+                {
+                    "reference_id": "1",
+                    "chunk_id": "chunk-1",
+                    "workspace": "default",
+                }
+            ],
+        }
+    ]
+
+
 def test_query_endpoint_includes_agent_search_result(monkeypatch):
     query_routes = _load_query_routes_module()
     client, fake_rag = _build_test_client(
@@ -690,3 +739,81 @@ def test_query_endpoint_continues_when_prior_rag_fails(monkeypatch):
     assert payload["agent_search_result"]["prior_rag_relation_count"] == 0
     assert payload["agent_search_result"]["prior_rag_chunk_count"] == 0
     assert captured["prior_rag_context"] is None
+
+
+def test_query_endpoint_agent_search_retrieval_target_includes_history_references(
+    monkeypatch,
+):
+    query_routes = _load_query_routes_module()
+    client, _ = _build_test_client(
+        {
+            "llm_response": {
+                "content": "answer",
+                "response_iterator": None,
+                "is_streaming": False,
+            },
+            "data": {"entities": [], "relationships": [], "chunks": [], "references": []},
+        }
+    )
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(query_routes, "is_opencode_enabled", lambda: True)
+
+    async def _fake_run_agent_search(
+        agent_search_id,
+        workspace,
+        retrieval_target,
+        prior_rag_context=None,
+        callback=None,
+    ):
+        captured["retrieval_target"] = retrieval_target
+        return types.SimpleNamespace(
+            ok=True,
+            session_id="session-3",
+            final_output="agent done",
+            error=None,
+        )
+
+    async def _fake_wait_for_submit(
+        rag, agent_search_id, timeout_seconds=5.0, interval_seconds=0.5
+    ):
+        return {"entity_ids": [], "chunk_ids": []}, "default"
+
+    monkeypatch.setattr(query_routes, "run_agent_search", _fake_run_agent_search)
+    monkeypatch.setattr(query_routes, "_wait_for_agent_submit_payload", _fake_wait_for_submit)
+
+    response = _post_with_timeout(
+        client,
+        "/query",
+        {
+            "query": "follow-up query",
+            "mode": "mix",
+            "include_references": False,
+            "agent_search": True,
+            "conversation_history": [
+                {
+                    "role": "assistant",
+                    "content": "The earlier answer referenced one source.",
+                    "references": [
+                        {
+                            "reference_id": 1,
+                            "chunk_id": "chunk-1",
+                            "workspace": "default",
+                            "score": 0.98,
+                            "metadata": {"page": 3},
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    retrieval_target = str(captured["retrieval_target"])
+    assert "[history]" in retrieval_target
+    assert '"role": "assistant"' in retrieval_target
+    assert '"reference_id": "1"' in retrieval_target
+    assert '"score": "0.98"' in retrieval_target
+    assert '"metadata": "{\'page\': 3}"' in retrieval_target
+    assert "[latest_query]\nfollow-up query" in retrieval_target

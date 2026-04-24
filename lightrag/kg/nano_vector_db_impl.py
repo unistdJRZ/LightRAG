@@ -180,6 +180,23 @@ class NanoVectorDBStorage(BaseVectorStorage):
         ]
         return results
 
+    async def query_by_doc_id(
+        self,
+        query: str,
+        doc_id: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+    ) -> list[dict[str, Any]]:
+        # NanoVectorDB has no metadata pre-filter API; over-fetch and filter locally.
+        results = await self.query(
+            query=query,
+            top_k=max(top_k * 20, top_k),
+            query_embedding=query_embedding,
+        )
+        return [
+            result for result in results if str(result.get("doc_id") or "") == doc_id
+        ][:top_k]
+
     @property
     async def client_storage(self):
         client = await self._get_client()

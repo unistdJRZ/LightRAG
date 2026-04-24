@@ -3050,6 +3050,19 @@ def apply_source_ids_limit(
     return truncated
 
 
+def truncate_source_id_for_display(source_id: Any, limit: int = 10) -> Any:
+    """Limit a displayed source_id chunk list without mutating stored source data."""
+
+    if not isinstance(source_id, str) or not source_id.strip() or limit <= 0:
+        return source_id
+
+    source_ids = split_string_by_multi_markers(source_id, [GRAPH_FIELD_SEP])
+    if len(source_ids) <= limit:
+        return source_id
+
+    return GRAPH_FIELD_SEP.join(source_ids[:limit])
+
+
 def compute_incremental_chunk_ids(
     existing_full_chunk_ids: list[str],
     old_chunk_ids: list[str],
@@ -3375,12 +3388,13 @@ def convert_to_user_format(
         if original_entity:
             # Use original database data
             source_id = original_entity.get("source_id", "")
+            display_source_id = truncate_source_id_for_display(source_id)
             formatted_entities.append(
                 {
                     "entity_name": original_entity.get("entity_name", entity_name),
                     "entity_type": original_entity.get("entity_type", "UNKNOWN"),
                     "description": original_entity.get("description", ""),
-                    "source_id": source_id,
+                    "source_id": display_source_id,
                     "file_path": original_entity.get("file_path", "unknown_source"),
                     "created_at": original_entity.get("created_at", ""),
                     "related_chunk": _resolve_related_chunk(
@@ -3391,12 +3405,13 @@ def convert_to_user_format(
         else:
             # Fallback to LLM context data (for backward compatibility)
             source_id = entity.get("source_id", "")
+            display_source_id = truncate_source_id_for_display(source_id)
             formatted_entities.append(
                 {
                     "entity_name": entity_name,
                     "entity_type": entity.get("type", "UNKNOWN"),
                     "description": entity.get("description", ""),
-                    "source_id": source_id,
+                    "source_id": display_source_id,
                     "file_path": entity.get("file_path", "unknown_source"),
                     "created_at": entity.get("created_at", ""),
                     "related_chunk": _resolve_related_chunk(
@@ -3420,6 +3435,7 @@ def convert_to_user_format(
         if original_relation:
             # Use original database data
             source_id = original_relation.get("source_id", "")
+            display_source_id = truncate_source_id_for_display(source_id)
             formatted_relationships.append(
                 {
                     "src_id": original_relation.get("src_id", entity1),
@@ -3427,7 +3443,7 @@ def convert_to_user_format(
                     "description": original_relation.get("description", ""),
                     "keywords": original_relation.get("keywords", ""),
                     "weight": original_relation.get("weight", 1.0),
-                    "source_id": source_id,
+                    "source_id": display_source_id,
                     "file_path": original_relation.get("file_path", "unknown_source"),
                     "created_at": original_relation.get("created_at", ""),
                     "related_chunk": _resolve_related_chunk(
@@ -3438,6 +3454,7 @@ def convert_to_user_format(
         else:
             # Fallback to LLM context data (for backward compatibility)
             source_id = relation.get("source_id", "")
+            display_source_id = truncate_source_id_for_display(source_id)
             formatted_relationships.append(
                 {
                     "src_id": entity1,
@@ -3445,7 +3462,7 @@ def convert_to_user_format(
                     "description": relation.get("description", ""),
                     "keywords": relation.get("keywords", ""),
                     "weight": relation.get("weight", 1.0),
-                    "source_id": source_id,
+                    "source_id": display_source_id,
                     "file_path": relation.get("file_path", "unknown_source"),
                     "created_at": relation.get("created_at", ""),
                     "related_chunk": _resolve_related_chunk(

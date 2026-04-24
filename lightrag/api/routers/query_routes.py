@@ -32,9 +32,23 @@ from lightrag.utils import (
     is_image_content_type,
     logger,
 )
+from lightrag.operate import _stringify_history_reference_items
 from pydantic import BaseModel, Field, field_validator
 
 router = APIRouter(tags=["query"])
+
+
+def _validate_history_references(
+    references: Any, field_name: str = "references"
+) -> None:
+    if references is None:
+        return
+    if not isinstance(references, list):
+        raise ValueError(f"'{field_name}' must be a list when provided.")
+
+    for ref in references:
+        if not isinstance(ref, dict):
+            raise ValueError(f"Each item in '{field_name}' must be an object.")
 
 
 def _log_query_request(endpoint: str, request: "QueryRequest") -> None:
@@ -52,6 +66,22 @@ def _log_query_request(endpoint: str, request: "QueryRequest") -> None:
         "Received %s request params: %s",
         endpoint,
         json.dumps(payload, ensure_ascii=False, default=str),
+    )
+
+
+def _log_query_response(endpoint: str, response_content: Any) -> None:
+    """Emit only the response text when DEBUG logging is enabled."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    logger.debug(
+        "Returning %s response: %s",
+        endpoint,
+        json.dumps(
+            {"response": str(response_content or "")},
+            ensure_ascii=False,
+            default=str,
+        ),
     )
 
 
@@ -84,6 +114,7 @@ class QueryInputPayload(BaseModel):
                 raise ValueError("Each message must have a 'role' key.")
             if not isinstance(msg["role"], str) or not msg["role"].strip():
                 raise ValueError("Each message 'role' must be a non-empty string.")
+            _validate_history_references(msg.get("references"))
         return history
 
 
@@ -160,7 +191,7 @@ class QueryRequest(BaseModel):
 
     conversation_history: Optional[List[Dict[str, Any]]] = Field(
         default=None,
-        description="History messages are only sent to LLM for context, not used for retrieval. Format: [{'role': 'user/assistant', 'content': 'message'}].",
+        description="History messages are only sent to LLM for context, not used for retrieval. Format: [{'role': 'user/assistant', 'content': 'message', 'references': [{'reference_id': '1', 'chunk_id': 'chunk-1', 'workspace': 'default'}]}].",
     )
 
     user_prompt: Optional[str] = Field(
@@ -176,6 +207,11 @@ class QueryRequest(BaseModel):
     include_references: Optional[bool] = Field(
         default=True,
         description="If True, includes reference list in responses. Affects /query and /query/stream endpoints. /query/data always includes references.",
+    )
+
+    query_ref: list[str] = Field(
+        default_factory=list,
+        description="Chunk IDs referenced by this query. When provided, their documents' QA pairs are searched and used as supplemental context.",
     )
 
     stream: Optional[bool] = Field(
@@ -210,7 +246,23 @@ class QueryRequest(BaseModel):
                 raise ValueError("Each message must have a 'role' key.")
             if not isinstance(msg["role"], str) or not msg["role"].strip():
                 raise ValueError("Each message 'role' must be a non-empty string.")
+            _validate_history_references(msg.get("references"))
         return conversation_history
+
+    @field_validator("query_ref", mode="before")
+    @classmethod
+    def query_ref_normalize(cls, query_ref: Any) -> list[str]:
+        if query_ref is None:
+            return []
+        values = query_ref if isinstance(query_ref, list) else [query_ref]
+        normalized: list[str] = []
+        for item in values:
+            if isinstance(item, dict):
+                item = item.get("chunk_id")
+            chunk_id = str(item or "").strip()
+            if chunk_id and chunk_id not in normalized:
+                normalized.append(chunk_id)
+        return normalized
 
     def to_query_params(self, is_stream: bool) -> "QueryParam":
         """Converts a QueryRequest instance into a QueryParam instance."""
@@ -352,6 +404,10 @@ class AgentSearchResultPayload(BaseModel):
     prior_rag_chunk_count: int = Field(
         default=0,
         description="Number of chunk items included in the prior RAG summary passed to the agent.",
+    )
+    prior_rag_doc_qa_count: int = Field(
+        default=0,
+        description="Number of document QA items included in the prior RAG summary passed to the agent.",
     )
     opencode_session_id: str | None = Field(
         default=None,
@@ -534,15 +590,22 @@ def _build_retrieval_target(request: QueryRequest) -> str:
     sections: list[str] = []
     history = request.get_effective_history()
     if history:
-        history_lines: list[str] = []
+        history_entries: list[dict[str, Any]] = []
         for message in history:
             role = str(message.get("role", "user") or "user").strip() or "user"
             content = str(message.get("content", "") or "").strip()
-            if content:
-                history_lines.append(f"{role}: {content}")
-        if history_lines:
+            if not content:
+                continue
+            history_entry: dict[str, Any] = {"role": role, "content": content}
+            references = _stringify_history_reference_items(message.get("references"))
+            if references:
+                history_entry["references"] = references
+            history_entries.append(history_entry)
+        if history_entries:
             sections.append("[history]")
-            sections.extend(history_lines)
+            sections.append(
+                json.dumps(history_entries, ensure_ascii=False, indent=2)
+            )
 
     query_text = request.get_query_text().strip()
     sections.extend(["[latest_query]", query_text])
@@ -560,6 +623,7 @@ def _summarize_prior_rag_data(
         "entities": 0,
         "relationships": 0,
         "chunks": 0,
+        "doc_qa": 0,
     }
     if not isinstance(result, dict):
         return None, empty_counts
@@ -577,8 +641,11 @@ def _summarize_prior_rag_data(
     chunks = [item for item in (data.get("chunks") or []) if isinstance(item, dict)][
         :max_chunks
     ]
+    doc_qa = [item for item in (data.get("doc_qa") or []) if isinstance(item, dict)][
+        :5
+    ]
 
-    if not entities and not relationships and not chunks:
+    if not entities and not relationships and not chunks and not doc_qa:
         return None, empty_counts
 
     lines: list[str] = []
@@ -629,6 +696,22 @@ def _summarize_prior_rag_data(
                 parts.append(f"content={content}")
             lines.append(" - " + " | ".join(part for part in parts if part))
 
+    if doc_qa:
+        lines.append("[doc_qa]")
+        for item in doc_qa:
+            belong_chunk = str(item.get("belong_chunk", "") or "").strip()
+            question = str(item.get("question", "") or "").strip()
+            answer = str(item.get("answer", "") or "").strip()
+            parts = []
+            if belong_chunk:
+                parts.append(f"belong_chunk={belong_chunk}")
+            if question:
+                parts.append(f"question={question}")
+            if answer:
+                parts.append(f"answer={answer}")
+            if parts:
+                lines.append(" - " + " | ".join(parts))
+
     summary = "\n".join(lines).strip()
     if not summary:
         return None, empty_counts
@@ -637,6 +720,7 @@ def _summarize_prior_rag_data(
         "entities": len(entities),
         "relationships": len(relationships),
         "chunks": len(chunks),
+        "doc_qa": len(doc_qa),
     }
 
 
@@ -655,7 +739,7 @@ async def _build_prior_rag_context(
         )
     except Exception as exc:
         logger.warning("Prior RAG context generation failed before agent_search: %s", exc)
-        return None, {"entities": 0, "relationships": 0, "chunks": 0}
+        return None, {"entities": 0, "relationships": 0, "chunks": 0, "doc_qa": 0}
 
     return _summarize_prior_rag_data(result)
 
@@ -836,7 +920,7 @@ async def _run_agent_search_pipeline(
     agent_search_id = _build_agent_search_id()
     retrieval_target = _build_retrieval_target(request)
     prior_rag_context: str | None = None
-    prior_rag_counts = {"entities": 0, "relationships": 0, "chunks": 0}
+    prior_rag_counts = {"entities": 0, "relationships": 0, "chunks": 0, "doc_qa": 0}
 
     if status_queue is not None:
         await status_queue.put(
@@ -854,6 +938,20 @@ async def _run_agent_search_pipeline(
         request,
         param,
     )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Sending agent_search payload: %s",
+            json.dumps(
+                {
+                    "agent_search_id": agent_search_id,
+                    "workspace": workspace,
+                    "retrieval_target": retrieval_target,
+                    "prior_rag_context": prior_rag_context,
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
 
     if not is_opencode_enabled():
         return AgentSearchMergeBundle(
@@ -867,6 +965,7 @@ async def _run_agent_search_pipeline(
                 prior_rag_entity_count=prior_rag_counts["entities"],
                 prior_rag_relation_count=prior_rag_counts["relationships"],
                 prior_rag_chunk_count=prior_rag_counts["chunks"],
+                prior_rag_doc_qa_count=prior_rag_counts["doc_qa"],
                 error="OpenCode integration is not configured",
             ),
             search_entities=[],
@@ -897,6 +996,7 @@ async def _run_agent_search_pipeline(
                 prior_rag_entity_count=prior_rag_counts["entities"],
                 prior_rag_relation_count=prior_rag_counts["relationships"],
                 prior_rag_chunk_count=prior_rag_counts["chunks"],
+                prior_rag_doc_qa_count=prior_rag_counts["doc_qa"],
                 opencode_session_id=opencode_result.session_id,
                 opencode_output=opencode_result.final_output,
                 error=opencode_result.error,
@@ -923,6 +1023,7 @@ async def _run_agent_search_pipeline(
                 prior_rag_entity_count=prior_rag_counts["entities"],
                 prior_rag_relation_count=prior_rag_counts["relationships"],
                 prior_rag_chunk_count=prior_rag_counts["chunks"],
+                prior_rag_doc_qa_count=prior_rag_counts["doc_qa"],
                 opencode_session_id=opencode_result.session_id,
                 opencode_output=opencode_result.final_output,
                 error="OpenCode finished but no matching /api/agent/submit payload was found",
@@ -959,6 +1060,7 @@ async def _run_agent_search_pipeline(
             prior_rag_entity_count=prior_rag_counts["entities"],
             prior_rag_relation_count=prior_rag_counts["relationships"],
             prior_rag_chunk_count=prior_rag_counts["chunks"],
+            prior_rag_doc_qa_count=prior_rag_counts["doc_qa"],
             opencode_session_id=opencode_result.session_id,
             opencode_output=opencode_result.final_output,
         ),
@@ -1334,6 +1436,7 @@ def create_query_routes(
             response_content = llm_response.get("content", "")
             if not response_content:
                 response_content = "No relevant context found for the query."
+            _log_query_response("/query", response_content)
 
             if request.include_references:
                 references = _enrich_references_with_chunk_preview(
@@ -1667,10 +1770,16 @@ def create_query_routes(
 
                         response_stream = llm_response.get("response_iterator")
                         if response_stream:
+                            last_response_chunk = ""
                             try:
                                 async for chunk in response_stream:
                                     if chunk:
+                                        last_response_chunk = str(chunk)
                                         yield f"{json.dumps({'response': chunk})}\n"
+                                _log_query_response(
+                                    "/query/stream",
+                                    last_response_chunk,
+                                )
                             except Exception as e:
                                 logger.error(f"Streaming error: {str(e)}")
                                 yield f"{json.dumps({'error': str(e)})}\n"
@@ -1678,6 +1787,7 @@ def create_query_routes(
                         response_content = llm_response.get("content", "")
                         if not response_content:
                             response_content = "No relevant context found for the query."
+                        _log_query_response("/query/stream", response_content)
 
                         complete_response: dict[str, Any] = {"response": response_content}
                         if request.include_references:

@@ -7,10 +7,8 @@ workspaces:
     alias: MSRE代表文献
   - id: msr_1
     alias: MSR-1
-  - id: ornl_test
-    alias: 橡树岭测试
-  - id: batch_test
-    alias: 批量导入测试
+  - id: minmal_test
+    alias: 最小测试
 
 # Backend dev server (FastAPI)
 backend_host: "0.0.0.0"

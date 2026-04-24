@@ -37,6 +37,7 @@ from lightrag.utils import (
     create_prefixed_exception,
     fix_tuple_delimiter_corruption,
     convert_to_user_format,
+    truncate_source_id_for_display,
     generate_reference_list_from_chunks,
     apply_source_ids_limit,
     merge_source_ids,
@@ -3302,7 +3303,8 @@ async def kg_query(
     # Return different content based on query parameters
     if query_param.only_need_context and not query_param.only_need_prompt:
         return QueryResult(
-            content=context_result.context, raw_data=context_result.raw_data
+            content=context_result.response_context or context_result.context,
+            raw_data=context_result.raw_data,
         )
 
     user_prompt = f"\n\n{query_param.user_prompt}" if query_param.user_prompt else "n/a"
@@ -3364,7 +3366,9 @@ async def kg_query(
         response = await use_model_func(
             user_query,
             system_prompt=sys_prompt,
-            history_messages=query_param.conversation_history,
+            history_messages=sanitize_history_messages_for_llm(
+                query_param.conversation_history
+            ),
             enable_cot=True,
             stream=query_param.stream,
         )
@@ -3491,18 +3495,65 @@ def normalize_query_input(
     return latest_query, normalized_history
 
 
+def _stringify_history_reference_items(
+    references: Any,
+) -> list[dict[str, str]]:
+    if not isinstance(references, list):
+        return []
+
+    normalized_references: list[dict[str, str]] = []
+    for ref in references:
+        if not isinstance(ref, dict):
+            continue
+
+        normalized_ref: dict[str, str] = {}
+        for key, value in ref.items():
+            key_str = str(key).strip()
+            if not key_str:
+                continue
+            normalized_ref[key_str] = "" if value is None else str(value)
+
+        if normalized_ref:
+            normalized_references.append(normalized_ref)
+
+    return normalized_references
+
+
+def sanitize_history_messages_for_llm(
+    history_messages: list[dict[str, Any]] | None,
+) -> list[dict[str, str]]:
+    if not history_messages:
+        return []
+
+    sanitized_history: list[dict[str, str]] = []
+    for msg in history_messages:
+        if not isinstance(msg, dict):
+            continue
+
+        role = str(msg.get("role") or "").strip()
+        content = str(msg.get("content") or "").strip()
+        if role and content:
+            sanitized_history.append({"role": role, "content": content})
+
+    return sanitized_history
+
+
 def _serialize_keyword_history(history_messages: list[dict[str, Any]] | None) -> str:
     if not history_messages:
         return "[]"
 
-    normalized_history: list[dict[str, str]] = []
+    normalized_history: list[dict[str, Any]] = []
     for msg in history_messages:
-        if not isinstance(msg, dict):
+        sanitized_messages = sanitize_history_messages_for_llm([msg])
+        if not sanitized_messages:
             continue
-        role = str(msg.get("role") or "").strip()
-        content = str(msg.get("content") or "").strip()
-        if role and content:
-            normalized_history.append({"role": role, "content": content})
+
+        normalized_message: dict[str, Any] = sanitized_messages[0]
+        normalized_references = _stringify_history_reference_items(msg.get("references"))
+        if normalized_references:
+            normalized_message["references"] = normalized_references
+
+        normalized_history.append(normalized_message)
 
     if not normalized_history:
         return "[]"
@@ -4150,7 +4201,7 @@ async def _build_context_str(
     relation_id_to_original: dict = None,
     preserved_entities: list[dict] | None = None,
     preserved_chunks: list[dict] | None = None,
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, dict[str, Any], str]:
     """
     Build the final LLM context string with token processing.
     This includes dynamic token calculation and final chunk truncation.
@@ -4168,7 +4219,7 @@ async def _build_context_str(
         )
         empty_raw_data["status"] = "failure"
         empty_raw_data["message"] = "Missing tokenizer, cannot build LLM context."
-        return "", empty_raw_data
+        return "", empty_raw_data, ""
 
     # Get token limits
     max_total_tokens = getattr(
@@ -4310,7 +4361,7 @@ async def _build_context_str(
         )
         empty_raw_data["status"] = "failure"
         empty_raw_data["message"] = "Query returned empty dataset."
-        return "", empty_raw_data
+        return "", empty_raw_data, ""
 
     # output chunks tracking infomations
     # format: <source><frequency>/<order> (e.g., E5/2 R2/1 C1/1)
@@ -4335,6 +4386,11 @@ async def _build_context_str(
         relations_str=relations_str,
         text_chunks_str=text_units_str,
         reference_list_str=reference_list_str,
+    )
+    response_context = PROMPTS["kg_query_context_response"].format(
+        entities_str=entities_str,
+        relations_str=relations_str,
+        text_chunks_str=text_units_str,
     )
 
     # Always return both context and complete data structure (unified approach)
@@ -4368,7 +4424,7 @@ async def _build_context_str(
     logger.debug(
         f"[_build_context_str] Final data after conversion: {len(final_data.get('data', {}).get('entities', []))} entities, {len(final_data.get('data', {}).get('relationships', []))} relationships, {len(final_data.get('data', {}).get('chunks', []))} chunks"
     )
-    return result, final_data
+    return result, final_data, response_context
 
 
 def _annotate_related_chunks_for_prompt(
@@ -4421,6 +4477,10 @@ def _annotate_related_chunks_for_prompt(
         prompt_entity["related_chunk"] = _resolve_related_chunk_from_source_id(
             source_id, missing_entity_message
         )
+        if "source_id" in prompt_entity:
+            prompt_entity["source_id"] = truncate_source_id_for_display(
+                prompt_entity["source_id"]
+            )
         prompt_entities_context.append(prompt_entity)
 
     prompt_relations_context: list[dict] = []
@@ -4443,6 +4503,10 @@ def _annotate_related_chunks_for_prompt(
         prompt_relation["related_chunk"] = _resolve_related_chunk_from_source_id(
             source_id, missing_relation_message
         )
+        if "source_id" in prompt_relation:
+            prompt_relation["source_id"] = truncate_source_id_for_display(
+                prompt_relation["source_id"]
+            )
         prompt_relations_context.append(prompt_relation)
 
     return prompt_entities_context, prompt_relations_context
@@ -4510,6 +4574,7 @@ def _build_preserved_prompt_entities(
         if not entity_name:
             continue
         source_id = entity.get("source_id", "")
+        display_source_id = truncate_source_id_for_display(source_id)
         prompt_entities.append(
             {
                 "entity": entity_name,
@@ -4519,7 +4584,7 @@ def _build_preserved_prompt_entities(
                     entity.get("created_at", "UNKNOWN")
                 ),
                 "file_path": entity.get("file_path", "unknown_source"),
-                "source_id": source_id,
+                "source_id": display_source_id,
                 "related_chunk": _resolve_related_chunk_reference(
                     source_id,
                     chunk_id_to_reference_id,
@@ -4540,12 +4605,13 @@ def _format_preserved_entities_for_user(
         if not entity_name:
             continue
         source_id = entity.get("source_id", "")
+        display_source_id = truncate_source_id_for_display(source_id)
         formatted_entities.append(
             {
                 "entity_name": entity_name,
                 "entity_type": entity.get("entity_type", "UNKNOWN"),
                 "description": entity.get("description", ""),
-                "source_id": source_id,
+                "source_id": display_source_id,
                 "file_path": entity.get("file_path", "unknown_source"),
                 "created_at": entity.get("created_at", ""),
                 "related_chunk": _resolve_related_chunk_reference(
@@ -4761,8 +4827,8 @@ async def _build_query_context(
         return None
 
     # Stage 4: Build final LLM context with dynamic token processing
-    # _build_context_str now always returns tuple[str, dict]
-    context, raw_data = await _build_context_str(
+    # _build_context_str returns LLM context, raw data, and context-only response text.
+    context, raw_data, response_context = await _build_context_str(
         entities_context=truncation_result["entities_context"],
         relations_context=truncation_result["relations_context"],
         merged_chunks=merged_chunks,
@@ -4812,7 +4878,11 @@ async def _build_query_context(
         f"[_build_query_context] Raw data entities: {len(raw_data.get('data', {}).get('entities', []))}, relationships: {len(raw_data.get('data', {}).get('relationships', []))}, chunks: {len(raw_data.get('data', {}).get('chunks', []))}"
     )
 
-    return QueryContextResult(context=context, raw_data=raw_data)
+    return QueryContextResult(
+        context=context,
+        raw_data=raw_data,
+        response_context=response_context,
+    )
 
 
 async def _get_node_data(
@@ -5601,9 +5671,12 @@ async def naive_query(
         text_chunks_str=text_units_str,
         reference_list_str=reference_list_str,
     )
+    response_context_content = PROMPTS["naive_query_context_response"].format(
+        text_chunks_str=text_units_str,
+    )
 
     if query_param.only_need_context and not query_param.only_need_prompt:
-        return QueryResult(content=context_content, raw_data=raw_data)
+        return QueryResult(content=response_context_content, raw_data=raw_data)
 
     sys_prompt = sys_prompt_template.format(
         response_type=query_param.response_type,
@@ -5644,7 +5717,9 @@ async def naive_query(
         response = await use_model_func(
             user_query,
             system_prompt=sys_prompt,
-            history_messages=query_param.conversation_history,
+            history_messages=sanitize_history_messages_for_llm(
+                query_param.conversation_history
+            ),
             enable_cot=True,
             stream=query_param.stream,
         )

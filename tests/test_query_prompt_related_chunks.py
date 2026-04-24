@@ -25,7 +25,7 @@ def test_build_context_str_includes_related_chunk_in_prompt(monkeypatch):
         _fake_process_chunks_unified,
     )
 
-    context, raw_data = asyncio.run(
+    context, raw_data, response_context = asyncio.run(
         _build_context_str(
             entities_context=[
                 {
@@ -90,6 +90,7 @@ def test_build_context_str_includes_related_chunk_in_prompt(monkeypatch):
     )
 
     assert '"entity": "Entity A"' in context
+    assert '"entity": "Entity A"' in response_context
     assert '"entity1": "Entity A"' in context
     assert '"related_chunk": "1"' in context
     assert '"related_chunk": "2"' in context
