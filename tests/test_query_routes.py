@@ -324,6 +324,43 @@ def test_query_endpoint_accepts_structured_query_payload():
     ]
 
 
+def test_query_data_endpoint_ignores_conversation_history():
+    client, fake_rag = _build_test_client(
+        {
+            "data": {"entities": [], "relationships": [], "chunks": [], "references": []},
+        }
+    )
+
+    response = _post_with_timeout(
+        client,
+        "/query/data",
+        {
+            "query": {
+                "history": [
+                    {"role": "user", "content": "What is LightRAG?"},
+                    {
+                        "role": "assistant",
+                        "content": "LightRAG is a graph-based RAG system.",
+                    },
+                ],
+                "latest_query": "How does keyword extraction work?",
+            },
+            "conversation_history": [
+                {
+                    "role": "assistant",
+                    "content": "Do not use this history for data retrieval.",
+                }
+            ],
+            "mode": "mix",
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake_rag.last_query == "How does keyword extraction work?"
+    assert fake_rag.last_param is not None
+    assert fake_rag.last_param.conversation_history == []
+
+
 def test_query_endpoint_accepts_history_references():
     client, fake_rag = _build_test_client(
         {
@@ -383,7 +420,7 @@ def test_query_endpoint_includes_agent_search_result(monkeypatch):
     )
 
     async def _fake_agent_search_pipeline(
-        rag, request, workspace, param=None, status_queue=None
+        rag, request, workspace, param=None, status_queue=None, ignore_history=False
     ):
         return query_routes.AgentSearchMergeBundle(
             public_result=query_routes.AgentSearchResultPayload(
@@ -451,7 +488,7 @@ def test_query_stream_endpoint_emits_agent_status(monkeypatch):
     )
 
     async def _fake_agent_search_pipeline(
-        rag, request, workspace, param=None, status_queue=None
+        rag, request, workspace, param=None, status_queue=None, ignore_history=False
     ):
         if status_queue is not None:
             await status_queue.put(
@@ -619,7 +656,7 @@ def test_query_data_endpoint_merges_agent_search_chunks(monkeypatch):
     )
 
     async def _fake_agent_search_pipeline(
-        rag, request, workspace, param=None, status_queue=None
+        rag, request, workspace, param=None, status_queue=None, ignore_history=False
     ):
         return query_routes.AgentSearchMergeBundle(
             public_result=query_routes.AgentSearchResultPayload(
@@ -892,6 +929,42 @@ def test_query_data_endpoint_disables_rerank_for_prior_and_final_rag(monkeypatch
     assert len(fake_rag.data_calls) == 2
     assert fake_rag.data_calls[0]["param"].enable_rerank is False
     assert fake_rag.data_calls[1]["param"].enable_rerank is False
+
+
+def test_query_data_endpoint_ignores_history_for_agent_prior_rag(monkeypatch):
+    query_routes = _load_query_routes_module()
+    client, fake_rag = _build_test_client(
+        {
+            "data": {"entities": [], "relationships": [], "chunks": [], "references": []},
+        }
+    )
+    _stub_successful_agent_search(query_routes, monkeypatch)
+
+    response = _post_with_timeout(
+        client,
+        "/query/data",
+        {
+            "query": {
+                "history": [
+                    {"role": "user", "content": "prior turn"},
+                    {"role": "assistant", "content": "prior answer"},
+                ],
+                "latest_query": "test query",
+            },
+            "conversation_history": [
+                {"role": "assistant", "content": "explicit history"}
+            ],
+            "mode": "mix",
+            "agent_search": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(fake_rag.data_calls) == 2
+    assert fake_rag.data_calls[0]["query"] == "test query"
+    assert fake_rag.data_calls[0]["param"].conversation_history == []
+    assert fake_rag.data_calls[1]["query"] == "test query"
+    assert fake_rag.data_calls[1]["param"].conversation_history == []
 
 
 def test_query_stream_endpoint_disables_rerank_for_prior_and_final_rag(monkeypatch):

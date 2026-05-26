@@ -700,6 +700,10 @@ def _build_retrieval_target(request: QueryRequest) -> str:
     return "\n".join(sections)
 
 
+def _build_latest_query_retrieval_target(request: QueryRequest) -> str:
+    return "\n".join(["[latest_query]", request.get_query_text().strip()])
+
+
 def _summarize_prior_rag_data(
     result: dict[str, Any] | None,
     *,
@@ -816,12 +820,19 @@ async def _build_prior_rag_context(
     rag: Any,
     request: QueryRequest,
     param: QueryParam,
+    *,
+    ignore_history: bool = False,
 ) -> tuple[str | None, dict[str, int]]:
     prior_param = QueryParam(**param.__dict__)
     prior_param.stream = False
+    if ignore_history:
+        prior_param.conversation_history = []
+    query_payload: str | QueryInputPayload = (
+        request.get_query_text() if ignore_history else request.query
+    )
     try:
         result = await rag.aquery_data(
-            request.query,
+            query_payload,
             param=prior_param,
             agent_context=None,
         )
@@ -1093,12 +1104,17 @@ async def _run_agent_search_pipeline(
     workspace: str,
     param: QueryParam,
     status_queue: asyncio.Queue[dict[str, Any]] | None = None,
+    ignore_history: bool = False,
 ) -> AgentSearchMergeBundle | None:
     if not request.agent_search:
         return None
 
     agent_search_id = _build_agent_search_id()
-    retrieval_target = _build_retrieval_target(request)
+    retrieval_target = (
+        _build_latest_query_retrieval_target(request)
+        if ignore_history
+        else _build_retrieval_target(request)
+    )
     prior_rag_context: str | None = None
     prior_rag_counts = {"entities": 0, "relationships": 0, "chunks": 0, "doc_qa": 0}
     _update_agent_search_run_state(
@@ -1123,6 +1139,7 @@ async def _run_agent_search_pipeline(
         rag,
         request,
         param,
+        ignore_history=ignore_history,
     )
     _update_agent_search_run_state(
         prior_rag_context=prior_rag_context,
@@ -1233,6 +1250,7 @@ async def _run_agent_search_pipeline_guarded(
     workspace: str,
     param: QueryParam,
     status_queue: asyncio.Queue[dict[str, Any]] | None = None,
+    ignore_history: bool = False,
 ) -> AgentSearchMergeBundle | None:
     state: dict[str, Any] = {}
     state_token = _agent_search_run_state.set(state)
@@ -1244,13 +1262,19 @@ async def _run_agent_search_pipeline_guarded(
                 workspace=workspace,
                 param=param,
                 status_queue=status_queue,
+                ignore_history=ignore_history,
             ),
             timeout=_get_agent_search_timeout_seconds(),
         )
     except asyncio.TimeoutError:
         agent_search_id = str(state.get("agent_search_id") or _build_agent_search_id())
         retrieval_target = str(
-            state.get("retrieval_target") or _build_retrieval_target(request)
+            state.get("retrieval_target")
+            or (
+                _build_latest_query_retrieval_target(request)
+                if ignore_history
+                else _build_retrieval_target(request)
+            )
         )
         prior_rag_context = state.get("prior_rag_context")
         prior_rag_counts = state.get(
@@ -1304,7 +1328,12 @@ async def _run_agent_search_pipeline_guarded(
     except Exception as exc:
         agent_search_id = str(state.get("agent_search_id") or _build_agent_search_id())
         retrieval_target = str(
-            state.get("retrieval_target") or _build_retrieval_target(request)
+            state.get("retrieval_target")
+            or (
+                _build_latest_query_retrieval_target(request)
+                if ignore_history
+                else _build_retrieval_target(request)
+            )
         )
         prior_rag_context = state.get("prior_rag_context")
         prior_rag_counts = state.get(
@@ -1363,6 +1392,7 @@ async def _run_query_with_agent_context(
             workspace=workspace,
             param=param,
             status_queue=status_queue,
+            ignore_history=data_only,
         )
         if request.agent_search
         else None
@@ -1371,7 +1401,7 @@ async def _run_query_with_agent_context(
 
     if data_only:
         result = await rag.aquery_data(
-            request.query,
+            request.get_query_text(),
             param=param,
             agent_context=agent_context,
         )
@@ -2422,6 +2452,7 @@ def create_query_routes(
                 or default_workspace
             )
             param = request.to_query_params(False)  # No streaming for data endpoint
+            param.conversation_history = []
             response, agent_bundle = await _run_query_with_agent_context(
                 current_rag,
                 request,
