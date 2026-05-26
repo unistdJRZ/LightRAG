@@ -36,6 +36,9 @@ from lightrag.operate import _stringify_history_reference_items
 from pydantic import BaseModel, Field, field_validator
 
 router = APIRouter(tags=["query"])
+_agent_search_run_state: ContextVar[dict[str, Any] | None] = ContextVar(
+    "agent_search_run_state", default=None
+)
 
 
 def _validate_history_references(
@@ -206,7 +209,7 @@ class QueryRequest(BaseModel):
 
     include_references: Optional[bool] = Field(
         default=True,
-        description="If True, includes reference list in responses. Affects /query and /query/stream endpoints. /query/data always includes references.",
+        description="If True, includes reference list in responses. Affects /query and /query/stream endpoints. /query/data returns agent-focused structured data and ignores this flag.",
     )
 
     query_ref: list[str] = Field(
@@ -221,6 +224,10 @@ class QueryRequest(BaseModel):
     agent_search: bool = Field(
         default=False,
         description="If True, dispatches the combined history and query to the configured OpenCode RAG search agent and merges its submitted results into the final output.",
+    )
+    stream_agent_status: bool = Field(
+        default=False,
+        description="If True, emits intermediate agent_search status events on /query/stream. Defaults to False so only final result packets are streamed.",
     )
 
     @field_validator("query", mode="after")
@@ -270,7 +277,7 @@ class QueryRequest(BaseModel):
         # Exclude API-level parameters that don't belong in QueryParam
         request_data = self.model_dump(
             exclude_none=True,
-            exclude={"query", "workspace", "agent_search"},
+            exclude={"query", "workspace", "agent_search", "stream_agent_status"},
         )
 
         if self.conversation_history is None:
@@ -345,7 +352,7 @@ class QueryDataResponse(BaseModel):
     status: str = Field(description="Query execution status")
     message: str = Field(description="Status message")
     data: Dict[str, Any] = Field(
-        description="Query result data containing entities, relationships, chunks, and references"
+        description="Agent-focused retrieval data containing entities, relationships, and chunks"
     )
     metadata: Dict[str, Any] = Field(
         description="Query metadata including mode, keywords, and processing information"
@@ -577,6 +584,76 @@ def _normalize_chunk_level_references(data: Dict[str, Any]) -> List[Dict[str, An
     return fallback
 
 
+def _format_query_data_for_agent(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the /query/data payload in the compact schema expected by agents."""
+    formatted = response.copy()
+    data = response.get("data", {})
+    if not isinstance(data, dict):
+        formatted["data"] = {"entities": [], "relationships": [], "chunks": []}
+        return formatted
+
+    entities: list[dict[str, Any]] = []
+    for item in data.get("entities", []) or []:
+        if not isinstance(item, dict):
+            continue
+        entity_id = str(
+            item.get("id")
+            or item.get("entity_name")
+            or item.get("entity")
+            or item.get("name")
+            or ""
+        ).strip()
+        if not entity_id:
+            continue
+        entities.append(
+            {
+                "id": entity_id,
+                "description": item.get("description", ""),
+            }
+        )
+
+    relationships: list[dict[str, Any]] = []
+    for item in data.get("relationships", data.get("relations", [])) or []:
+        if not isinstance(item, dict):
+            continue
+        relation_id = str(item.get("id") or item.get("name") or "").strip()
+        if not relation_id:
+            src_id = str(item.get("src_id") or item.get("entity1") or "").strip()
+            tgt_id = str(item.get("tgt_id") or item.get("entity2") or "").strip()
+            relation_id = (
+                f"{src_id} -> {tgt_id}" if src_id or tgt_id else ""
+            ).strip()
+        if not relation_id:
+            continue
+        relationships.append(
+            {
+                "id": relation_id,
+                "description": item.get("description", ""),
+            }
+        )
+
+    chunks: list[dict[str, Any]] = []
+    for item in data.get("chunks", []) or []:
+        if not isinstance(item, dict):
+            continue
+        resolved_image_base64, resolved_image_text = get_chunk_image_fields(item)
+        chunks.append(
+            {
+                "chunk_id": item.get("chunk_id", ""),
+                "full_doc_id": item.get("full_doc_id"),
+                "image_text": resolved_image_text,
+                "content_type": item.get("content_type"),
+            }
+        )
+
+    formatted["data"] = {
+        "entities": entities,
+        "relationships": relationships,
+        "chunks": chunks,
+    }
+    return formatted
+
+
 def _build_agent_search_id() -> str:
     return f"agent-search-{uuid4().hex}"
 
@@ -584,6 +661,17 @@ def _build_agent_search_id() -> str:
 def _get_agent_search_timeout_seconds() -> float:
     configured = float(getattr(global_args, "opencode_timeout", 120.0) or 120.0)
     return max(configured + 5.0, 10.0)
+
+
+def _get_agent_submit_wait_timeout_seconds() -> float:
+    configured = float(getattr(global_args, "opencode_timeout", 120.0) or 120.0)
+    return min(max(configured / 6.0, 1.0), 10.0)
+
+
+def _update_agent_search_run_state(**values: Any) -> None:
+    state = _agent_search_run_state.get()
+    if state is not None:
+        state.update(values)
 
 
 def _build_retrieval_target(request: QueryRequest) -> str:
@@ -907,6 +995,98 @@ def _build_agent_context(
     }
 
 
+def _normalize_agent_submit_ids(submit_payload: dict[str, Any]) -> tuple[list[str], list[str]]:
+    entity_ids = [
+        str(item).strip()
+        for item in submit_payload.get("entity_ids", [])
+        if str(item).strip()
+    ]
+    chunk_ids = [
+        str(item).strip()
+        for item in submit_payload.get("chunk_ids", [])
+        if str(item).strip()
+    ]
+    return entity_ids, chunk_ids
+
+
+async def _build_agent_bundle_from_submit(
+    rag: Any,
+    *,
+    agent_search_id: str,
+    workspace: str,
+    retrieval_target: str,
+    submit_payload: dict[str, Any],
+    resolved_workspace: str,
+    status: Literal["completed", "missing_submit", "failed"],
+    prior_rag_context: str | None,
+    prior_rag_counts: dict[str, int],
+    opencode_session_id: str | None = None,
+    opencode_output: str | None = None,
+    error: str | None = None,
+) -> AgentSearchMergeBundle:
+    entity_ids, chunk_ids = _normalize_agent_submit_ids(submit_payload)
+    search_entities = await _load_agent_entities(entity_ids, rag)
+    search_chunks = await _load_agent_chunks(chunk_ids, rag)
+    cache_signature = _build_agent_cache_signature(entity_ids, chunk_ids)
+
+    return AgentSearchMergeBundle(
+        public_result=AgentSearchResultPayload(
+            agent_search_id=agent_search_id,
+            workspace=resolved_workspace or workspace,
+            retrieval_target=retrieval_target,
+            status=status,
+            submitted=True,
+            entity_count=len(search_entities),
+            chunk_count=len(search_chunks),
+            prior_rag_used=bool(prior_rag_context),
+            prior_rag_entity_count=prior_rag_counts["entities"],
+            prior_rag_relation_count=prior_rag_counts["relationships"],
+            prior_rag_chunk_count=prior_rag_counts["chunks"],
+            prior_rag_doc_qa_count=prior_rag_counts["doc_qa"],
+            opencode_session_id=opencode_session_id,
+            opencode_output=opencode_output,
+            error=error,
+        ),
+        search_entities=search_entities,
+        search_chunks=search_chunks,
+        cache_signature=cache_signature,
+    )
+
+
+def _build_agent_bundle_without_submit(
+    *,
+    agent_search_id: str,
+    workspace: str,
+    retrieval_target: str,
+    resolved_workspace: str = "",
+    status: Literal["completed", "missing_submit", "failed"],
+    prior_rag_context: str | None,
+    prior_rag_counts: dict[str, int],
+    opencode_session_id: str | None = None,
+    opencode_output: str | None = None,
+    error: str | None = None,
+) -> AgentSearchMergeBundle:
+    return AgentSearchMergeBundle(
+        public_result=AgentSearchResultPayload(
+            agent_search_id=agent_search_id,
+            workspace=resolved_workspace or workspace,
+            retrieval_target=retrieval_target,
+            status=status,
+            submitted=False,
+            prior_rag_used=bool(prior_rag_context),
+            prior_rag_entity_count=prior_rag_counts["entities"],
+            prior_rag_relation_count=prior_rag_counts["relationships"],
+            prior_rag_chunk_count=prior_rag_counts["chunks"],
+            prior_rag_doc_qa_count=prior_rag_counts["doc_qa"],
+            opencode_session_id=opencode_session_id,
+            opencode_output=opencode_output,
+            error=error,
+        ),
+        search_entities=[],
+        search_chunks=[],
+    )
+
+
 async def _run_agent_search_pipeline(
     rag: Any,
     request: QueryRequest,
@@ -921,6 +1101,12 @@ async def _run_agent_search_pipeline(
     retrieval_target = _build_retrieval_target(request)
     prior_rag_context: str | None = None
     prior_rag_counts = {"entities": 0, "relationships": 0, "chunks": 0, "doc_qa": 0}
+    _update_agent_search_run_state(
+        agent_search_id=agent_search_id,
+        retrieval_target=retrieval_target,
+        prior_rag_context=prior_rag_context,
+        prior_rag_counts=prior_rag_counts,
+    )
 
     if status_queue is not None:
         await status_queue.put(
@@ -937,6 +1123,10 @@ async def _run_agent_search_pipeline(
         rag,
         request,
         param,
+    )
+    _update_agent_search_run_state(
+        prior_rag_context=prior_rag_context,
+        prior_rag_counts=prior_rag_counts,
     )
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
@@ -972,102 +1162,69 @@ async def _run_agent_search_pipeline(
             search_chunks=[],
         )
 
-    opencode_result = await run_agent_search(
-        agent_search_id=agent_search_id,
-        workspace=workspace,
-        retrieval_target=retrieval_target,
-        prior_rag_context=prior_rag_context,
-        callback=(
-            None
-            if status_queue is None
-            else lambda status: _emit_agent_status(status_queue, status)
-        ),
-    )
-
-    if not opencode_result.ok:
-        return AgentSearchMergeBundle(
-            public_result=AgentSearchResultPayload(
-                agent_search_id=agent_search_id,
-                workspace=workspace,
-                retrieval_target=retrieval_target,
-                status="failed",
-                submitted=False,
-                prior_rag_used=bool(prior_rag_context),
-                prior_rag_entity_count=prior_rag_counts["entities"],
-                prior_rag_relation_count=prior_rag_counts["relationships"],
-                prior_rag_chunk_count=prior_rag_counts["chunks"],
-                prior_rag_doc_qa_count=prior_rag_counts["doc_qa"],
-                opencode_session_id=opencode_result.session_id,
-                opencode_output=opencode_result.final_output,
-                error=opencode_result.error,
+    opencode_result = None
+    opencode_error: str | None = None
+    try:
+        opencode_result = await run_agent_search(
+            agent_search_id=agent_search_id,
+            workspace=workspace,
+            retrieval_target=retrieval_target,
+            prior_rag_context=prior_rag_context,
+            callback=(
+                None
+                if status_queue is None
+                else lambda status: _emit_agent_status(status_queue, status)
             ),
-            search_entities=[],
-            search_chunks=[],
         )
+    except Exception as exc:
+        logger.error("OpenCode agent search raised unexpectedly: %s", exc)
+        opencode_error = str(exc)
 
-    submit_timeout = float(getattr(global_args, "opencode_timeout", 120.0) or 120.0)
     submit_payload, resolved_workspace = await _wait_for_agent_submit_payload(
         rag,
         agent_search_id,
-        timeout_seconds=min(max(submit_timeout / 6.0, 1.0), 10.0),
+        timeout_seconds=_get_agent_submit_wait_timeout_seconds(),
     )
-    if submit_payload is None:
-        return AgentSearchMergeBundle(
-            public_result=AgentSearchResultPayload(
-                agent_search_id=agent_search_id,
-                workspace=resolved_workspace or workspace,
-                retrieval_target=retrieval_target,
-                status="missing_submit",
-                submitted=False,
-                prior_rag_used=bool(prior_rag_context),
-                prior_rag_entity_count=prior_rag_counts["entities"],
-                prior_rag_relation_count=prior_rag_counts["relationships"],
-                prior_rag_chunk_count=prior_rag_counts["chunks"],
-                prior_rag_doc_qa_count=prior_rag_counts["doc_qa"],
-                opencode_session_id=opencode_result.session_id,
-                opencode_output=opencode_result.final_output,
-                error="OpenCode finished but no matching /api/agent/submit payload was found",
-            ),
-            search_entities=[],
-            search_chunks=[],
+
+    opencode_ok = bool(getattr(opencode_result, "ok", False))
+    opencode_session_id = getattr(opencode_result, "session_id", None)
+    opencode_output = getattr(opencode_result, "final_output", None)
+    if opencode_error is None:
+        opencode_error = getattr(opencode_result, "error", None)
+
+    if submit_payload is not None:
+        return await _build_agent_bundle_from_submit(
+            rag,
+            agent_search_id=agent_search_id,
+            workspace=workspace,
+            retrieval_target=retrieval_target,
+            submit_payload=submit_payload,
+            resolved_workspace=resolved_workspace,
+            status="completed" if opencode_ok else "failed",
+            prior_rag_context=prior_rag_context,
+            prior_rag_counts=prior_rag_counts,
+            opencode_session_id=opencode_session_id,
+            opencode_output=opencode_output,
+            error=None if opencode_ok else opencode_error,
         )
 
-    entity_ids = [
-        str(item).strip()
-        for item in submit_payload.get("entity_ids", [])
-        if str(item).strip()
-    ]
-    chunk_ids = [
-        str(item).strip()
-        for item in submit_payload.get("chunk_ids", [])
-        if str(item).strip()
-    ]
-
-    search_entities = await _load_agent_entities(entity_ids, rag)
-    search_chunks = await _load_agent_chunks(chunk_ids, rag)
-    cache_signature = _build_agent_cache_signature(entity_ids, chunk_ids)
-
-    return AgentSearchMergeBundle(
-        public_result=AgentSearchResultPayload(
+    if submit_payload is None:
+        return _build_agent_bundle_without_submit(
             agent_search_id=agent_search_id,
-            workspace=resolved_workspace or workspace,
+            workspace=workspace,
             retrieval_target=retrieval_target,
-            status="completed",
-            submitted=True,
-            entity_count=len(search_entities),
-            chunk_count=len(search_chunks),
-            prior_rag_used=bool(prior_rag_context),
-            prior_rag_entity_count=prior_rag_counts["entities"],
-            prior_rag_relation_count=prior_rag_counts["relationships"],
-            prior_rag_chunk_count=prior_rag_counts["chunks"],
-            prior_rag_doc_qa_count=prior_rag_counts["doc_qa"],
-            opencode_session_id=opencode_result.session_id,
-            opencode_output=opencode_result.final_output,
-        ),
-        search_entities=search_entities,
-        search_chunks=search_chunks,
-        cache_signature=cache_signature,
-    )
+            resolved_workspace=resolved_workspace,
+            status="missing_submit" if opencode_ok else "failed",
+            prior_rag_context=prior_rag_context,
+            prior_rag_counts=prior_rag_counts,
+            opencode_session_id=opencode_session_id,
+            opencode_output=opencode_output,
+            error=(
+                "OpenCode finished but no matching /api/agent/submit payload was found"
+                if opencode_ok
+                else opencode_error
+            ),
+        )
 
 
 async def _run_agent_search_pipeline_guarded(
@@ -1077,6 +1234,8 @@ async def _run_agent_search_pipeline_guarded(
     param: QueryParam,
     status_queue: asyncio.Queue[dict[str, Any]] | None = None,
 ) -> AgentSearchMergeBundle | None:
+    state: dict[str, Any] = {}
+    state_token = _agent_search_run_state.set(state)
     try:
         return await asyncio.wait_for(
             _run_agent_search_pipeline(
@@ -1089,8 +1248,20 @@ async def _run_agent_search_pipeline_guarded(
             timeout=_get_agent_search_timeout_seconds(),
         )
     except asyncio.TimeoutError:
-        agent_search_id = _build_agent_search_id()
-        retrieval_target = _build_retrieval_target(request)
+        agent_search_id = str(state.get("agent_search_id") or _build_agent_search_id())
+        retrieval_target = str(
+            state.get("retrieval_target") or _build_retrieval_target(request)
+        )
+        prior_rag_context = state.get("prior_rag_context")
+        prior_rag_counts = state.get(
+            "prior_rag_counts",
+            {"entities": 0, "relationships": 0, "chunks": 0, "doc_qa": 0},
+        )
+        submit_payload, resolved_workspace = await _wait_for_agent_submit_payload(
+            rag,
+            agent_search_id,
+            timeout_seconds=0.0,
+        )
         if status_queue is not None:
             await status_queue.put(
                 {
@@ -1101,19 +1272,79 @@ async def _run_agent_search_pipeline_guarded(
                     "opencode_session_id": None,
                 }
             )
-        return AgentSearchMergeBundle(
-            public_result=AgentSearchResultPayload(
+
+        if submit_payload is not None:
+            return await _build_agent_bundle_from_submit(
+                rag,
                 agent_search_id=agent_search_id,
                 workspace=workspace,
                 retrieval_target=retrieval_target,
                 status="failed",
-                submitted=False,
-                prior_rag_used=False,
+                submit_payload=submit_payload,
+                resolved_workspace=resolved_workspace,
+                prior_rag_context=(
+                    prior_rag_context if isinstance(prior_rag_context, str) else None
+                ),
+                prior_rag_counts=prior_rag_counts,
                 error="agent_search timed out",
+            )
+
+        return _build_agent_bundle_without_submit(
+            agent_search_id=agent_search_id,
+            workspace=workspace,
+            retrieval_target=retrieval_target,
+            resolved_workspace=resolved_workspace,
+            status="failed",
+            prior_rag_context=(
+                prior_rag_context if isinstance(prior_rag_context, str) else None
             ),
-            search_entities=[],
-            search_chunks=[],
+            prior_rag_counts=prior_rag_counts,
+            error="agent_search timed out",
         )
+    except Exception as exc:
+        agent_search_id = str(state.get("agent_search_id") or _build_agent_search_id())
+        retrieval_target = str(
+            state.get("retrieval_target") or _build_retrieval_target(request)
+        )
+        prior_rag_context = state.get("prior_rag_context")
+        prior_rag_counts = state.get(
+            "prior_rag_counts",
+            {"entities": 0, "relationships": 0, "chunks": 0, "doc_qa": 0},
+        )
+        submit_payload, resolved_workspace = await _wait_for_agent_submit_payload(
+            rag,
+            agent_search_id,
+            timeout_seconds=0.0,
+        )
+        if submit_payload is not None:
+            return await _build_agent_bundle_from_submit(
+                rag,
+                agent_search_id=agent_search_id,
+                workspace=workspace,
+                retrieval_target=retrieval_target,
+                submit_payload=submit_payload,
+                resolved_workspace=resolved_workspace,
+                status="failed",
+                prior_rag_context=(
+                    prior_rag_context if isinstance(prior_rag_context, str) else None
+                ),
+                prior_rag_counts=prior_rag_counts,
+                error=str(exc),
+            )
+        return _build_agent_bundle_without_submit(
+            agent_search_id=agent_search_id,
+            workspace=workspace,
+            retrieval_target=retrieval_target,
+            resolved_workspace=resolved_workspace,
+            status="failed",
+            prior_rag_context=(
+                prior_rag_context if isinstance(prior_rag_context, str) else None
+            ),
+            prior_rag_counts=prior_rag_counts,
+            error=str(exc),
+        )
+    finally:
+        _agent_search_run_state.reset(state_token)
 
 
 async def _run_query_with_agent_context(
@@ -1685,7 +1916,9 @@ def create_query_routes(
 
             async def stream_generator():
                 status_queue: asyncio.Queue[dict[str, Any]] | None = (
-                    asyncio.Queue() if request.agent_search else None
+                    asyncio.Queue()
+                    if request.agent_search and request.stream_agent_status
+                    else None
                 )
                 agent_bundle: AgentSearchMergeBundle | None = None
                 result: dict[str, Any] | None = None
@@ -1695,9 +1928,10 @@ def create_query_routes(
                         loop = asyncio.get_running_loop()
                         heartbeat_interval_seconds = 5.0
                         last_heartbeat_at = loop.time()
-                        yield (
-                            f"{json.dumps({'agent_status': {'agent_search_id': None, 'phase': 'starting', 'message': 'agent_search started', 'event_type': 'local.started', 'opencode_session_id': None}})}\n"
-                        )
+                        if request.stream_agent_status:
+                            yield (
+                                f"{json.dumps({'agent_status': {'agent_search_id': None, 'phase': 'starting', 'message': 'agent_search started', 'event_type': 'local.started', 'opencode_session_id': None}})}\n"
+                            )
                         agent_task = asyncio.create_task(
                             _run_agent_search_pipeline_guarded(
                                 current_rag,
@@ -1736,7 +1970,7 @@ def create_query_routes(
                                 agent_status = status_queue.get_nowait()
                                 yield f"{json.dumps({'agent_status': agent_status})}\n"
 
-                    if agent_bundle is not None:
+                    if agent_bundle is not None and request.stream_agent_status:
                         yield (
                             f"{json.dumps({'agent_status': {'agent_search_id': agent_bundle.public_result.agent_search_id, 'phase': 'rag_started', 'message': 'agent_search completed, starting rag query', 'event_type': 'local.rag_started', 'opencode_session_id': agent_bundle.public_result.opencode_session_id}})}\n"
                         )
@@ -1848,59 +2082,55 @@ def create_query_routes(
                                             "items": {
                                                 "type": "object",
                                                 "properties": {
-                                                    "entity_name": {"type": "string"},
-                                                    "entity_type": {"type": "string"},
+                                                    "id": {"type": "string"},
                                                     "description": {"type": "string"},
-                                                    "source_id": {"type": "string"},
-                                                    "file_path": {"type": "string"},
-                                                    "reference_id": {"type": "string"},
                                                 },
+                                                "required": ["id", "description"],
                                             },
-                                            "description": "Retrieved entities from knowledge graph",
+                                            "description": "Retrieved entities with only identifier and description for LLM agent consumption",
                                         },
                                         "relationships": {
                                             "type": "array",
                                             "items": {
                                                 "type": "object",
                                                 "properties": {
-                                                    "src_id": {"type": "string"},
-                                                    "tgt_id": {"type": "string"},
+                                                    "id": {"type": "string"},
                                                     "description": {"type": "string"},
-                                                    "keywords": {"type": "string"},
-                                                    "weight": {"type": "number"},
-                                                    "source_id": {"type": "string"},
-                                                    "file_path": {"type": "string"},
-                                                    "reference_id": {"type": "string"},
                                                 },
+                                                "required": ["id", "description"],
                                             },
-                                            "description": "Retrieved relationships from knowledge graph",
+                                            "description": "Retrieved relationships with only identifier and description for LLM agent consumption",
                                         },
                                         "chunks": {
                                             "type": "array",
                                             "items": {
                                                 "type": "object",
                                                 "properties": {
-                                                    "content": {"type": "string"},
-                                                    "file_path": {"type": "string"},
                                                     "chunk_id": {"type": "string"},
-                                                    "reference_id": {"type": "string"},
+                                                    "full_doc_id": {
+                                                        "type": "string",
+                                                        "nullable": True,
+                                                    },
+                                                    "image_text": {
+                                                        "type": "string",
+                                                        "nullable": True,
+                                                    },
+                                                    "content_type": {
+                                                        "type": "string",
+                                                        "nullable": True,
+                                                    },
                                                 },
+                                                "required": [
+                                                    "chunk_id",
+                                                    "full_doc_id",
+                                                    "image_text",
+                                                    "content_type",
+                                                ],
                                             },
-                                            "description": "Retrieved text chunks from vector database",
-                                        },
-                                        "references": {
-                                            "type": "array",
-                                            "items": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "reference_id": {"type": "string"},
-                                                    "file_path": {"type": "string"},
-                                                },
-                                            },
-                                            "description": "Reference list for citation purposes",
+                                            "description": "Retrieved chunks with compact source and OCR metadata only",
                                         },
                                     },
-                                    "description": "Structured retrieval data containing entities, relationships, chunks, and references",
+                                    "description": "Agent-focused structured retrieval data. Unlike /query, this endpoint does not return a prompt string or reference list.",
                                 },
                                 "metadata": {
                                     "type": "object",
@@ -1955,38 +2185,22 @@ def create_query_routes(
                                     "data": {
                                         "entities": [
                                             {
-                                                "entity_name": "Neural Networks",
-                                                "entity_type": "CONCEPT",
+                                                "id": "Neural Networks",
                                                 "description": "Computational models inspired by biological neural networks",
-                                                "source_id": "chunk-123",
-                                                "file_path": "/documents/ai_basics.pdf",
-                                                "reference_id": "1",
                                             }
                                         ],
                                         "relationships": [
                                             {
-                                                "src_id": "Neural Networks",
-                                                "tgt_id": "Machine Learning",
+                                                "id": "Neural Networks -> Machine Learning",
                                                 "description": "Neural networks are a subset of machine learning algorithms",
-                                                "keywords": "subset, algorithm, learning",
-                                                "weight": 0.85,
-                                                "source_id": "chunk-123",
-                                                "file_path": "/documents/ai_basics.pdf",
-                                                "reference_id": "1",
                                             }
                                         ],
                                         "chunks": [
                                             {
-                                                "content": "Neural networks are computational models that mimic the way biological neural networks work...",
-                                                "file_path": "/documents/ai_basics.pdf",
                                                 "chunk_id": "chunk-123",
-                                                "reference_id": "1",
-                                            }
-                                        ],
-                                        "references": [
-                                            {
-                                                "reference_id": "1",
-                                                "file_path": "/documents/ai_basics.pdf",
+                                                "full_doc_id": "doc-ai-basics",
+                                                "image_text": None,
+                                                "content_type": "text",
                                             }
                                         ],
                                     },
@@ -2020,23 +2234,11 @@ def create_query_routes(
                                         "entities": [],
                                         "relationships": [
                                             {
-                                                "src_id": "Artificial Intelligence",
-                                                "tgt_id": "Machine Learning",
+                                                "id": "Artificial Intelligence -> Machine Learning",
                                                 "description": "AI encompasses machine learning as a core component",
-                                                "keywords": "encompasses, component, field",
-                                                "weight": 0.92,
-                                                "source_id": "chunk-456",
-                                                "file_path": "/documents/ai_overview.pdf",
-                                                "reference_id": "2",
                                             }
                                         ],
                                         "chunks": [],
-                                        "references": [
-                                            {
-                                                "reference_id": "2",
-                                                "file_path": "/documents/ai_overview.pdf",
-                                            }
-                                        ],
                                     },
                                     "metadata": {
                                         "query_mode": "global",
@@ -2062,16 +2264,10 @@ def create_query_routes(
                                         "relationships": [],
                                         "chunks": [
                                             {
-                                                "content": "Deep learning is a subset of machine learning that uses neural networks with multiple layers...",
-                                                "file_path": "/documents/deep_learning.pdf",
                                                 "chunk_id": "chunk-789",
-                                                "reference_id": "3",
-                                            }
-                                        ],
-                                        "references": [
-                                            {
-                                                "reference_id": "3",
-                                                "file_path": "/documents/deep_learning.pdf",
+                                                "full_doc_id": "doc-deep-learning",
+                                                "image_text": None,
+                                                "content_type": "text",
                                             }
                                         ],
                                     },
@@ -2117,23 +2313,25 @@ def create_query_routes(
     )
     async def query_data(request: QueryRequest):
         """
-        Advanced data retrieval endpoint for structured RAG analysis.
+        Advanced data retrieval endpoint for LLM-agent structured RAG data.
 
-        This endpoint provides raw retrieval results without LLM generation, perfect for:
-        - **Data Analysis**: Examine what information would be used for RAG
-        - **System Integration**: Get structured data for custom processing
-        - **Debugging**: Understand retrieval behavior and quality
-        - **Research**: Analyze knowledge graph structure and relationships
+        This endpoint follows the same request parameters, controls, and retrieval flow
+        as /query, but returns compact structured data instead of an LLM response prompt.
+        It is intended for:
+        - **LLM Agents**: Consume separated entities, relationships, and chunks
+        - **System Integration**: Get structured retrieval inputs for custom processing
+        - **Debugging**: Understand which structured items retrieval selected
 
         **Key Features:**
         - No LLM generation - pure data retrieval
-        - Complete structured output with entities, relationships, and chunks
-        - Always includes references for citation
+        - Same retrieval behavior as /query for the same parameters
+        - Compact structured output with entities, relationships, and chunks
+        - No prompt string and no reference list in data
         - Detailed metadata about processing and keywords
         - Compatible with all query modes and parameters
 
         **Query Mode Behaviors:**
-        - **local**: Returns entities and their direct relationships + related chunks
+        - **local**: Returns entities and their direct relationships plus related chunks
         - **global**: Returns relationship patterns across the knowledge graph
         - **hybrid**: Combines local and global retrieval strategies
         - **naive**: Returns only vector-retrieved text chunks (no knowledge graph)
@@ -2141,10 +2339,9 @@ def create_query_routes(
         - **bypass**: Returns empty data arrays (used for direct LLM queries)
 
         **Data Structure:**
-        - **entities**: Knowledge graph entities with descriptions and metadata
-        - **relationships**: Connections between entities with weights and descriptions
-        - **chunks**: Text segments from documents with source information
-        - **references**: Citation information mapping reference IDs to file paths
+        - **entities**: Objects with `id` and `description`
+        - **relationships**: Objects with `id` and `description`
+        - **chunks**: Objects with `chunk_id`, `full_doc_id`, `image_text`, and `content_type`
         - **metadata**: Processing information, keywords, and query statistics
 
         **Usage Examples:**
@@ -2190,7 +2387,6 @@ def create_query_routes(
         - **Empty arrays**: Normal for certain modes (e.g., naive mode has no entities/relationships)
         - **Processing info**: Shows retrieval statistics and token usage
         - **Keywords**: High-level and low-level keywords extracted from query
-        - **Reference mapping**: Links all data back to source documents
 
         Args:
             request (QueryRequest): The request object containing query parameters:
@@ -2206,7 +2402,7 @@ def create_query_routes(
             QueryDataResponse: Structured JSON response containing:
                 - **status**: "success" or "failure"
                 - **message**: Human-readable status description
-                - **data**: Complete retrieval results with entities, relationships, chunks, references
+                - **data**: Agent-focused retrieval results with entities, relationships, and chunks
                 - **metadata**: Query processing information and statistics
 
         Raises:
@@ -2215,8 +2411,8 @@ def create_query_routes(
                 - 500: Internal processing error (e.g., knowledge graph unavailable)
 
         Note:
-            This endpoint always includes references regardless of the include_references parameter,
-            as structured data analysis typically requires source attribution.
+            The `include_references` parameter only affects /query and /query/stream.
+            /query/data always returns the compact agent-focused structure above.
         """
         try:
             _log_query_request("/query/data", request)
@@ -2240,6 +2436,7 @@ def create_query_routes(
                     response["agent_search_result"] = agent_bundle.public_result.model_dump(
                         exclude_none=True
                     )
+                response = _format_query_data_for_agent(response)
                 return QueryDataResponse(**response)
             else:
                 # Handle unexpected response format

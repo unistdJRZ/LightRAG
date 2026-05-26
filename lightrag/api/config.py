@@ -5,7 +5,8 @@ Configs for the LightRAG API.
 import os
 import argparse
 import logging
-from dotenv import load_dotenv
+from pathlib import Path
+from dotenv import load_dotenv, dotenv_values
 from lightrag.utils import get_env_value
 from lightrag.llm.binding_options import (
     GeminiEmbeddingOptions,
@@ -43,10 +44,40 @@ from lightrag.constants import (
     DEFAULT_ENTITY_TYPES,
 )
 
-# use the .env that is inside the current folder
-# allows to use different .env file for each lightrag instance
-# the OS environment variables take precedence over the .env file
-load_dotenv(dotenv_path=".env", override=False)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CWD_ENV_PATH = Path.cwd() / ".env"
+_REPO_ENV_PATH = _REPO_ROOT / ".env"
+
+
+def _iter_env_paths() -> list[Path]:
+    env_paths = [_CWD_ENV_PATH]
+    if _REPO_ENV_PATH != _CWD_ENV_PATH:
+        env_paths.append(_REPO_ENV_PATH)
+    return env_paths
+
+
+def _load_env_files() -> None:
+    # Load the caller's .env first, then the repo root .env as a fallback for
+    # service launchers whose working directory is not the repository root.
+    for env_path in _iter_env_paths():
+        if env_path.exists():
+            load_dotenv(dotenv_path=env_path, override=False)
+
+
+def _get_dotenv_override_value(env_key: str) -> str | None:
+    # OCR_SERVER_URL is commonly edited in the repo .env during local service
+    # work; read it directly so a stale inherited process env does not pin OCR
+    # traffic to an old localhost endpoint.
+    for env_path in _iter_env_paths():
+        if not env_path.exists():
+            continue
+        value = dotenv_values(env_path).get(env_key)
+        if value:
+            return value.strip()
+    return None
+
+
+_load_env_files()
 
 
 ollama_server_infos = OllamaServerInfos()
@@ -444,7 +475,9 @@ def parse_args() -> argparse.Namespace:
     # PDF decryption password
     args.pdf_decrypt_password = get_env_value("PDF_DECRYPT_PASSWORD", None)
     # Added for /documents/register external OCR workflow
-    args.ocr_server_url = get_env_value("OCR_SERVER_URL", None)
+    args.ocr_server_url = _get_dotenv_override_value(
+        "OCR_SERVER_URL"
+    ) or get_env_value("OCR_SERVER_URL", None)
     args.ocr_poll_timeout_seconds = get_env_value(
         "OCR_POLL_TIMEOUT_SECONDS", 1800, int
     )

@@ -1006,32 +1006,38 @@ class LightRAG:
                         logger.debug("No processed documents found, skipping migration")
                         return
 
-                    # Check first few documents to see if they have full_entities/full_relations data
-                    migration_needed = True
-                    checked_count = 0
-                    max_check = min(5, len(processed_docs))  # Check up to 5 documents
+                    migration_candidates = {
+                        doc_id: doc_status
+                        for doc_id, doc_status in processed_docs.items()
+                        if self._should_migrate_full_entity_relation_data(doc_status)
+                    }
 
-                    for doc_id in list(processed_docs.keys())[:max_check]:
-                        checked_count += 1
+                    if not migration_candidates:
+                        logger.debug(
+                            "No processed documents require full_entities/full_relations migration"
+                        )
+                        return
+
+                    docs_missing_full_data = {}
+                    for doc_id, doc_status in migration_candidates.items():
                         entity_data = await self.full_entities.get_by_id(doc_id)
                         relation_data = await self.full_relations.get_by_id(doc_id)
 
-                        if entity_data or relation_data:
-                            migration_needed = False
-                            break
+                        if not entity_data and not relation_data:
+                            docs_missing_full_data[doc_id] = doc_status
 
-                    if not migration_needed:
+                    if not docs_missing_full_data:
                         logger.debug(
                             "Full entities/relations data already exists, no migration needed"
                         )
                         return
 
                     logger.info(
-                        f"Data migration needed: found {len(all_entity_labels)} entities in graph but no full_entities/full_relations data"
+                        f"Data migration needed: found {len(all_entity_labels)} entities in graph and {len(docs_missing_full_data)} processed documents without full_entities/full_relations data"
                     )
 
                     # Perform migration
-                    await self._migrate_entity_relation_data(processed_docs)
+                    await self._migrate_entity_relation_data(docs_missing_full_data)
 
                 except Exception as e:
                     logger.error(f"Error during migration check: {e}")
@@ -1040,6 +1046,20 @@ class LightRAG:
             except Exception as e:
                 logger.error(f"Error in data migration check: {e}")
                 raise e
+
+    @staticmethod
+    def _should_migrate_full_entity_relation_data(doc_status: Any) -> bool:
+        """Return whether a processed document should have full KG metadata."""
+        metadata = getattr(doc_status, "metadata", None)
+        if metadata is None and isinstance(doc_status, dict):
+            metadata = doc_status.get("metadata")
+        if not isinstance(metadata, dict):
+            return True
+
+        kg_extraction_status = str(
+            metadata.get("kg_extraction_status") or ""
+        ).strip().lower()
+        return kg_extraction_status != "pending"
 
     async def _migrate_entity_relation_data(self, processed_docs: dict):
         """Migrate existing entity and relation data to full_entities and full_relations storage"""
@@ -1106,9 +1126,10 @@ class LightRAG:
         migration_count = 0
 
         # Store entities
-        if doc_entities:
+        if processed_docs:
             entities_data = {}
-            for doc_id, entity_set in doc_entities.items():
+            for doc_id in processed_docs.keys():
+                entity_set = doc_entities.get(doc_id, set())
                 entities_data[doc_id] = {
                     "entity_names": list(entity_set),
                     "count": len(entity_set),
@@ -1116,9 +1137,10 @@ class LightRAG:
             await self.full_entities.upsert(entities_data)
 
         # Store relations
-        if doc_relations:
+        if processed_docs:
             relations_data = {}
-            for doc_id, relation_set in doc_relations.items():
+            for doc_id in processed_docs.keys():
+                relation_set = doc_relations.get(doc_id, set())
                 # Convert tuples back to lists
                 relations_data[doc_id] = {
                     "relation_pairs": [list(pair) for pair in relation_set],
@@ -1126,9 +1148,7 @@ class LightRAG:
                 }
             await self.full_relations.upsert(relations_data)
 
-        migration_count = len(
-            set(list(doc_entities.keys()) + list(doc_relations.keys()))
-        )
+        migration_count = len(processed_docs)
 
         # Persist the migrated data
         await self.full_entities.index_done_callback()
@@ -1317,6 +1337,7 @@ class LightRAG:
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
         meta_info: dict[str, Any] | None = None,
+        extract_kg: bool = True,
     ) -> str:
         """Sync Insert documents with checkpoint support
 
@@ -1344,6 +1365,7 @@ class LightRAG:
                 file_paths,
                 track_id,
                 meta_info,
+                extract_kg,
             )
         )
 
@@ -1356,6 +1378,7 @@ class LightRAG:
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
         meta_info: dict[str, Any] | None = None,
+        extract_kg: bool = True,
     ) -> str:
         """Async Insert documents with checkpoint support
 
@@ -1385,7 +1408,7 @@ class LightRAG:
             meta_info=meta_info,
         )
         await self.apipeline_process_enqueue_documents(
-            split_by_character, split_by_character_only
+            split_by_character, split_by_character_only, extract_kg=extract_kg
         )
 
         return track_id
@@ -2019,16 +2042,17 @@ class LightRAG:
         self,
         split_by_character: str | None = None,
         split_by_character_only: bool = False,
+        extract_kg: bool = True,
     ) -> None:
         """
         Process pending documents by splitting them into chunks, processing
-        each chunk for entity and relation extraction, and updating the
+        each chunk for optional entity and relation extraction, and updating the
         document status.
 
         1. Get all pending, failed, and abnormally terminated processing documents.
         2. Validate document data consistency and fix any issues
         3. Split document content into chunks
-        4. Process each chunk for entity and relation extraction
+        4. Optionally process each chunk for entity and relation extraction
         5. Update the document status
         """
 
@@ -2336,12 +2360,15 @@ class LightRAG:
                                 text_chunks_task,
                             ]
                             entity_relation_task = None
+                            kg_extraction_status = (
+                                "completed" if extract_kg else "pending"
+                            )
 
                             # Execute first stage tasks
                             await asyncio.gather(*first_stage_tasks)
 
                             # Stage 2: Process entity relation graph (after text_chunks are saved)
-                            if entity_extractable_chunks:
+                            if extract_kg and entity_extractable_chunks:
                                 entity_relation_task = asyncio.create_task(
                                     self._process_extract_entities(
                                         entity_extractable_chunks,
@@ -2351,6 +2378,12 @@ class LightRAG:
                                 )
                                 chunk_results = await entity_relation_task
                             else:
+                                if not extract_kg and entity_extractable_chunks:
+                                    logger.info(
+                                        "Skipping KG extraction for %d chunks in %s",
+                                        len(entity_extractable_chunks),
+                                        file_path,
+                                    )
                                 chunk_results = []
                             file_extraction_stage_ok = True
 
@@ -2446,30 +2479,35 @@ class LightRAG:
                                             "User cancelled"
                                         )
 
-                                # Use chunk_results from entity_relation_task
-                                await merge_nodes_and_edges(
-                                    chunk_results=chunk_results,  # result collected from entity_relation_task
-                                    knowledge_graph_inst=self.chunk_entity_relation_graph,
-                                    entity_vdb=self.entities_vdb,
-                                    relationships_vdb=self.relationships_vdb,
-                                    global_config=asdict(self),
-                                    full_entities_storage=self.full_entities,
-                                    full_relations_storage=self.full_relations,
-                                    doc_id=doc_id,
-                                    pipeline_status=pipeline_status,
-                                    pipeline_status_lock=pipeline_status_lock,
-                                    llm_response_cache=self.llm_response_cache,
-                                    entity_chunks_storage=self.entity_chunks,
-                                    relation_chunks_storage=self.relation_chunks,
-                                    current_file_number=current_file_number,
-                                    total_files=total_files,
-                                    file_path=file_path,
-                                )
+                                if extract_kg:
+                                    # Use chunk_results from entity_relation_task
+                                    await merge_nodes_and_edges(
+                                        chunk_results=chunk_results,  # result collected from entity_relation_task
+                                        knowledge_graph_inst=self.chunk_entity_relation_graph,
+                                        entity_vdb=self.entities_vdb,
+                                        relationships_vdb=self.relationships_vdb,
+                                        global_config=asdict(self),
+                                        full_entities_storage=self.full_entities,
+                                        full_relations_storage=self.full_relations,
+                                        doc_id=doc_id,
+                                        pipeline_status=pipeline_status,
+                                        pipeline_status_lock=pipeline_status_lock,
+                                        llm_response_cache=self.llm_response_cache,
+                                        entity_chunks_storage=self.entity_chunks,
+                                        relation_chunks_storage=self.relation_chunks,
+                                        current_file_number=current_file_number,
+                                        total_files=total_files,
+                                        file_path=file_path,
+                                    )
+                                    if entity_extractable_chunks:
+                                        await self.text_chunks.mark_chunks_extracted(
+                                            list(entity_extractable_chunks.keys()), True
+                                        )
 
-                                await self._process_doc_qa_pairs(
-                                    doc_id=doc_id,
-                                    document_text=content,
-                                )
+                                    await self._process_doc_qa_pairs(
+                                        doc_id=doc_id,
+                                        document_text=content,
+                                    )
 
                                 # Record processing end time
                                 processing_end_time = int(time.time())
@@ -2492,6 +2530,7 @@ class LightRAG:
                                                 **existing_metadata,
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
+                                                "kg_extraction_status": kg_extraction_status,
                                             },
                                         }
                                     }
@@ -2669,10 +2708,130 @@ class LightRAG:
         except Exception as e:
             error_msg = f"Failed to extract entities and relationships: {str(e)}"
             logger.error(error_msg)
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = error_msg
-                pipeline_status["history_messages"].append(error_msg)
+            if pipeline_status is not None and pipeline_status_lock is not None:
+                async with pipeline_status_lock:
+                    pipeline_status["latest_message"] = error_msg
+                    pipeline_status["history_messages"].append(error_msg)
             raise e
+
+    def extract_pending_kg(self, limit: int = 1000) -> int:
+        """Synchronously extract KG for chunks imported without KG extraction."""
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(self.aextract_pending_kg(limit=limit))
+
+    async def aextract_pending_kg(self, limit: int = 1000) -> int:
+        """Extract and merge KG for chunks whose extracted_kg flag is false."""
+        pipeline_status = await get_namespace_data(
+            "pipeline_status", workspace=self.workspace
+        )
+        pipeline_status_lock = get_namespace_lock(
+            "pipeline_status", workspace=self.workspace
+        )
+
+        async with pipeline_status_lock:
+            if pipeline_status.get("busy", False):
+                raise RuntimeError("Cannot extract pending KG while pipeline is busy")
+            pipeline_status.update(
+                {
+                    "busy": True,
+                    "job_name": "Extracting Pending KG",
+                    "job_start": datetime.now(timezone.utc).isoformat(),
+                    "docs": 0,
+                    "batchs": 0,
+                    "cur_batch": 0,
+                    "request_pending": False,
+                    "cancellation_requested": False,
+                    "latest_message": "Scanning chunks pending KG extraction",
+                }
+            )
+            del pipeline_status["history_messages"][:]
+            pipeline_status["history_messages"].append(
+                "Scanning chunks pending KG extraction"
+            )
+
+        processed_chunks = 0
+        completed = False
+        try:
+            pending_chunks = await self.text_chunks.get_unextracted_chunks(limit)
+            if not pending_chunks:
+                async with pipeline_status_lock:
+                    pipeline_status["latest_message"] = "No chunks pending KG extraction"
+                    pipeline_status["history_messages"].append(
+                        "No chunks pending KG extraction"
+                    )
+                completed = True
+                return 0
+
+            chunks_by_doc: dict[str, dict[str, Any]] = {}
+            for chunk_id, chunk_data in pending_chunks.items():
+                doc_id = str(chunk_data.get("full_doc_id") or "")
+                chunks_by_doc.setdefault(doc_id, {})[chunk_id] = chunk_data
+
+            total_docs = len(chunks_by_doc)
+            async with pipeline_status_lock:
+                pipeline_status["docs"] = total_docs
+                pipeline_status["batchs"] = total_docs
+                pipeline_status["latest_message"] = (
+                    f"Extracting KG for {len(pending_chunks)} pending chunks"
+                )
+                pipeline_status["history_messages"].append(
+                    pipeline_status["latest_message"]
+                )
+
+            for index, (doc_id, doc_chunks) in enumerate(chunks_by_doc.items(), 1):
+                async with pipeline_status_lock:
+                    if pipeline_status.get("cancellation_requested", False):
+                        raise PipelineCancelledException("User cancelled")
+                    pipeline_status["cur_batch"] = index
+                    pipeline_status["latest_message"] = (
+                        f"Extracting pending KG {index}/{total_docs}: {doc_id or 'unknown_doc'}"
+                    )
+                    pipeline_status["history_messages"].append(
+                        pipeline_status["latest_message"]
+                    )
+
+                chunk_results = await self._process_extract_entities(
+                    doc_chunks,
+                    pipeline_status,
+                    pipeline_status_lock,
+                )
+                await merge_nodes_and_edges(
+                    chunk_results=chunk_results,
+                    knowledge_graph_inst=self.chunk_entity_relation_graph,
+                    entity_vdb=self.entities_vdb,
+                    relationships_vdb=self.relationships_vdb,
+                    global_config=asdict(self),
+                    full_entities_storage=self.full_entities,
+                    full_relations_storage=self.full_relations,
+                    doc_id=doc_id or None,
+                    pipeline_status=pipeline_status,
+                    pipeline_status_lock=pipeline_status_lock,
+                    llm_response_cache=self.llm_response_cache,
+                    entity_chunks_storage=self.entity_chunks,
+                    relation_chunks_storage=self.relation_chunks,
+                    current_file_number=index,
+                    total_files=total_docs,
+                    file_path=next(iter(doc_chunks.values())).get(
+                        "file_path", "unknown_source"
+                    ),
+                )
+                await self.text_chunks.mark_chunks_extracted(list(doc_chunks.keys()), True)
+                processed_chunks += len(doc_chunks)
+
+            await self._insert_done(pipeline_status, pipeline_status_lock)
+            completed = True
+            return processed_chunks
+        finally:
+            async with pipeline_status_lock:
+                pipeline_status["busy"] = False
+                pipeline_status["cancellation_requested"] = False
+                final_state = "completed" if completed else "stopped"
+                pipeline_status["latest_message"] = (
+                    f"Pending KG extraction {final_state}: {processed_chunks} chunks"
+                )
+                pipeline_status["history_messages"].append(
+                    pipeline_status["latest_message"]
+                )
 
     async def _process_doc_qa_pairs(
         self,

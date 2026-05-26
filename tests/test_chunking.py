@@ -1277,9 +1277,13 @@ class _FakeFullDocsStorage:
 class _FakeTextChunksStorage:
     def __init__(self):
         self.records: dict[str, dict] = {}
+        self.marked: list[tuple[list[str], bool]] = []
 
     async def upsert(self, data: dict[str, dict]):
         self.records.update({chunk_id: dict(payload) for chunk_id, payload in data.items()})
+
+    async def mark_chunks_extracted(self, ids: list[str], extracted: bool = True):
+        self.marked.append((ids, extracted))
 
 
 class _FakeVectorStorage:
@@ -1288,6 +1292,94 @@ class _FakeVectorStorage:
 
     async def upsert(self, data: dict[str, dict]):
         self.upserts.append(dict(data))
+
+
+class _FakeFullEntityRelationStorage:
+    def __init__(self):
+        self.records: dict[str, dict] = {}
+        self.index_done_calls = 0
+
+    async def get_by_id(self, doc_id: str):
+        record = self.records.get(doc_id)
+        return dict(record) if record is not None else None
+
+    async def upsert(self, data: dict[str, dict]):
+        self.records.update({doc_id: dict(payload) for doc_id, payload in data.items()})
+
+    async def index_done_callback(self):
+        self.index_done_calls += 1
+
+
+class _FakeGraphStorage:
+    async def get_all_labels(self):
+        return ["Entity"]
+
+    async def get_all_nodes(self):
+        return []
+
+    async def get_all_edges(self):
+        return []
+
+
+@pytest.mark.offline
+def test_check_and_migrate_data_skips_pending_kg_documents_and_marks_empty_docs():
+    workspace = f"test-migration-skip-pending-{uuid.uuid4().hex}"
+    initialize_share_data()
+
+    async def _run():
+        await initialize_pipeline_status(workspace)
+        created_at = "2025-01-01T00:00:00+00:00"
+
+        rag = LightRAG.__new__(LightRAG)
+        rag.workspace = workspace
+        rag.chunk_entity_relation_graph = _FakeGraphStorage()
+        rag.entity_chunks = None
+        rag.relation_chunks = None
+        rag.full_entities = _FakeFullEntityRelationStorage()
+        rag.full_relations = _FakeFullEntityRelationStorage()
+        rag.doc_status = _FakeDocStatusStorage(
+            {
+                "doc-pending-kg": {
+                    "status": DocStatus.PROCESSED,
+                    "content_summary": "summary",
+                    "content_length": 11,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "file_path": "pending.txt",
+                    "chunks_list": ["chunk-pending"],
+                    "metadata": {"kg_extraction_status": "pending"},
+                },
+                "doc-completed-empty": {
+                    "status": DocStatus.PROCESSED,
+                    "content_summary": "summary",
+                    "content_length": 11,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "file_path": "completed.txt",
+                    "chunks_list": ["chunk-completed"],
+                    "metadata": {"kg_extraction_status": "completed"},
+                },
+            }
+        )
+
+        await rag.check_and_migrate_data()
+
+        assert "doc-pending-kg" not in rag.full_entities.records
+        assert "doc-pending-kg" not in rag.full_relations.records
+        assert rag.full_entities.records["doc-completed-empty"] == {
+            "entity_names": [],
+            "count": 0,
+        }
+        assert rag.full_relations.records["doc-completed-empty"] == {
+            "relation_pairs": [],
+            "count": 0,
+        }
+
+        await rag.check_and_migrate_data()
+        assert rag.full_entities.index_done_calls == 1
+        assert rag.full_relations.index_done_calls == 1
+
+    asyncio.run(_run())
 
 
 @pytest.mark.offline
@@ -1361,6 +1453,75 @@ def test_apipeline_process_enqueue_documents_preserves_chunk_metadata_on_failed_
     assert final_status["chunks_count"] == 1
     assert final_status["chunks_list"] == stored_chunk_ids
     assert len(stored_chunk_ids) == 1
+
+
+@pytest.mark.offline
+def test_apipeline_process_enqueue_documents_can_skip_kg_and_qa_extraction():
+    workspace = f"test-skip-kg-{uuid.uuid4().hex}"
+    initialize_share_data()
+    asyncio.run(initialize_pipeline_status(workspace))
+
+    doc_id = "doc-test"
+    created_at = "2025-01-01T00:00:00+00:00"
+
+    rag = LightRAG.__new__(LightRAG)
+    rag.workspace = workspace
+    rag.max_parallel_insert = 1
+    rag.doc_status = _FakeDocStatusStorage(
+        {
+            doc_id: {
+                "status": DocStatus.PENDING,
+                "content_summary": "summary",
+                "content_length": 11,
+                "created_at": created_at,
+                "updated_at": created_at,
+                "file_path": "doc.txt",
+                "track_id": "track-1",
+                "metadata": {},
+            }
+        }
+    )
+    rag.full_docs = _FakeFullDocsStorage(
+        {
+            doc_id: {
+                "content": "hello world",
+                "file_path": "doc.txt",
+            }
+        }
+    )
+    rag.text_chunks = _FakeTextChunksStorage()
+    rag.chunks_vdb = _FakeVectorStorage()
+    rag._embedding_vlm_enabled = lambda: False
+
+    async def _fake_chunk_document_content(*args, **kwargs):
+        return [
+            {
+                "content": "hello world",
+                "tokens": 2,
+                "chunk_order_index": 0,
+            }
+        ]
+
+    async def _unexpected_extract(*args, **kwargs):
+        raise AssertionError("KG extraction should be skipped")
+
+    async def _unexpected_qa(*args, **kwargs):
+        raise AssertionError("QA extraction should be skipped")
+
+    async def _fake_insert_done(*args, **kwargs):
+        return None
+
+    rag._chunk_document_content = _fake_chunk_document_content
+    rag._process_extract_entities = _unexpected_extract
+    rag._process_doc_qa_pairs = _unexpected_qa
+    rag._insert_done = _fake_insert_done
+
+    asyncio.run(rag.apipeline_process_enqueue_documents(extract_kg=False))
+
+    final_status = rag.doc_status.records[doc_id]
+    assert final_status["status"] == DocStatus.PROCESSED
+    assert final_status["metadata"]["kg_extraction_status"] == "pending"
+    assert rag.text_chunks.marked == []
 
 
 @pytest.mark.offline

@@ -229,6 +229,72 @@ def test_chunk_search_endpoint_returns_rows_and_builds_sql():
     assert db.last_multirows is True
 
 
+def test_workspace_info_returns_description_and_alias():
+    create_agent_routes = _load_create_agent_routes()
+    db = _FakeDB(
+        [
+            {
+                "description": "Contains MSRE representative documents for agent routing.",
+            }
+        ]
+    )
+    app = FastAPI()
+    app.include_router(
+        create_agent_routes(
+            rag_by_workspace={
+                "msre": _FakeRAG(_FakeTextChunks(db, workspace="msre")),
+            },
+            workspace="msre",
+            workspace_display_names={"msre": "MSRE Docs"},
+        )
+    )
+    client = TestClient(app)
+
+    response = client.get("/agent/workspace_info")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "workspace": "msre",
+        "alias": "MSRE Docs",
+        "description": "Contains MSRE representative documents for agent routing.",
+        "has_description": True,
+    }
+    assert "FROM LIGHTRAG_WORKSPACE_INFO" in db.last_sql
+    assert db.last_params == ["msre"]
+    assert db.last_multirows is True
+
+
+def test_workspace_info_uses_workspace_from_body_and_returns_empty_description():
+    create_agent_routes = _load_create_agent_routes()
+    default_db = _FakeDB([])
+    team_db = _FakeDB([])
+    app = FastAPI()
+    app.include_router(
+        create_agent_routes(
+            rag_by_workspace={
+                "default": _FakeRAG(_FakeTextChunks(default_db, workspace="default")),
+                "team-a": _FakeRAG(_FakeTextChunks(team_db, workspace="team-a")),
+            },
+            workspace="default",
+            workspace_aliases={"Team A": "team-a"},
+            workspace_display_names={"team-a": "Team A"},
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post("/agent/workspace_info", json={"workspace": "Team A"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "workspace": "team-a",
+        "alias": "Team A",
+        "description": "",
+        "has_description": False,
+    }
+    assert default_db.last_sql is None
+    assert team_db.last_params == ["team-a"]
+
+
 def test_chunk_search_accepts_full_doc_id_alias_and_string_content_type():
     client, db = _build_test_client(_FakeRAG(_FakeTextChunks(_FakeDB([]))))
 

@@ -8,10 +8,12 @@ import { useAuthStore, useBackendState } from '@/stores/state'
 import { cn } from '@/lib/utils'
 import { useTranslation } from 'react-i18next'
 import { navigationService } from '@/services/navigation'
-import { ZapIcon, GithubIcon, LogOutIcon } from 'lucide-react'
+import { FileTextIcon, ZapIcon, GithubIcon, LogOutIcon } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/Tooltip'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/Select'
-import { getWorkspaces } from '@/api/lightrag'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/Dialog'
+import Textarea from '@/components/ui/Textarea'
+import { getWorkspaces, updateWorkspaceDescription } from '@/api/lightrag'
 
 interface NavigationTabProps {
   value: string
@@ -68,6 +70,10 @@ function WorkspaceSelector() {
   const setWorkspace = useSettingsStore.use.setWorkspace()
   const setWorkspaceInfo = useSettingsStore.use.setWorkspaceInfo()
   const [isLoading, setIsLoading] = useState(false)
+  const [isDialogOpen, setIsDialogOpen] = useState(false)
+  const [descriptionDraft, setDescriptionDraft] = useState('')
+  const [isSaving, setIsSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   const workspaceOptions = useMemo(() => {
     if (availableWorkspaces.length > 0) {
@@ -80,6 +86,8 @@ function WorkspaceSelector() {
     workspace && workspaceOptions.some((item) => item.id === workspace)
       ? workspace
       : defaultWorkspace
+  const selectedWorkspaceOption = workspaceOptions.find((item) => item.id === selectedWorkspace)
+  const selectedWorkspaceDescription = selectedWorkspaceOption?.description || ''
 
   useEffect(() => {
     let cancelled = false
@@ -115,27 +123,100 @@ function WorkspaceSelector() {
     useBackendState.getState().resetHealthCheckTimer()
   }, [defaultWorkspace, setWorkspace])
 
+  const handleOpenDescriptionDialog = useCallback(() => {
+    setDescriptionDraft(selectedWorkspaceDescription)
+    setSaveError(null)
+    setIsDialogOpen(true)
+  }, [selectedWorkspaceDescription])
+
+  const handleSaveDescription = useCallback(async () => {
+    setIsSaving(true)
+    setSaveError(null)
+    try {
+      const updated = await updateWorkspaceDescription(selectedWorkspace, descriptionDraft)
+      const nextWorkspaces = workspaceOptions.map((item) =>
+        item.id === updated.id
+          ? {
+            ...item,
+            alias: updated.alias,
+            description: updated.description,
+            has_description: updated.has_description
+          }
+          : item
+      )
+      setWorkspaceInfo(nextWorkspaces, defaultWorkspace)
+      setIsDialogOpen(false)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setSaveError(message)
+      console.warn('Failed to save workspace description:', error)
+    } finally {
+      setIsSaving(false)
+    }
+  }, [defaultWorkspace, descriptionDraft, selectedWorkspace, setWorkspaceInfo, workspaceOptions])
+
   return (
-    <div className="w-[180px]">
-      <span className="sr-only">{t('header.workspace', 'Workspace')}</span>
-      <Select
-        value={selectedWorkspace}
-        onValueChange={handleWorkspaceChange}
+    <div className="flex items-center gap-1">
+      <div className="w-[180px]">
+        <span className="sr-only">{t('header.workspace', 'Workspace')}</span>
+        <Select
+          value={selectedWorkspace}
+          onValueChange={handleWorkspaceChange}
+          disabled={isLoading || workspaceOptions.length === 0}
+        >
+          <SelectTrigger className="h-8 text-xs">
+            <SelectValue placeholder={t('header.workspace', 'Workspace')} />
+          </SelectTrigger>
+          <SelectContent>
+            {workspaceOptions.map((item) => (
+              <SelectItem key={item.id} value={item.id}>
+                {item.id === defaultWorkspace
+                  ? `${item.alias} (${t('header.defaultWorkspace', 'default')})`
+                  : item.alias}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="size-8"
+        side="bottom"
+        tooltip={selectedWorkspaceDescription || t('header.workspaceDescription', 'Workspace description')}
+        onClick={handleOpenDescriptionDialog}
         disabled={isLoading || workspaceOptions.length === 0}
       >
-        <SelectTrigger className="h-8 text-xs">
-          <SelectValue placeholder={t('header.workspace', 'Workspace')} />
-        </SelectTrigger>
-        <SelectContent>
-          {workspaceOptions.map((item) => (
-            <SelectItem key={item.id} value={item.id}>
-              {item.id === defaultWorkspace
-                ? `${item.alias} (${t('header.defaultWorkspace', 'default')})`
-                : item.alias}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+        <FileTextIcon className="size-4" aria-hidden="true" />
+      </Button>
+      <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>{t('header.workspaceDescription', 'Workspace description')}</DialogTitle>
+            <DialogDescription>
+              {selectedWorkspaceOption?.alias || selectedWorkspace}
+            </DialogDescription>
+          </DialogHeader>
+          <Textarea
+            value={descriptionDraft}
+            onChange={(event) => setDescriptionDraft(event.target.value)}
+            placeholder={t('header.workspaceDescriptionPlaceholder', 'Describe what this workspace contains.')}
+            className="min-h-32"
+            disabled={isSaving}
+          />
+          {saveError && (
+            <p className="text-destructive text-sm">{saveError}</p>
+          )}
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setIsDialogOpen(false)} disabled={isSaving}>
+              {t('common.cancel', 'Cancel')}
+            </Button>
+            <Button onClick={handleSaveDescription} disabled={isSaving}>
+              {isSaving ? t('common.saving', 'Saving...') : t('common.save', 'Save')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

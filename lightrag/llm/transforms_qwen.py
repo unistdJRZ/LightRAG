@@ -444,6 +444,10 @@ def _build_message_content(item: dict[str, Any]) -> list[dict[str, Any]]:
     return content
 
 
+def _has_visual_inputs(image_inputs: Any, video_inputs: Any) -> bool:
+    return bool(image_inputs) or bool(video_inputs)
+
+
 def _resolve_model_runtime_kwargs(
     torch_dtype: str | None = None,
     attn_implementation: str | None = None,
@@ -627,7 +631,11 @@ def _run_embedding_sync(
                 "padding": True,
                 "return_tensors": "pt",
             }
-            if max_token_size and max_token_size > 0:
+            if (
+                max_token_size
+                and max_token_size > 0
+                and not _has_visual_inputs(image_inputs, video_inputs)
+            ):
                 processor_kwargs["truncation"] = True
                 processor_kwargs["max_length"] = max_token_size
 
@@ -748,7 +756,11 @@ def _run_rerank_sync(
             "padding": True,
             "return_tensors": "pt",
         }
-        if max_token_size and max_token_size > 0:
+        if (
+            max_token_size
+            and max_token_size > 0
+            and not _has_visual_inputs(image_inputs, video_inputs)
+        ):
             processor_kwargs["truncation"] = True
             processor_kwargs["max_length"] = max_token_size
 

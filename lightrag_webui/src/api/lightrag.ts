@@ -140,6 +140,8 @@ export type QueryRequest = {
   enable_rerank?: boolean
   /** If True, forwards history + query to the configured OpenCode RAG search agent and merges its submitted results into the final output. */
   agent_search?: boolean
+  /** If True, emits intermediate agent search status events from /query/stream. */
+  stream_agent_status?: boolean
 }
 
 export type QueryReference = {
@@ -398,8 +400,17 @@ export type WorkspacesResponse = {
   workspaces: Array<{
     id: string
     alias: string
+    description?: string
+    has_description?: boolean
   }>
   count: number
+}
+
+export type WorkspaceInfo = {
+  id: string
+  alias: string
+  description: string
+  has_description: boolean
 }
 
 export type PipelineStatusResponse = {
@@ -682,6 +693,17 @@ export const getWorkspaces = async (): Promise<WorkspacesResponse> => {
     }
     throw error
   }
+}
+
+export const updateWorkspaceDescription = async (
+  workspace: string,
+  description: string
+): Promise<WorkspaceInfo> => {
+  const response = await axiosInstance.put(
+    `/workspaces/${encodeURIComponent(workspace)}/description`,
+    { description }
+  )
+  return response.data
 }
 
 export const getDocuments = async (): Promise<DocsStatusesResponse> => {

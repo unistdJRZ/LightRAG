@@ -249,6 +249,10 @@ class InsertTextRequest(BaseModel):
         description="The text to insert",
     )
     file_source: str = Field(default=None, min_length=0, description="File Source")
+    extract_kg: bool = Field(
+        default=True,
+        description="Whether to extract and merge KG during import. Set false to import chunks and embeddings only.",
+    )
 
     @field_validator("text", mode="after")
     @classmethod
@@ -287,6 +291,10 @@ class InsertTextsRequest(BaseModel):
     )
     file_sources: list[str] = Field(
         default=None, min_length=0, description="Sources of the texts"
+    )
+    extract_kg: bool = Field(
+        default=True,
+        description="Whether to extract and merge KG during import. Set false to import chunks and embeddings only.",
     )
 
     @field_validator("texts", mode="after")
@@ -333,6 +341,14 @@ class RegisterDocumentRequest(BaseModel):
         min_length=1,
         description="OCR result ID from external OCR service. Required for PDF/image files.",
     )
+    ocr_router: bool = Field(
+        default=False,
+        description="Use OCR server content_router endpoint instead of content endpoint.",
+    )
+    extract_kg: bool = Field(
+        default=True,
+        description="Whether to extract and merge KG during import. Set false to import chunks and embeddings only.",
+    )
 
     @field_validator("file_id", mode="after")
     @classmethod
@@ -355,6 +371,7 @@ class RegisterDocumentRequest(BaseModel):
                 "file_id": "main-framework-file-001",
                 "file_path": "/data/docs/contract-001.pdf",
                 "ocr_id": "ocr-task-001",
+                "ocr_router": False,
             }
         }
 
@@ -410,6 +427,30 @@ class RegisterDocumentResponse(InsertResponse):
                 },
             ]
         }
+
+
+class ExtractPendingKGRequest(BaseModel):
+    """Request model for offline KG extraction from imported chunks."""
+
+    workspace: Optional[str] = Field(
+        default=None,
+        description="Target workspace for this request.",
+    )
+    limit: int = Field(
+        default=1000,
+        ge=1,
+        le=100000,
+        description="Maximum number of unextracted chunks to process in this run.",
+    )
+
+
+class ExtractPendingKGResponse(BaseModel):
+    """Response model for starting offline KG extraction."""
+
+    status: Literal["success", "busy", "failure"] = Field(
+        description="Status of the operation"
+    )
+    message: str = Field(description="Message describing the operation result")
 
 
 class ClearDocumentsResponse(BaseModel):
@@ -1850,7 +1891,20 @@ async def _extract_text_from_ocr_response(response: aiohttp.ClientResponse) -> s
         return response_body
 
 
-async def _fetch_text_from_ocr_server(ocr_id: str) -> str | dict[str, Any]:
+def _resolve_ocr_content_url(ocr_server_url: str, ocr_router: bool = False) -> str:
+    """Resolve OCR server content endpoint from a base URL or endpoint URL."""
+    endpoint = "content_router" if ocr_router else "content"
+    base_url = ocr_server_url.rstrip("/")
+    for known_endpoint in ("/content", "/content_router"):
+        if base_url.endswith(known_endpoint):
+            base_url = base_url[: -len(known_endpoint)]
+            break
+    return f"{base_url}/{endpoint}"
+
+
+async def _fetch_text_from_ocr_server(
+    ocr_id: str, ocr_router: bool = False
+) -> str | dict[str, Any]:
     """Fetch OCR content by ocr_id from external OCR server /content endpoint."""
     ocr_server_url = getattr(global_args, "ocr_server_url", None)
     if not ocr_server_url:
@@ -1858,10 +1912,7 @@ async def _fetch_text_from_ocr_server(ocr_id: str) -> str | dict[str, Any]:
     ocr_request_timeout_seconds = getattr(global_args, "ocr_request_timeout_seconds", 300)
     ocr_poll_timeout_seconds = getattr(global_args, "ocr_poll_timeout_seconds", 1800)
 
-    base_url = ocr_server_url.rstrip("/")
-    content_url = (
-        base_url if base_url.endswith("/content") else f"{base_url}/content"
-    )
+    content_url = _resolve_ocr_content_url(ocr_server_url, ocr_router=ocr_router)
     timeout = aiohttp.ClientTimeout(total=ocr_request_timeout_seconds)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + ocr_poll_timeout_seconds
@@ -1933,6 +1984,7 @@ async def pipeline_enqueue_file(
     track_id: str = None,
     file_source: Optional[str] = None,
     ocr_id: Optional[str] = None,
+    ocr_router: bool = False,
     move_to_enqueued: bool = True,
     meta_info: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, str]:
@@ -1944,6 +1996,7 @@ async def pipeline_enqueue_file(
         track_id: Optional tracking ID, if not provided will be generated
         file_source: Optional file source used for document citation
         ocr_id: Optional OCR task ID used by external OCR workflow
+        ocr_router: Whether to fetch OCR result from content_router endpoint
         move_to_enqueued: Whether to move the source file into __enqueued__ directory
         meta_info: Optional metadata passed through enqueue pipeline into doc_status.metadata.meta_info
     Returns:
@@ -1963,6 +2016,7 @@ async def pipeline_enqueue_file(
         retryable_ocr_metadata = {}
         if ocr_id:
             retryable_ocr_metadata["ocr_id"] = ocr_id
+            retryable_ocr_metadata["ocr_router"] = ocr_router
             if meta_info:
                 retryable_ocr_metadata["meta_info"] = dict(meta_info)
             if file_source:
@@ -2128,7 +2182,9 @@ async def pipeline_enqueue_file(
                         # Added for /documents/register:
                         # when ocr_id is provided, use external OCR result instead of local PDF parsing.
                         if ocr_id:
-                            content = await _fetch_text_from_ocr_server(ocr_id)
+                            content = await _fetch_text_from_ocr_server(
+                                ocr_id, ocr_router=ocr_router
+                            )
                             content_from_ocr = True
                         else:
                             # Try DOCLING first if configured and available
@@ -2175,7 +2231,9 @@ async def pipeline_enqueue_file(
                                 "ocr_id is required for image files in register workflow"
                             )
                         # Added for /documents/register image flow: always load text from OCR service.
-                        content = await _fetch_text_from_ocr_server(ocr_id)
+                        content = await _fetch_text_from_ocr_server(
+                            ocr_id, ocr_router=ocr_router
+                        )
                         content_from_ocr = True
                     except Exception as e:
                         error_files = [
@@ -2515,7 +2573,9 @@ async def pipeline_index_registered_file(
     file_source: str,
     track_id: str,
     ocr_id: Optional[str] = None,
+    ocr_router: bool = False,
     meta_info: Optional[dict[str, Any]] = None,
+    extract_kg: bool = True,
 ):
     """Index a file registered by external framework without uploading/moving it."""
     try:
@@ -2525,11 +2585,12 @@ async def pipeline_index_registered_file(
             track_id,
             file_source=file_source,
             ocr_id=ocr_id,
+            ocr_router=ocr_router,
             move_to_enqueued=False,
             meta_info=meta_info,
         )
         if success:
-            await rag.apipeline_process_enqueue_documents()
+            await rag.apipeline_process_enqueue_documents(extract_kg=extract_kg)
     except Exception as e:
         logger.error(
             f"Error indexing registered file {file_path.name} (source={file_source}): {str(e)}"
@@ -2548,6 +2609,7 @@ async def retry_failed_registered_ocr_documents(rag: LightRAG) -> int:
             continue
 
         ocr_id = str(metadata.get("ocr_id", "") or "").strip()
+        ocr_router = bool(metadata.get("ocr_router", False))
         file_path_raw = str(getattr(status_doc, "file_path", "") or "").strip()
         if not ocr_id or not file_path_raw:
             continue
@@ -2567,6 +2629,7 @@ async def retry_failed_registered_ocr_documents(rag: LightRAG) -> int:
             track_id=getattr(status_doc, "track_id", None),
             file_source=file_path_raw,
             ocr_id=ocr_id,
+            ocr_router=ocr_router,
             move_to_enqueued=False,
             meta_info=meta_info,
         )
@@ -2578,14 +2641,14 @@ async def retry_failed_registered_ocr_documents(rag: LightRAG) -> int:
 
 
 async def reprocess_failed_documents_with_ocr_retry(rag: LightRAG) -> None:
-    """Retry OCR fetch for failed registered files, then process normal queue."""
+    """Retry failed documents without KG extraction by default."""
     retried_count = await retry_failed_registered_ocr_documents(rag)
     if retried_count:
         logger.info(
             "Retried OCR content fetch for %d failed registered document(s)",
             retried_count,
         )
-    await rag.apipeline_process_enqueue_documents()
+    await rag.apipeline_process_enqueue_documents(extract_kg=False)
 
 
 async def pipeline_index_files(
@@ -2627,6 +2690,7 @@ async def pipeline_index_texts(
     texts: List[str],
     file_sources: List[str] = None,
     track_id: str = None,
+    extract_kg: bool = True,
 ):
     """Index a list of texts with track_id
 
@@ -2647,7 +2711,16 @@ async def pipeline_index_texts(
     await rag.apipeline_enqueue_documents(
         input=texts, file_paths=file_sources, track_id=track_id
     )
-    await rag.apipeline_process_enqueue_documents()
+    await rag.apipeline_process_enqueue_documents(extract_kg=extract_kg)
+
+
+async def pipeline_extract_pending_kg(rag: LightRAG, limit: int = 1000):
+    """Run offline KG extraction for chunks imported with extract_kg=false."""
+    try:
+        await rag.aextract_pending_kg(limit=limit)
+    except Exception as e:
+        logger.error(f"Error extracting pending KG: {str(e)}")
+        logger.error(traceback.format_exc())
 
 
 async def run_scanning_process(
@@ -2672,6 +2745,7 @@ async def run_scanning_process(
                 "Re-enqueued %d failed registered OCR document(s) before scanning",
                 retried_failed_registered_docs,
             )
+            await rag.apipeline_process_enqueue_documents(extract_kg=False)
 
         if new_files:
             # Check for files with PROCESSED status and filter them out
@@ -2702,28 +2776,16 @@ async def run_scanning_process(
                         f"Scanning process completed: {len(valid_files)} files Processed."
                     )
             else:
-                if retried_failed_registered_docs:
-                    logger.info(
-                        "No new files to process after filtering; processing %d retried registered OCR document(s).",
-                        retried_failed_registered_docs,
-                    )
-                    await rag.apipeline_process_enqueue_documents()
-                else:
-                    logger.info(
-                        "No files to process after filtering already processed files."
-                    )
-        else:
-            if retried_failed_registered_docs:
                 logger.info(
-                    "No upload file found, processing %d retried registered OCR document(s)...",
-                    retried_failed_registered_docs,
+                    "No files to process after filtering already processed files."
                 )
-            else:
+        else:
+            if not retried_failed_registered_docs:
                 # No new files to index, check if there are any documents in the queue
                 logger.info(
                     "No upload file found, check if there are any documents in the queue..."
                 )
-            await rag.apipeline_process_enqueue_documents()
+                await rag.apipeline_process_enqueue_documents()
 
     except Exception as e:
         logger.error(f"Error during scanning process: {str(e)}")
@@ -3311,7 +3373,9 @@ def create_document_routes(
                 registered_file_source,
                 track_id,
                 request.ocr_id,
+                request.ocr_router,
                 register_meta_info,
+                request.extract_kg,
             )
 
             return RegisterDocumentResponse(
@@ -3323,6 +3387,49 @@ def create_document_routes(
             raise
         except Exception as e:
             logger.error(f"Error /documents/register: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post(
+        "/extract_kg",
+        response_model=ExtractPendingKGResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def extract_pending_kg(
+        request: ExtractPendingKGRequest, background_tasks: BackgroundTasks
+    ):
+        """Run offline KG extraction for chunks imported without KG extraction."""
+        try:
+            from lightrag.kg.shared_storage import (
+                get_namespace_data,
+                get_namespace_lock,
+            )
+
+            active_rag = _active_rag()
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=active_rag.workspace
+            )
+            pipeline_status_lock = get_namespace_lock(
+                "pipeline_status", workspace=active_rag.workspace
+            )
+            async with pipeline_status_lock:
+                if pipeline_status.get("busy", False):
+                    return ExtractPendingKGResponse(
+                        status="busy",
+                        message="Cannot extract pending KG while pipeline is busy.",
+                    )
+
+            background_tasks.add_task(
+                pipeline_extract_pending_kg,
+                active_rag,
+                request.limit,
+            )
+            return ExtractPendingKGResponse(
+                status="success",
+                message="Pending KG extraction started in background.",
+            )
+        except Exception as e:
+            logger.error(f"Error /documents/extract_kg: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 
@@ -3392,6 +3499,7 @@ def create_document_routes(
                 [request.text],
                 file_sources=[request.file_source],
                 track_id=track_id,
+                extract_kg=request.extract_kg,
             )
 
             return InsertResponse(
@@ -3475,6 +3583,7 @@ def create_document_routes(
                 request.texts,
                 file_sources=request.file_sources,
                 track_id=track_id,
+                extract_kg=request.extract_kg,
             )
 
             return InsertResponse(

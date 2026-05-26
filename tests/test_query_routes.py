@@ -124,6 +124,34 @@ def _build_test_client(result: dict) -> tuple[TestClient, _FakeRAG]:
     return TestClient(app), fake_rag
 
 
+def _stub_successful_agent_search(query_routes, monkeypatch) -> None:
+    monkeypatch.setattr(query_routes, "is_opencode_enabled", lambda: True)
+
+    async def _fake_run_agent_search(
+        agent_search_id,
+        workspace,
+        retrieval_target,
+        prior_rag_context=None,
+        callback=None,
+    ):
+        return types.SimpleNamespace(
+            ok=True,
+            session_id="session-rerank",
+            final_output="agent done",
+            error=None,
+        )
+
+    async def _fake_wait_for_submit(
+        rag, agent_search_id, timeout_seconds=5.0, interval_seconds=0.5
+    ):
+        return {"entity_ids": [], "chunk_ids": []}, "default"
+
+    monkeypatch.setattr(query_routes, "run_agent_search", _fake_run_agent_search)
+    monkeypatch.setattr(
+        query_routes, "_wait_for_agent_submit_payload", _fake_wait_for_submit
+    )
+
+
 def _post_with_timeout(
     client: TestClient,
     path: str,
@@ -459,6 +487,7 @@ def test_query_stream_endpoint_emits_agent_status(monkeypatch):
             "mode": "mix",
             "stream": True,
             "agent_search": True,
+            "stream_agent_status": True,
         },
     )
 
@@ -467,6 +496,59 @@ def test_query_stream_endpoint_emits_agent_status(monkeypatch):
     assert lines[0]["agent_status"]["event_type"] == "local.started"
     assert lines[1]["agent_status"]["message"] == "agent is searching"
     assert lines[-1]["response"] == "answer"
+
+
+def test_query_stream_endpoint_suppresses_agent_status_by_default(monkeypatch):
+    query_routes = _load_query_routes_module()
+    client, _ = _build_test_client(
+        {
+            "llm_response": {
+                "content": "answer",
+                "response_iterator": None,
+                "is_streaming": False,
+            },
+            "data": {"chunks": [], "references": []},
+        }
+    )
+
+    async def _fake_agent_search_pipeline_guarded(
+        rag, request, workspace, param=None, status_queue=None
+    ):
+        assert status_queue is None
+        return query_routes.AgentSearchMergeBundle(
+            public_result=query_routes.AgentSearchResultPayload(
+                agent_search_id="agent-search-005",
+                workspace=workspace,
+                retrieval_target="[latest_query]\ntest query",
+                status="completed",
+                submitted=True,
+            ),
+            search_entities=[],
+            search_chunks=[],
+        )
+
+    monkeypatch.setattr(
+        query_routes,
+        "_run_agent_search_pipeline_guarded",
+        _fake_agent_search_pipeline_guarded,
+    )
+
+    response = _post_with_timeout(
+        client,
+        "/query/stream",
+        {
+            "query": "test query",
+            "mode": "mix",
+            "stream": True,
+            "agent_search": True,
+        },
+    )
+
+    assert response.status_code == 200
+    lines = [json.loads(line) for line in response.text.strip().splitlines()]
+    assert all("agent_status" not in line for line in lines)
+    assert lines[-1]["response"] == "answer"
+    assert lines[-1]["agent_search_result"]["agent_search_id"] == "agent-search-005"
 
 
 def test_query_stream_endpoint_emits_initial_agent_status_when_agent_is_silent(
@@ -514,6 +596,7 @@ def test_query_stream_endpoint_emits_initial_agent_status_when_agent_is_silent(
             "mode": "mix",
             "stream": True,
             "agent_search": True,
+            "stream_agent_status": True,
         },
     )
 
@@ -578,8 +661,81 @@ def test_query_data_endpoint_merges_agent_search_chunks(monkeypatch):
     payload = response.json()
     assert payload["agent_search_result"]["agent_search_id"] == "agent-search-003"
     assert payload["data"]["chunks"][0]["chunk_id"] == "chunk-7"
-    assert payload["data"]["references"][0]["chunk_id"] == "chunk-7"
+    assert payload["data"]["chunks"][0]["full_doc_id"] == "doc-7"
+    assert "references" not in payload["data"]
     assert fake_rag.last_agent_context["chunks"][0]["chunk_id"] == "chunk-7"
+
+
+def test_query_data_endpoint_returns_agent_focused_schema():
+    client, _ = _build_test_client(
+        {
+            "data": {
+                "entities": [
+                    {
+                        "entity_name": "LightRAG",
+                        "entity_type": "project",
+                        "description": "graph rag framework",
+                        "source_id": "chunk-1",
+                        "file_path": "/tmp/doc.txt",
+                    }
+                ],
+                "relationships": [
+                    {
+                        "src_id": "LightRAG",
+                        "tgt_id": "RAG",
+                        "description": "implements retrieval augmentation",
+                        "keywords": "retrieval, augmentation",
+                    }
+                ],
+                "chunks": [
+                    {
+                        "chunk_id": "chunk-1",
+                        "full_doc_id": "doc-1",
+                        "file_path": "/tmp/doc.txt",
+                        "content": "LightRAG is a graph-based retrieval system.",
+                        "content_type": "text",
+                        "image_text": "ocr text",
+                    }
+                ],
+                "references": [
+                    {
+                        "reference_id": "1",
+                        "chunk_id": "chunk-1",
+                        "file_path": "/tmp/doc.txt",
+                    }
+                ],
+            },
+        }
+    )
+
+    response = _post_with_timeout(
+        client,
+        "/query/data",
+        {
+            "query": "test query",
+            "mode": "mix",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["data"] == {
+        "entities": [{"id": "LightRAG", "description": "graph rag framework"}],
+        "relationships": [
+            {
+                "id": "LightRAG -> RAG",
+                "description": "implements retrieval augmentation",
+            }
+        ],
+        "chunks": [
+            {
+                "chunk_id": "chunk-1",
+                "full_doc_id": "doc-1",
+                "image_text": "ocr text",
+                "content_type": "text",
+            }
+        ],
+    }
 
 
 def test_query_endpoint_runs_prior_rag_before_agent_search(monkeypatch):
@@ -674,6 +830,103 @@ def test_query_endpoint_runs_prior_rag_before_agent_search(monkeypatch):
     assert "[chunks]" in captured["prior_rag_context"]
 
 
+def test_query_endpoint_disables_rerank_for_prior_and_final_rag(monkeypatch):
+    query_routes = _load_query_routes_module()
+    client, fake_rag = _build_test_client(
+        {
+            "llm_response": {
+                "content": "answer",
+                "response_iterator": None,
+                "is_streaming": False,
+            },
+            "data": {"entities": [], "relationships": [], "chunks": [], "references": []},
+        }
+    )
+    _stub_successful_agent_search(query_routes, monkeypatch)
+
+    response = _post_with_timeout(
+        client,
+        "/query",
+        {
+            "query": "test query",
+            "mode": "mix",
+            "include_references": False,
+            "agent_search": True,
+            "enable_rerank": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(fake_rag.data_calls) == 1
+    assert fake_rag.data_calls[0]["param"].enable_rerank is False
+    assert len(fake_rag.llm_calls) == 1
+    assert fake_rag.llm_calls[0]["param"].enable_rerank is False
+
+
+def test_query_data_endpoint_disables_rerank_for_prior_and_final_rag(monkeypatch):
+    query_routes = _load_query_routes_module()
+    client, fake_rag = _build_test_client(
+        {
+            "llm_response": {
+                "content": "answer",
+                "response_iterator": None,
+                "is_streaming": False,
+            },
+            "data": {"entities": [], "relationships": [], "chunks": [], "references": []},
+        }
+    )
+    _stub_successful_agent_search(query_routes, monkeypatch)
+
+    response = _post_with_timeout(
+        client,
+        "/query/data",
+        {
+            "query": "test query",
+            "mode": "mix",
+            "agent_search": True,
+            "enable_rerank": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(fake_rag.data_calls) == 2
+    assert fake_rag.data_calls[0]["param"].enable_rerank is False
+    assert fake_rag.data_calls[1]["param"].enable_rerank is False
+
+
+def test_query_stream_endpoint_disables_rerank_for_prior_and_final_rag(monkeypatch):
+    query_routes = _load_query_routes_module()
+    client, fake_rag = _build_test_client(
+        {
+            "llm_response": {
+                "content": "answer",
+                "response_iterator": None,
+                "is_streaming": False,
+            },
+            "data": {"entities": [], "relationships": [], "chunks": [], "references": []},
+        }
+    )
+    _stub_successful_agent_search(query_routes, monkeypatch)
+
+    response = _post_with_timeout(
+        client,
+        "/query/stream",
+        {
+            "query": "test query",
+            "mode": "mix",
+            "stream": True,
+            "agent_search": True,
+            "enable_rerank": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(fake_rag.data_calls) == 1
+    assert fake_rag.data_calls[0]["param"].enable_rerank is False
+    assert len(fake_rag.llm_calls) == 1
+    assert fake_rag.llm_calls[0]["param"].enable_rerank is False
+
+
 def test_query_endpoint_continues_when_prior_rag_fails(monkeypatch):
     query_routes = _load_query_routes_module()
     client, fake_rag = _build_test_client(
@@ -739,6 +992,164 @@ def test_query_endpoint_continues_when_prior_rag_fails(monkeypatch):
     assert payload["agent_search_result"]["prior_rag_relation_count"] == 0
     assert payload["agent_search_result"]["prior_rag_chunk_count"] == 0
     assert captured["prior_rag_context"] is None
+
+
+def test_query_endpoint_reads_agent_submit_after_agent_failure(monkeypatch):
+    query_routes = _load_query_routes_module()
+    client, fake_rag = _build_test_client(
+        {
+            "llm_response": {
+                "content": "answer",
+                "response_iterator": None,
+                "is_streaming": False,
+            },
+            "data": {"entities": [], "relationships": [], "chunks": [], "references": []},
+        }
+    )
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(query_routes, "is_opencode_enabled", lambda: True)
+
+    async def _fake_run_agent_search(
+        agent_search_id,
+        workspace,
+        retrieval_target,
+        prior_rag_context=None,
+        callback=None,
+    ):
+        captured["run_agent_search_id"] = agent_search_id
+        return types.SimpleNamespace(
+            ok=False,
+            session_id="session-failed",
+            final_output="partial agent output",
+            error="agent failed after submit",
+        )
+
+    async def _fake_wait_for_submit(
+        rag, agent_search_id, timeout_seconds=5.0, interval_seconds=0.5
+    ):
+        captured["wait_agent_search_id"] = agent_search_id
+        return {"entity_ids": ["entity-1"], "chunk_ids": ["chunk-8"]}, "default"
+
+    async def _fake_load_agent_entities(entity_ids, rag):
+        return [
+            {
+                "entity_name": entity_ids[0],
+                "description": "submitted entity",
+                "source_id": "chunk-8",
+                "entity_type": "concept",
+                "file_path": "unknown_source",
+            }
+        ]
+
+    async def _fake_load_agent_chunks(chunk_ids, rag):
+        return [
+            {
+                "chunk_id": chunk_ids[0],
+                "full_doc_id": "doc-8",
+                "file_path": "/tmp/submitted.txt",
+                "content": "submitted chunk",
+                "content_type": "text",
+            }
+        ]
+
+    monkeypatch.setattr(query_routes, "run_agent_search", _fake_run_agent_search)
+    monkeypatch.setattr(query_routes, "_wait_for_agent_submit_payload", _fake_wait_for_submit)
+    monkeypatch.setattr(query_routes, "_load_agent_entities", _fake_load_agent_entities)
+    monkeypatch.setattr(query_routes, "_load_agent_chunks", _fake_load_agent_chunks)
+
+    response = _post_with_timeout(
+        client,
+        "/query",
+        {
+            "query": "test query",
+            "mode": "mix",
+            "include_references": True,
+            "agent_search": True,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert captured["wait_agent_search_id"] == captured["run_agent_search_id"]
+    assert payload["agent_search_result"]["status"] == "failed"
+    assert payload["agent_search_result"]["submitted"] is True
+    assert payload["agent_search_result"]["error"] == "agent failed after submit"
+    assert payload["references"][-1]["chunk_id"] == "chunk-8"
+    assert fake_rag.last_agent_context["chunks"][0]["chunk_id"] == "chunk-8"
+
+
+def test_query_endpoint_reads_agent_submit_after_agent_timeout(monkeypatch):
+    query_routes = _load_query_routes_module()
+    client, fake_rag = _build_test_client(
+        {
+            "llm_response": {
+                "content": "answer",
+                "response_iterator": None,
+                "is_streaming": False,
+            },
+            "data": {"entities": [], "relationships": [], "chunks": [], "references": []},
+        }
+    )
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(query_routes, "is_opencode_enabled", lambda: True)
+    monkeypatch.setattr(query_routes, "_get_agent_search_timeout_seconds", lambda: 0.05)
+
+    async def _fake_run_agent_search(
+        agent_search_id,
+        workspace,
+        retrieval_target,
+        prior_rag_context=None,
+        callback=None,
+    ):
+        captured["run_agent_search_id"] = agent_search_id
+        await asyncio.sleep(1.0)
+
+    async def _fake_wait_for_submit(
+        rag, agent_search_id, timeout_seconds=5.0, interval_seconds=0.5
+    ):
+        captured["wait_agent_search_id"] = agent_search_id
+        captured["submit_timeout_seconds"] = timeout_seconds
+        return {"entity_ids": [], "chunk_ids": ["chunk-timeout"]}, "default"
+
+    async def _fake_load_agent_chunks(chunk_ids, rag):
+        return [
+            {
+                "chunk_id": chunk_ids[0],
+                "full_doc_id": "doc-timeout",
+                "file_path": "/tmp/timeout.txt",
+                "content": "timeout submitted chunk",
+                "content_type": "text",
+            }
+        ]
+
+    monkeypatch.setattr(query_routes, "run_agent_search", _fake_run_agent_search)
+    monkeypatch.setattr(query_routes, "_wait_for_agent_submit_payload", _fake_wait_for_submit)
+    monkeypatch.setattr(query_routes, "_load_agent_chunks", _fake_load_agent_chunks)
+
+    response = _post_with_timeout(
+        client,
+        "/query",
+        {
+            "query": "test query",
+            "mode": "mix",
+            "include_references": True,
+            "agent_search": True,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert captured["wait_agent_search_id"] == captured["run_agent_search_id"]
+    assert captured["submit_timeout_seconds"] == 0.0
+    assert payload["agent_search_result"]["status"] == "failed"
+    assert payload["agent_search_result"]["submitted"] is True
+    assert payload["agent_search_result"]["error"] == "agent_search timed out"
+    assert payload["references"][-1]["chunk_id"] == "chunk-timeout"
+    assert fake_rag.last_agent_context["chunks"][0]["chunk_id"] == "chunk-timeout"
 
 
 def test_query_endpoint_agent_search_retrieval_target_includes_history_references(

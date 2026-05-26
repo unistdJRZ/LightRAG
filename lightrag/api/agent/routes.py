@@ -423,6 +423,20 @@ class AgentSubmitResponse(BaseModel):
     expires_at: str = Field(description="UTC expiration time for the cache entry")
 
 
+class WorkspaceInfoRequest(BaseModel):
+    workspace: Optional[str] = Field(
+        default=None,
+        description="Target workspace for this request. If omitted, falls back to query/header/default routing.",
+    )
+
+
+class WorkspaceInfoResponse(BaseModel):
+    workspace: str = Field(description="Resolved workspace id")
+    alias: str = Field(description="Workspace display alias")
+    description: str = Field(description="Stored workspace description")
+    has_description: bool = Field(description="Whether a non-empty description exists")
+
+
 def _resolve_chunk_storage(rag: Any) -> Any:
     text_chunks = getattr(rag, "text_chunks", None)
     namespace = str(getattr(text_chunks, "namespace", "") or "")
@@ -442,7 +456,10 @@ def _resolve_chunk_storage(rag: Any) -> Any:
     return text_chunks
 
 
-def _resolve_postgres_storage(rag: Any) -> Any:
+def _resolve_postgres_storage(
+    rag: Any,
+    endpoint: str = "/api/agent/submit",
+) -> Any:
     for attr_name in ("text_chunks", "llm_response_cache", "doc_status"):
         storage = getattr(rag, attr_name, None)
         db = getattr(storage, "db", None)
@@ -451,15 +468,35 @@ def _resolve_postgres_storage(rag: Any) -> Any:
 
     raise HTTPException(
         status_code=501,
-        detail="The /api/agent/submit endpoint currently requires PostgreSQL-backed storage.",
+        detail=f"The {endpoint} endpoint currently requires PostgreSQL-backed storage.",
     )
+
+
+async def _get_workspace_description(rag: Any) -> tuple[str, str]:
+    storage = _resolve_postgres_storage(rag, endpoint="/api/agent/workspace_info")
+    records = await storage.db.query(
+        """
+        SELECT COALESCE(description, '') AS description
+        FROM LIGHTRAG_WORKSPACE_INFO
+        WHERE workspace = $1
+        LIMIT 1
+        """,
+        [storage.workspace],
+        multirows=True,
+    )
+    if not records:
+        return storage.workspace, ""
+    return storage.workspace, str(records[0].get("description") or "")
 
 
 async def _maybe_cleanup_agent_submit_cache(db: Any) -> bool:
     db_key = id(db)
     now = time.monotonic()
-    last_run = _agent_submit_cleanup_last_run.get(db_key, 0.0)
-    if now - last_run < _AGENT_SUBMIT_CACHE_CLEANUP_INTERVAL_SECONDS:
+    last_run = _agent_submit_cleanup_last_run.get(db_key)
+    if (
+        last_run is not None
+        and now - last_run < _AGENT_SUBMIT_CACHE_CLEANUP_INTERVAL_SECONDS
+    ):
         return False
 
     lock = _agent_submit_cleanup_locks.setdefault(db_key, asyncio.Lock())
@@ -468,8 +505,11 @@ async def _maybe_cleanup_agent_submit_cache(db: Any) -> bool:
 
     async with lock:
         now = time.monotonic()
-        last_run = _agent_submit_cleanup_last_run.get(db_key, 0.0)
-        if now - last_run < _AGENT_SUBMIT_CACHE_CLEANUP_INTERVAL_SECONDS:
+        last_run = _agent_submit_cleanup_last_run.get(db_key)
+        if (
+            last_run is not None
+            and now - last_run < _AGENT_SUBMIT_CACHE_CLEANUP_INTERVAL_SECONDS
+        ):
             return False
 
         await db.execute(
@@ -866,6 +906,7 @@ def create_agent_routes(
     api_key: Optional[str] = None,
     workspace: str = "",
     workspace_aliases: Mapping[str, str] | None = None,
+    workspace_display_names: Mapping[str, str] | None = None,
 ):
     if not rag_by_workspace:
         raise ValueError("rag_by_workspace cannot be empty")
@@ -891,11 +932,58 @@ def create_agent_routes(
         workspace_aliases=workspace_aliases,
     )
     combined_auth = get_combined_auth_dependency(api_key)
+    alias_by_workspace = dict(workspace_display_names or {})
+    if workspace_aliases:
+        for alias, workspace_id in workspace_aliases.items():
+            alias_by_workspace.setdefault(workspace_id, alias)
     router = APIRouter(
         prefix="/agent",
         tags=["agent"],
         dependencies=[Depends(workspace_scope)],
     )
+
+    def _workspace_alias(workspace_id: str) -> str:
+        return alias_by_workspace.get(workspace_id) or workspace_id or "default"
+
+    async def _workspace_info_response(current_rag: Any) -> WorkspaceInfoResponse:
+        try:
+            resolved_workspace, description = await _get_workspace_description(current_rag)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("Failed to fetch workspace info: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to fetch workspace info: {exc}",
+            ) from exc
+
+        description = description.strip()
+        return WorkspaceInfoResponse(
+            workspace=resolved_workspace,
+            alias=_workspace_alias(resolved_workspace),
+            description=description,
+            has_description=bool(description),
+        )
+
+    @router.get(
+        "/workspace_info",
+        dependencies=[Depends(combined_auth)],
+        response_model=WorkspaceInfoResponse,
+        summary="Get workspace description for agents",
+        description="Returns the configured description of the resolved workspace so agents can decide whether to query it.",
+    )
+    async def workspace_info_get():
+        return await _workspace_info_response(rag.resolve_current())
+
+    @router.post(
+        "/workspace_info",
+        dependencies=[Depends(combined_auth)],
+        response_model=WorkspaceInfoResponse,
+        summary="Get workspace description for agents",
+        description="Returns the configured description of the resolved workspace so agents can decide whether to query it.",
+    )
+    async def workspace_info_post(payload: WorkspaceInfoRequest):
+        return await _workspace_info_response(rag.resolve_current())
 
     @router.post(
         "/chunk_search",

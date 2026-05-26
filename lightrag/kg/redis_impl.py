@@ -338,6 +338,8 @@ class RedisKVStorage(BaseKVStorage):
                     if self.namespace.endswith("text_chunks"):
                         if "llm_cache_list" not in v:
                             v["llm_cache_list"] = []
+                        if "extracted_kg" not in v:
+                            v["extracted_kg"] = False
 
                     # Add timestamps based on whether key exists
                     if exists_results[i]:  # Key exists, only update update_time
@@ -378,6 +380,66 @@ class RedisKVStorage(BaseKVStorage):
         except Exception as e:
             logger.error(f"[{self.workspace}] Error checking if storage is empty: {e}")
             return True
+
+    async def get_unextracted_chunks(self, limit: int = 1000) -> dict[str, dict[str, Any]]:
+        if not self.namespace.endswith("text_chunks"):
+            return await super().get_unextracted_chunks(limit)
+
+        chunks: dict[str, dict[str, Any]] = {}
+        pattern = f"{self.final_namespace}:*"
+        async with self._get_redis_connection() as redis:
+            async for key in redis.scan_iter(match=pattern, count=1000):
+                if len(chunks) >= limit:
+                    break
+                raw = await redis.get(key)
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("extracted_kg", False):
+                    continue
+                if str(data.get("content_type") or "").lower() == "image":
+                    continue
+                key_text = key.decode() if isinstance(key, bytes) else str(key)
+                chunk_id = data.get("_id") or key_text.rsplit(":", 1)[-1]
+                data.setdefault("llm_cache_list", [])
+                data.setdefault("create_time", 0)
+                data.setdefault("update_time", 0)
+                data["extracted_kg"] = False
+                chunks[chunk_id] = data
+        return chunks
+
+    async def mark_chunks_extracted(
+        self, ids: list[str], extracted: bool = True
+    ) -> None:
+        if not ids or not self.namespace.endswith("text_chunks"):
+            return
+
+        import time
+
+        current_time = int(time.time())
+        async with self._get_redis_connection() as redis:
+            pipe = redis.pipeline()
+            records: list[tuple[str, dict[str, Any]]] = []
+            for chunk_id in ids:
+                key = f"{self.final_namespace}:{chunk_id}"
+                raw = await redis.get(key)
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                data["extracted_kg"] = extracted
+                data["update_time"] = current_time
+                records.append((key, data))
+
+            for key, data in records:
+                pipe.set(key, json.dumps(data))
+            if records:
+                await pipe.execute()
 
     async def delete(self, ids: list[str]) -> None:
         """Delete specific records from storage by their IDs"""

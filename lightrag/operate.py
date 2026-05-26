@@ -4638,6 +4638,7 @@ def _format_preserved_chunks_for_user(
             "content": chunk_content,
             "file_path": chunk.get("file_path", "unknown_source"),
             "chunk_id": chunk.get("chunk_id", ""),
+            "full_doc_id": chunk.get("full_doc_id"),
         }
         if chunk.get("content_type") is not None:
             chunk_data["content_type"] = chunk.get("content_type")

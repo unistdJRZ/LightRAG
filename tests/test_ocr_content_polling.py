@@ -49,6 +49,17 @@ class _FakeClientSession:
         return next(self._responses)
 
 
+class _CapturingClientSession(_FakeClientSession):
+    def __init__(self, responses, captured, timeout=None):
+        super().__init__(responses, timeout=timeout)
+        self._captured = captured
+
+    def get(self, url, params=None):
+        self._captured["url"] = url
+        self._captured["params"] = params
+        return super().get(url, params=params)
+
+
 def test_ocr_timeout_defaults():
     assert routes.global_args.ocr_poll_timeout_seconds == 1800
     assert routes.global_args.ocr_request_timeout_seconds == 300
@@ -61,6 +72,23 @@ def test_get_ocr_poll_delay_seconds_uses_exponential_backoff_with_cap(monkeypatc
     delays = [routes._get_ocr_poll_delay_seconds(attempt) for attempt in range(6)]
 
     assert delays == [2.0, 4.0, 8.0, 16.0, 30.0, 30.0]
+
+
+def test_resolve_ocr_content_url_switches_to_content_router():
+    assert (
+        routes._resolve_ocr_content_url("http://ocr-server", ocr_router=True)
+        == "http://ocr-server/content_router"
+    )
+    assert (
+        routes._resolve_ocr_content_url("http://ocr-server/content", ocr_router=True)
+        == "http://ocr-server/content_router"
+    )
+    assert (
+        routes._resolve_ocr_content_url(
+            "http://ocr-server/content_router", ocr_router=False
+        )
+        == "http://ocr-server/content"
+    )
 
 
 def test_fetch_text_from_ocr_server_poll_pending_then_finished(monkeypatch):
@@ -192,6 +220,47 @@ def test_fetch_text_from_ocr_server_poll_running_then_finished(monkeypatch):
     assert sleep_calls == [0]
 
 
+def test_fetch_text_from_ocr_server_uses_content_router_endpoint(monkeypatch):
+    responses = [
+        _FakeResponse(
+            200,
+            json.dumps(
+                {
+                    "status": "FINISHED",
+                    "content": {
+                        "results": {
+                            "demo.pdf": {
+                                "md_content": "router markdown",
+                                "images": {},
+                            }
+                        }
+                    },
+                }
+            ),
+        )
+    ]
+    captured = {}
+
+    monkeypatch.setattr(routes.global_args, "ocr_server_url", "http://ocr-server")
+    monkeypatch.setattr(routes.global_args, "ocr_poll_timeout_seconds", 300)
+    monkeypatch.setattr(routes.global_args, "ocr_request_timeout_seconds", 123)
+    monkeypatch.setattr(
+        routes.aiohttp,
+        "ClientSession",
+        lambda timeout=None: _CapturingClientSession(
+            responses, captured, timeout=timeout
+        ),
+    )
+
+    text = asyncio.run(
+        routes._fetch_text_from_ocr_server("ocr-123", ocr_router=True)
+    )
+
+    assert text == "router markdown"
+    assert captured["url"] == "http://ocr-server/content_router"
+    assert captured["params"] == {"ocr_id": "ocr-123"}
+
+
 def test_fetch_text_from_ocr_server_fail_status(monkeypatch):
     responses = [
         _FakeResponse(
@@ -226,7 +295,7 @@ class _FakeRAGForEnqueueError:
 def test_pipeline_enqueue_file_preserves_register_ocr_retry_metadata(monkeypatch):
     rag = _FakeRAGForEnqueueError()
 
-    async def _fail_fetch(_ocr_id):
+    async def _fail_fetch(_ocr_id, ocr_router=False):
         raise TimeoutError("timeout while polling")
 
     monkeypatch.setattr(routes, "_fetch_text_from_ocr_server", _fail_fetch)
@@ -265,6 +334,7 @@ def test_pipeline_enqueue_file_preserves_register_ocr_retry_metadata(monkeypatch
             "file_size": len(b"%PDF-1.4\n"),
             "metadata": {
                 "ocr_id": "ocr-xyz",
+                "ocr_router": False,
                 "meta_info": {"file_id": "file-123"},
                 "retry_source": "register_external_file",
                 "retry_stage": "ocr_content_fetch",
@@ -315,6 +385,7 @@ def test_retry_failed_registered_ocr_documents_reenqueues_missing_content(monkey
                     "retry_source": "register_external_file",
                     "retry_stage": "ocr_content_fetch",
                     "ocr_id": "ocr-456",
+                    "ocr_router": True,
                     "meta_info": {"file_id": "file-456"},
                 },
             )
@@ -328,6 +399,7 @@ def test_retry_failed_registered_ocr_documents_reenqueues_missing_content(monkey
         track_id=None,
         file_source=None,
         ocr_id=None,
+        ocr_router=False,
         move_to_enqueued=True,
         meta_info=None,
     ):
@@ -336,6 +408,7 @@ def test_retry_failed_registered_ocr_documents_reenqueues_missing_content(monkey
         captured["track_id"] = track_id
         captured["file_source"] = file_source
         captured["ocr_id"] = ocr_id
+        captured["ocr_router"] = ocr_router
         captured["move_to_enqueued"] = move_to_enqueued
         captured["meta_info"] = meta_info
         return True, track_id
@@ -351,6 +424,7 @@ def test_retry_failed_registered_ocr_documents_reenqueues_missing_content(monkey
         "track_id": "track-register-2",
         "file_source": file_path,
         "ocr_id": "ocr-456",
+        "ocr_router": True,
         "move_to_enqueued": False,
         "meta_info": {"file_id": "file-456"},
     }
@@ -364,10 +438,10 @@ class _FakeDocManagerForScan:
 
 class _FakeRAGForScan:
     def __init__(self):
-        self.process_calls = 0
+        self.process_calls = []
 
-    async def apipeline_process_enqueue_documents(self):
-        self.process_calls += 1
+    async def apipeline_process_enqueue_documents(self, extract_kg=True):
+        self.process_calls.append(extract_kg)
 
 
 def test_run_scanning_process_retries_registered_ocr_failures_when_no_new_files(
@@ -387,7 +461,26 @@ def test_run_scanning_process_retries_registered_ocr_failures_when_no_new_files(
 
     asyncio.run(routes.run_scanning_process(rag, doc_manager, track_id="scan-1"))
 
-    assert rag.process_calls == 1
+    assert rag.process_calls == [False]
+
+
+def test_reprocess_failed_documents_with_ocr_retry_disables_kg_by_default(
+    monkeypatch,
+):
+    rag = _FakeRAGForScan()
+
+    async def _fake_retry_failed_registered_ocr_documents(_rag):
+        return 0
+
+    monkeypatch.setattr(
+        routes,
+        "retry_failed_registered_ocr_documents",
+        _fake_retry_failed_registered_ocr_documents,
+    )
+
+    asyncio.run(routes.reprocess_failed_documents_with_ocr_retry(rag))
+
+    assert rag.process_calls == [False]
 
 
 def test_extract_structured_segments_from_ocr_chunks():

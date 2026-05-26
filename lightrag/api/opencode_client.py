@@ -356,6 +356,14 @@ async def _wait_until_session_complete(
         await asyncio.sleep(0.5)
 
 
+async def _delete_session(client: httpx.AsyncClient, session_id: str) -> None:
+    try:
+        response = await client.delete(f"/session/{session_id}")
+        response.raise_for_status()
+    except Exception as exc:
+        logger.warning("Failed to delete OpenCode session %s: %s", session_id, exc)
+
+
 async def run_agent_search(
     agent_search_id: str,
     workspace: str,
@@ -427,71 +435,74 @@ async def run_agent_search(
                 raise RuntimeError("OpenCode session creation did not return a valid session id")
 
             result.session_id = session_id
-            await _emit_status(
-                callback,
-                result.status_events,
-                OpencodeStatusEvent(
-                    agent_search_id=agent_search_id,
-                    phase="session_created",
-                    message=f"Created OpenCode session {session_id}",
-                    session_id=session_id,
-                ),
-            )
-
-            stream_state = _EventStreamState()
-            event_task = asyncio.create_task(
-                _stream_events(
-                    client=client,
-                    session_id=session_id,
-                    agent_search_id=agent_search_id,
-                    callback=callback,
-                    events=result.status_events,
-                    state=stream_state,
-                )
-            )
-
             try:
-                prompt_response = await client.post(
-                    f"/session/{session_id}/prompt_async",
-                    json={
-                        "agent": agent_name,
-                        "parts": [{"type": "text", "text": message}],
-                    },
+                await _emit_status(
+                    callback,
+                    result.status_events,
+                    OpencodeStatusEvent(
+                        agent_search_id=agent_search_id,
+                        phase="session_created",
+                        message=f"Created OpenCode session {session_id}",
+                        session_id=session_id,
+                    ),
                 )
-                prompt_response.raise_for_status()
 
-                error = await _wait_until_session_complete(
-                    client=client,
-                    session_id=session_id,
-                    state=stream_state,
-                    timeout_seconds=timeout_seconds,
+                stream_state = _EventStreamState()
+                event_task = asyncio.create_task(
+                    _stream_events(
+                        client=client,
+                        session_id=session_id,
+                        agent_search_id=agent_search_id,
+                        callback=callback,
+                        events=result.status_events,
+                        state=stream_state,
+                    )
                 )
-                if error:
-                    raise RuntimeError(error)
 
-                messages_response = await client.get(f"/session/{session_id}/message")
-                messages_response.raise_for_status()
-                result.final_output = _extract_message_text_from_messages(
-                    messages_response.json()
-                )
-            finally:
-                event_task.cancel()
                 try:
-                    await event_task
-                except asyncio.CancelledError:
-                    pass
+                    prompt_response = await client.post(
+                        f"/session/{session_id}/prompt_async",
+                        json={
+                            "agent": agent_name,
+                            "parts": [{"type": "text", "text": message}],
+                        },
+                    )
+                    prompt_response.raise_for_status()
 
-            await _emit_status(
-                callback,
-                result.status_events,
-                OpencodeStatusEvent(
-                    agent_search_id=agent_search_id,
-                    phase="completed",
-                    message=result.final_output or "OpenCode agent search completed",
-                    session_id=session_id,
-                ),
-            )
-            return result
+                    error = await _wait_until_session_complete(
+                        client=client,
+                        session_id=session_id,
+                        state=stream_state,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    if error:
+                        raise RuntimeError(error)
+
+                    messages_response = await client.get(f"/session/{session_id}/message")
+                    messages_response.raise_for_status()
+                    result.final_output = _extract_message_text_from_messages(
+                        messages_response.json()
+                    )
+                finally:
+                    event_task.cancel()
+                    try:
+                        await event_task
+                    except asyncio.CancelledError:
+                        pass
+
+                await _emit_status(
+                    callback,
+                    result.status_events,
+                    OpencodeStatusEvent(
+                        agent_search_id=agent_search_id,
+                        phase="completed",
+                        message=result.final_output or "OpenCode agent search completed",
+                        session_id=session_id,
+                    ),
+                )
+                return result
+            finally:
+                await _delete_session(client, session_id)
     except Exception as exc:
         logger.error("OpenCode agent search failed: %s", exc)
         result.error = str(exc)

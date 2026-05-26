@@ -197,6 +197,20 @@ class TranslateChunkResponse(BaseModel):
     )
 
 
+class WorkspaceDescriptionUpdateRequest(BaseModel):
+    description: str = Field(
+        default="",
+        description="Workspace description shown to agents and WebUI users.",
+    )
+
+
+class WorkspaceInfoItem(BaseModel):
+    id: str = Field(description="Workspace id")
+    alias: str = Field(description="Workspace display alias")
+    description: str = Field(default="", description="Workspace description")
+    has_description: bool = Field(description="Whether a non-empty description exists")
+
+
 TRANSLATE_TO_CN_SYSTEM_PROMPT = """You are a professional translator.
 Translate the user's text into Simplified Chinese.
 Requirements:
@@ -708,6 +722,10 @@ def create_app(args):
         }
         for item in workspace_definitions
     }
+    workspace_display_names = {
+        item.id: item.alias
+        for item in workspace_definitions
+    }
     workspace_rags: dict[str, LightRAG] = {}
     workspace_doc_managers: dict[str, DocumentManager] = {}
 
@@ -930,6 +948,83 @@ def create_app(args):
             workspace = None
 
         return workspace
+
+    def resolve_postgres_workspace_storage(rag_instance: LightRAG, endpoint: str):
+        for attr_name in ("text_chunks", "llm_response_cache", "doc_status"):
+            storage = getattr(rag_instance, attr_name, None)
+            db = getattr(storage, "db", None)
+            if callable(getattr(db, "query", None)) and callable(
+                getattr(db, "execute", None)
+            ):
+                return storage
+
+        raise HTTPException(
+            status_code=501,
+            detail=f"The {endpoint} endpoint currently requires PostgreSQL-backed storage.",
+        )
+
+    async def get_workspace_descriptions() -> dict[str, str]:
+        if not workspace_rags:
+            return {}
+
+        storage = resolve_postgres_workspace_storage(
+            workspace_rags[default_workspace_name],
+            "/api/workspaces",
+        )
+        records = await storage.db.query(
+            """
+            SELECT workspace, COALESCE(description, '') AS description
+            FROM LIGHTRAG_WORKSPACE_INFO
+            WHERE workspace = ANY($1)
+            """,
+            [workspace_names],
+            multirows=True,
+        )
+        return {
+            str(record.get("workspace") or ""): str(record.get("description") or "")
+            for record in (records or [])
+        }
+
+    async def upsert_workspace_description(
+        workspace_name: str,
+        description: str,
+    ) -> str:
+        storage = resolve_postgres_workspace_storage(
+            workspace_rags[workspace_name],
+            "/api/workspaces/{workspace}/description",
+        )
+        normalized_description = str(description or "").strip()
+        result = await storage.db.query(
+            """
+            INSERT INTO LIGHTRAG_WORKSPACE_INFO (workspace, description)
+            VALUES ($1, $2)
+            ON CONFLICT (workspace) DO UPDATE
+            SET
+                description = EXCLUDED.description,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING COALESCE(description, '') AS description
+            """,
+            [workspace_name, normalized_description],
+        )
+        if not result:
+            raise RuntimeError("Failed to persist workspace description")
+        return str(result.get("description") or "")
+
+    def format_workspace_info_item(
+        workspace_name: str,
+        description: str,
+    ) -> WorkspaceInfoItem:
+        meta = workspace_metadata.get(workspace_name) or {
+            "id": display_workspace_id(workspace_name),
+            "alias": display_workspace_id(workspace_name),
+        }
+        normalized_description = str(description or "").strip()
+        return WorkspaceInfoItem(
+            id=meta["id"],
+            alias=meta["alias"],
+            description=normalized_description,
+            has_description=bool(normalized_description),
+        )
 
     # Create working directory if it doesn't exist
     Path(args.working_dir).mkdir(parents=True, exist_ok=True)
@@ -1663,6 +1758,7 @@ def create_app(args):
             api_key,
             workspace=default_workspace_name,
             workspace_aliases=workspace_aliases,
+            workspace_display_names=workspace_display_names,
         ),
         prefix="/api",
     )
@@ -1738,18 +1834,27 @@ def create_app(args):
         description="Returns all loaded workspace identifiers and the default workspace.",
     )
     async def list_workspaces():
+        try:
+            descriptions = await get_workspace_descriptions()
+        except HTTPException as exc:
+            if exc.status_code != 501:
+                raise
+            descriptions = {}
+        except Exception as exc:
+            logger.warning("Failed to load workspace descriptions: %s", exc)
+            descriptions = {}
+
         workspace_list = [
-            workspace_metadata.get(name)
-            or {"id": display_workspace_id(name), "alias": display_workspace_id(name)}
+            format_workspace_info_item(name, descriptions.get(name, "")).model_dump()
             for name in workspace_names
         ]
-        default_workspace_meta = workspace_metadata.get(default_workspace_name) or {
-            "id": display_workspace_id(default_workspace_name),
-            "alias": display_workspace_id(default_workspace_name),
-        }
+        default_workspace_meta = format_workspace_info_item(
+            default_workspace_name,
+            descriptions.get(default_workspace_name, ""),
+        )
         return {
-            "default_workspace": default_workspace_meta["id"],
-            "default_workspace_alias": default_workspace_meta["alias"],
+            "default_workspace": default_workspace_meta.id,
+            "default_workspace_alias": default_workspace_meta.alias,
             "workspaces": workspace_list,
             "count": len(workspace_list),
         }
@@ -1758,9 +1863,10 @@ def create_app(args):
         request: Request, explicit_workspace: str | None
     ) -> str:
         workspace = (explicit_workspace or "").strip()
-        if workspace and workspace not in workspace_rags:
+        has_explicit_workspace = bool(workspace)
+        if has_explicit_workspace and workspace not in workspace_rags:
             workspace = workspace_aliases.get(workspace, workspace)
-        if not workspace:
+        if not has_explicit_workspace:
             workspace = get_workspace_from_request(request)
         if workspace is None:
             workspace = default_workspace_name
@@ -1776,6 +1882,39 @@ def create_app(args):
             )
 
         return workspace
+
+    @app.put(
+        "/api/workspaces/{workspace}/description",
+        dependencies=[Depends(combined_auth)],
+        response_model=WorkspaceInfoItem,
+        summary="Update workspace description",
+        description="Stores a human-maintained description for the selected workspace.",
+    )
+    async def update_workspace_description(
+        request: Request,
+        workspace: str,
+        payload: WorkspaceDescriptionUpdateRequest,
+    ):
+        resolved_workspace = resolve_workspace_or_raise(request, workspace)
+        try:
+            description = await upsert_workspace_description(
+                resolved_workspace,
+                payload.description,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Failed to update description for workspace '%s': %s",
+                resolved_workspace,
+                exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to update workspace description: {exc}",
+            ) from exc
+
+        return format_workspace_info_item(resolved_workspace, description)
 
     @app.post(
         "/api/chunks/paginated",

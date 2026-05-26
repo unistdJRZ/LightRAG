@@ -1083,6 +1083,33 @@ class PostgreSQLDB:
                 e,
             )
 
+    async def _migrate_text_chunks_add_extracted_kg(self):
+        """Add extracted_kg column to LIGHTRAG_DOC_CHUNKS table if needed."""
+        try:
+            check_column_sql = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'lightrag_doc_chunks'
+            AND column_name = 'extracted_kg'
+            """
+
+            column_info = await self.query(check_column_sql)
+            if not column_info:
+                logger.info("Adding extracted_kg column to LIGHTRAG_DOC_CHUNKS table")
+                add_column_sql = """
+                ALTER TABLE LIGHTRAG_DOC_CHUNKS
+                ADD COLUMN extracted_kg BOOLEAN NOT NULL DEFAULT FALSE
+                """
+                await self.execute(add_column_sql)
+                logger.info(
+                    "Successfully added extracted_kg column to LIGHTRAG_DOC_CHUNKS table"
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to add extracted_kg column to LIGHTRAG_DOC_CHUNKS: %s",
+                e,
+            )
+
     async def _migrate_doc_status_add_track_id(self):
         """Add track_id column to LIGHTRAG_DOC_STATUS table if it doesn't exist and create index"""
         try:
@@ -1492,6 +1519,13 @@ class PostgreSQLDB:
                 f"PostgreSQL, Failed to migrate text chunks translated_cn field: {e}"
             )
 
+        try:
+            await self._migrate_text_chunks_add_extracted_kg()
+        except Exception as e:
+            logger.error(
+                f"PostgreSQL, Failed to migrate text chunks extracted_kg field: {e}"
+            )
+
         # Migrate field lengths for entity_name, source_id, target_id, and file_path
         try:
             await self._migrate_field_lengths()
@@ -1535,6 +1569,11 @@ class PostgreSQLDB:
             logger.error(
                 f"PostgreSQL, Failed to create agent submit cache indexes: {e}"
             )
+
+        try:
+            await self._create_workspace_info_indexes()
+        except Exception as e:
+            logger.error(f"PostgreSQL, Failed to create workspace info indexes: {e}")
 
         try:
             await self._create_doc_qa_pair_indexes()
@@ -1704,6 +1743,32 @@ class PostgreSQLDB:
                     index["name"],
                     e,
                 )
+
+    async def _create_workspace_info_indexes(self):
+        """Create indexes for workspace description lookups."""
+        index = {
+            "table": "lightrag_workspace_info",
+            "name": "idx_lightrag_workspace_info_workspace",
+            "sql": "CREATE INDEX IF NOT EXISTS idx_lightrag_workspace_info_workspace ON LIGHTRAG_WORKSPACE_INFO(workspace)",
+        }
+        try:
+            existing = await self.query(
+                """
+                SELECT indexname
+                FROM pg_indexes
+                WHERE tablename = $1
+                AND indexname = $2
+                """,
+                [index["table"], index["name"]],
+            )
+            if not existing:
+                await self.execute(index["sql"])
+        except Exception as e:
+            logger.warning(
+                "Failed to create workspace info index %s: %s",
+                index["name"],
+                e,
+            )
 
     async def _create_doc_qa_pair_indexes(self):
         """Create indexes to query document QA pairs by workspace and document."""
@@ -2154,6 +2219,7 @@ class PGKVStorage(BaseKVStorage):
                     page_size = None
             response["page_size"] = page_size
             response["translated_cn"] = response.get("translated_cn")
+            response["extracted_kg"] = bool(response.get("extracted_kg", False))
             create_time = response.get("create_time", 0)
             update_time = response.get("update_time", 0)
             response["create_time"] = create_time
@@ -2312,6 +2378,7 @@ class PGKVStorage(BaseKVStorage):
                         page_size = None
                 result["page_size"] = page_size
                 result["translated_cn"] = result.get("translated_cn")
+                result["extracted_kg"] = bool(result.get("extracted_kg", False))
                 create_time = result.get("create_time", 0)
                 update_time = result.get("update_time", 0)
                 result["create_time"] = create_time
@@ -2481,6 +2548,7 @@ class PGKVStorage(BaseKVStorage):
                     "segment_order_index": v.get("segment_order_index"),
                     "llm_cache_list": json.dumps(v.get("llm_cache_list", [])),
                     "translated_cn": v.get("translated_cn"),
+                    "extracted_kg": bool(v.get("extracted_kg", False)),
                     "create_time": current_time,
                     "update_time": current_time,
                 }
@@ -2576,6 +2644,60 @@ class PGKVStorage(BaseKVStorage):
     async def index_done_callback(self) -> None:
         # PG handles persistence automatically
         pass
+
+    async def get_unextracted_chunks(self, limit: int = 1000) -> dict[str, dict[str, Any]]:
+        if not is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
+            return await super().get_unextracted_chunks(limit)
+
+        sql = """
+        SELECT id, tokens, COALESCE(content, '') as content,
+               chunk_order_index, full_doc_id, file_path, page_id, bbox, page_size,
+               content_type, ocr_chunk_id, image_base64, image_text,
+               segment_order_index, translated_cn, extracted_kg,
+               COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
+               EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
+               EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
+        FROM LIGHTRAG_DOC_CHUNKS
+        WHERE workspace=$1
+          AND COALESCE(extracted_kg, FALSE) = FALSE
+          AND COALESCE(content_type, '') <> 'image'
+        ORDER BY create_time ASC, chunk_order_index ASC, id ASC
+        LIMIT $2
+        """
+        rows = await self.db.query(
+            sql,
+            [self.workspace, limit],
+            multirows=True,
+        )
+        chunks: dict[str, dict[str, Any]] = {}
+        for row in rows or []:
+            chunk_id = row.pop("id")
+            for json_field in ("llm_cache_list", "bbox", "page_size"):
+                value = row.get(json_field)
+                if isinstance(value, str):
+                    try:
+                        row[json_field] = json.loads(value)
+                    except json.JSONDecodeError:
+                        row[json_field] = [] if json_field == "llm_cache_list" else None
+            row["extracted_kg"] = bool(row.get("extracted_kg", False))
+            chunks[chunk_id] = row
+        return chunks
+
+    async def mark_chunks_extracted(
+        self, ids: list[str], extracted: bool = True
+    ) -> None:
+        if not ids or not is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
+            return
+
+        sql = """
+        UPDATE LIGHTRAG_DOC_CHUNKS
+        SET extracted_kg=$3, update_time=CURRENT_TIMESTAMP
+        WHERE workspace=$1 AND id = ANY($2)
+        """
+        await self.db.execute(
+            sql,
+            {"workspace": self.workspace, "ids": ids, "extracted": extracted},
+        )
 
     async def is_empty(self) -> bool:
         """Check if the storage is empty for the current workspace and namespace
@@ -5835,6 +5957,7 @@ TABLES = {
                     image_text TEXT NULL,
                     segment_order_index INTEGER NULL,
                     translated_cn TEXT NULL,
+                    extracted_kg BOOLEAN NOT NULL DEFAULT FALSE,
                     llm_cache_list JSONB NULL DEFAULT '[]'::jsonb,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
@@ -5988,6 +6111,15 @@ TABLES = {
                     CONSTRAINT LIGHTRAG_AGENT_SUBMIT_CACHE_PK PRIMARY KEY (workspace, id)
                     )"""
     },
+    "LIGHTRAG_WORKSPACE_INFO": {
+        "ddl": """CREATE TABLE LIGHTRAG_WORKSPACE_INFO (
+                    workspace VARCHAR(255) NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT LIGHTRAG_WORKSPACE_INFO_PK PRIMARY KEY (workspace)
+                    )"""
+    },
     "LIGHTRAG_DOC_QA_PAIRS": {
         "ddl": """CREATE TABLE LIGHTRAG_DOC_QA_PAIRS (
                     workspace VARCHAR(255) NOT NULL,
@@ -6017,7 +6149,7 @@ SQL_TEMPLATES = {
                             """,
     "get_by_id_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
                                 chunk_order_index, full_doc_id, file_path, page_id, bbox, page_size,
-                                content_type, ocr_chunk_id, image_base64, image_text, segment_order_index, translated_cn,
+                                content_type, ocr_chunk_id, image_base64, image_text, segment_order_index, translated_cn, extracted_kg,
                                 COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
@@ -6035,7 +6167,7 @@ SQL_TEMPLATES = {
                             """,
     "get_by_ids_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
                                   chunk_order_index, full_doc_id, file_path, page_id, bbox, page_size,
-                                  content_type, ocr_chunk_id, image_base64, image_text, segment_order_index, translated_cn,
+                                  content_type, ocr_chunk_id, image_base64, image_text, segment_order_index, translated_cn, extracted_kg,
                                   COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
                                   EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                   EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
@@ -6108,8 +6240,8 @@ SQL_TEMPLATES = {
     "upsert_text_chunk": """INSERT INTO LIGHTRAG_DOC_CHUNKS (workspace, id, tokens,
                       chunk_order_index, full_doc_id, content, file_path, page_id, bbox, page_size,
                       content_type, ocr_chunk_id, image_base64, image_text, segment_order_index, llm_cache_list,
-                      translated_cn, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                      translated_cn, extracted_kg, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET tokens=EXCLUDED.tokens,
                       chunk_order_index=EXCLUDED.chunk_order_index,
@@ -6126,6 +6258,7 @@ SQL_TEMPLATES = {
                       segment_order_index=EXCLUDED.segment_order_index,
                       llm_cache_list=EXCLUDED.llm_cache_list,
                       translated_cn=EXCLUDED.translated_cn,
+                      extracted_kg=EXCLUDED.extracted_kg,
                       update_time = EXCLUDED.update_time
                      """,
     "upsert_full_entities": """INSERT INTO LIGHTRAG_FULL_ENTITIES (workspace, id, entity_names, count,

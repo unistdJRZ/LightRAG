@@ -88,6 +88,7 @@ class TextChunkSchema(TypedDict):
     segment_order_index: NotRequired[int]
     llm_cache_list: NotRequired[list[str]]
     translated_cn: NotRequired[str]
+    extracted_kg: NotRequired[bool]
 
 
 class ConversationHistoryReference(TypedDict):
@@ -445,6 +446,23 @@ class BaseKVStorage(StorageNameSpace, ABC):
         Returns:
             bool: True if storage contains no data, False otherwise
         """
+
+    async def get_unextracted_chunks(self, limit: int = 1000) -> dict[str, dict[str, Any]]:
+        """Return chunks that have not completed KG extraction.
+
+        Storage backends that support deferred KG extraction should override this.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support scanning unextracted chunks"
+        )
+
+    async def mark_chunks_extracted(
+        self, ids: list[str], extracted: bool = True
+    ) -> None:
+        """Mark chunks as having completed KG extraction."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support marking extracted chunks"
+        )
 
 
 @dataclass
