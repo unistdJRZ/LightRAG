@@ -35,9 +35,40 @@ sys.modules.setdefault("pipmaster", pipmaster_stub)
 
 
 def _load_translate_chunk_to_cn():
-    from lightrag.api.lightrag_server import translate_chunk_to_cn
+    argv = sys.argv[:]
+    try:
+        sys.argv = [sys.argv[0]]
+        from lightrag.api.lightrag_server import translate_chunk_to_cn
+    finally:
+        sys.argv = argv
 
     return translate_chunk_to_cn
+
+
+def _load_chunk_file_id_helpers():
+    argv = sys.argv[:]
+    try:
+        sys.argv = [sys.argv[0]]
+        from lightrag.api.lightrag_server import (
+            _extract_file_id_from_doc_status,
+            _resolve_chunk_file_id,
+        )
+    finally:
+        sys.argv = argv
+
+    return _extract_file_id_from_doc_status, _resolve_chunk_file_id
+
+
+class _FakeDocStatusStorage:
+    def __init__(self):
+        self.by_id: dict[str, dict] = {}
+        self.by_file_path: dict[str, dict] = {}
+
+    async def get_by_id(self, doc_id: str):
+        return self.by_id.get(doc_id)
+
+    async def get_doc_by_file_path(self, file_path: str):
+        return self.by_file_path.get(file_path)
 
 
 class _FakeTextChunksStorage:
@@ -59,6 +90,7 @@ class _FakeTextChunksStorage:
 class _FakeRAG:
     def __init__(self, chunk_data: dict | None, llm_response: str = "翻译结果"):
         self.text_chunks = _FakeTextChunksStorage(chunk_data)
+        self.doc_status = _FakeDocStatusStorage()
         self.llm_calls: list[dict] = []
         self._llm_response = llm_response
 
@@ -81,6 +113,44 @@ class _FakeRAG:
             }
         )
         return self._llm_response
+
+
+@pytest.mark.offline
+def test_chunk_file_id_helpers_resolve_meta_info_and_file_path_fallback():
+    extract_file_id, resolve_chunk_file_id = _load_chunk_file_id_helpers()
+    assert (
+        extract_file_id({"metadata": {"meta_info": {"file_id": "file-meta"}}})
+        == "file-meta"
+    )
+    assert extract_file_id({"metadata": {"file_id": "file-direct"}}) == "file-direct"
+
+    rag = _FakeRAG({"content": "chunk"})
+    rag.doc_status.by_id["doc-1"] = {
+        "metadata": {"meta_info": {"file_id": "file-from-doc"}}
+    }
+    assert (
+        asyncio.run(
+            resolve_chunk_file_id(
+                rag,
+                {"full_doc_id": "doc-1", "file_path": "/tmp/doc.txt"},
+            )
+        )
+        == "file-from-doc"
+    )
+
+    rag.doc_status.by_id.clear()
+    rag.doc_status.by_file_path["/tmp/doc.txt"] = {
+        "metadata": {"file_id": "file-from-path"}
+    }
+    assert (
+        asyncio.run(
+            resolve_chunk_file_id(
+                rag,
+                {"full_doc_id": "missing-doc", "file_path": "/tmp/doc.txt"},
+            )
+        )
+        == "file-from-path"
+    )
 
 
 @pytest.mark.offline

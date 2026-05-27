@@ -111,9 +111,29 @@ class ChunkContentRequest(BaseModel):
 
 
 class ChunkContentResponse(BaseModel):
+    chunk_id: str = Field(description="Chunk identifier")
     content: str = Field(description="Full text content of the requested chunk")
     content_type: str | None = Field(
         default=None, description="Chunk content type when available"
+    )
+    full_doc_id: str | None = Field(
+        default=None, description="Owning document identifier when available"
+    )
+    file_id: str | None = Field(
+        default=None, description="Document file_id from doc status metadata when available"
+    )
+    file_path: str | None = Field(
+        default=None, description="Document file path when available"
+    )
+    page_id: int | None = Field(default=None, description="Page index when available")
+    bbox: list[float] | None = Field(
+        default=None, description="Chunk bounding box when available"
+    )
+    page_size: list[float] | None = Field(
+        default=None, description="Page size when available"
+    )
+    ocr_chunk_id: str | None = Field(
+        default=None, description="OCR chunk identifier when available"
     )
     image_base64: str | None = Field(
         default=None, description="Image payload for image chunks when available"
@@ -218,6 +238,60 @@ Requirements:
 - Preserve Markdown structure when present.
 - Preserve proper nouns, product names, code, URLs, numbers, and file paths when translation would be inappropriate.
 - Return only the translated Chinese text without explanations or extra commentary."""
+
+
+def _extract_file_id_from_doc_status(doc_status: Any) -> str | None:
+    if doc_status is None:
+        return None
+
+    metadata = getattr(doc_status, "metadata", None)
+    if metadata is None and isinstance(doc_status, dict):
+        metadata = doc_status.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+
+    meta_info = metadata.get("meta_info")
+    if isinstance(meta_info, dict) and meta_info.get("file_id") is not None:
+        return str(meta_info["file_id"])
+
+    if metadata.get("file_id") is not None:
+        return str(metadata["file_id"])
+
+    return None
+
+
+async def _resolve_chunk_file_id(rag: LightRAG, chunk_data: dict[str, Any]) -> str | None:
+    doc_status = getattr(rag, "doc_status", None)
+    if doc_status is None:
+        return None
+
+    full_doc_id = chunk_data.get("full_doc_id")
+    if isinstance(full_doc_id, str) and full_doc_id:
+        try:
+            file_id = _extract_file_id_from_doc_status(
+                await doc_status.get_by_id(full_doc_id)
+            )
+            if file_id is not None:
+                return file_id
+        except Exception as exc:
+            logger.warning("Failed to resolve file_id for doc %s: %s", full_doc_id, exc)
+
+    file_path = chunk_data.get("file_path")
+    if isinstance(file_path, str) and file_path:
+        get_doc_by_file_path = getattr(doc_status, "get_doc_by_file_path", None)
+        if callable(get_doc_by_file_path):
+            try:
+                return _extract_file_id_from_doc_status(
+                    await get_doc_by_file_path(file_path)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to resolve file_id for file_path %s: %s",
+                    file_path,
+                    exc,
+                )
+
+    return None
 
 
 async def translate_chunk_to_cn(
@@ -1989,9 +2063,38 @@ def create_app(args):
         chunk_content = chunk_data.get("content", "")
         if str(chunk_data.get("content_type", "") or "").strip().lower() == "image":
             chunk_content = resolved_image_base64 or chunk_content
+        file_id = await _resolve_chunk_file_id(workspace_rags[workspace], chunk_data)
         return ChunkContentResponse(
+            chunk_id=chunk_id,
             content=str(chunk_content or ""),
             content_type=str(chunk_data.get("content_type", "") or "").strip() or None,
+            full_doc_id=(
+                str(chunk_data.get("full_doc_id"))
+                if chunk_data.get("full_doc_id") is not None
+                else None
+            ),
+            file_id=file_id,
+            file_path=(
+                str(chunk_data.get("file_path"))
+                if chunk_data.get("file_path") is not None
+                else None
+            ),
+            page_id=(
+                int(chunk_data.get("page_id"))
+                if isinstance(chunk_data.get("page_id"), (int, float))
+                else None
+            ),
+            bbox=chunk_data.get("bbox") if isinstance(chunk_data.get("bbox"), list) else None,
+            page_size=(
+                chunk_data.get("page_size")
+                if isinstance(chunk_data.get("page_size"), list)
+                else None
+            ),
+            ocr_chunk_id=(
+                str(chunk_data.get("ocr_chunk_id"))
+                if chunk_data.get("ocr_chunk_id") is not None
+                else None
+            ),
             image_base64=resolved_image_base64,
             image_text=resolved_image_text,
         )
