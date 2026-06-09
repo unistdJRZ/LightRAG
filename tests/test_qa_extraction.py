@@ -9,6 +9,11 @@ from lightrag.qa_extraction import (
     extract_doc_qa_pairs,
     replace_doc_qa_pairs,
 )
+from lightrag.knowledge_base_qa import (
+    build_knowledge_base_qa_vector_data,
+    query_knowledge_base_qa_by_rule,
+    upsert_knowledge_base_qa_rows,
+)
 
 
 def test_extract_json_object_from_fenced_response():
@@ -262,3 +267,90 @@ def test_replace_doc_qa_pairs_inserts_final_qas():
     assert insert_call[1]["question"] == "What is LightRAG?"
     metadata = json.loads(insert_call[1]["metadata"])
     assert metadata["document_identity"]["title"] == "Example"
+
+
+def test_build_knowledge_base_qa_vector_data_uses_question_content():
+    vector_data = build_knowledge_base_qa_vector_data(
+        [
+            {
+                "id": "kbqa-1",
+                "question": "How many files are in this knowledge base?",
+                "answer": "There are 10 files.",
+            }
+        ]
+    )
+
+    assert vector_data == {
+        "kbqa-1": {
+            "content": "How many files are in this knowledge base?",
+            "kbqa_id": "kbqa-1",
+        }
+    }
+
+
+def test_upsert_knowledge_base_qa_rows_inserts_rows():
+    class FakeDB:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, sql, data=None):
+            self.calls.append((sql, data))
+
+    db = FakeDB()
+
+    count_rows = asyncio.run(
+        upsert_knowledge_base_qa_rows(
+            db=db,
+            workspace="default",
+            qa_rows=[
+                {
+                    "id": "kbqa-1",
+                    "question": "What is the document count?",
+                    "answer": "The knowledge base has 3 documents.",
+                }
+            ],
+        )
+    )
+
+    assert count_rows[0]["id"] == "kbqa-1"
+    insert_call = db.calls[-1]
+    assert "INSERT INTO LIGHTRAG_KNOWLEDGE_BASE_QA" in insert_call[0]
+    assert insert_call[1]["workspace"] == "default"
+    assert insert_call[1]["question"] == "What is the document count?"
+
+
+def test_query_knowledge_base_qa_by_rule_uses_workspace_and_query():
+    class FakeDB:
+        def __init__(self):
+            self.query_args = None
+
+        async def execute(self, sql, data=None):
+            return None
+
+        async def query(self, sql, params=None, multirows=False):
+            self.query_args = (sql, params, multirows)
+            return [
+                {
+                    "id": "kbqa-1",
+                    "workspace": "default",
+                    "question": "What is the document count?",
+                    "answer": "Three.",
+                    "metadata": "{}",
+                    "match_rank": 1,
+                }
+            ]
+
+    db = FakeDB()
+
+    rows = asyncio.run(
+        query_knowledge_base_qa_by_rule(
+            db=db,
+            workspace="default",
+            query="document count",
+            top_k=5,
+        )
+    )
+
+    assert rows[0]["id"] == "kbqa-1"
+    assert rows[0]["metadata"] == {}
+    assert db.query_args[1] == ["default", "document count", "%document count%", 5]

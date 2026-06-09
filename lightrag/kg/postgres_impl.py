@@ -1374,6 +1374,7 @@ class PostgreSQLDB:
             "LIGHTRAG_VDB_ENTITY",
             "LIGHTRAG_VDB_RELATION",
             "LIGHTRAG_VDB_QA_PAIRS",
+            "LIGHTRAG_VDB_KNOWLEDGE_BASE_QA",
         }
 
         # First create all tables (except vector tables)
@@ -1579,6 +1580,13 @@ class PostgreSQLDB:
             await self._create_doc_qa_pair_indexes()
         except Exception as e:
             logger.error(f"PostgreSQL, Failed to create doc QA pair indexes: {e}")
+
+        try:
+            await self._create_knowledge_base_qa_indexes()
+        except Exception as e:
+            logger.error(
+                f"PostgreSQL, Failed to create knowledge-base QA indexes: {e}"
+            )
 
     async def _migrate_create_full_entities_relations_tables(self):
         """Create LIGHTRAG_FULL_ENTITIES and LIGHTRAG_FULL_RELATIONS tables if they don't exist"""
@@ -1801,6 +1809,36 @@ class PostgreSQLDB:
             except Exception as e:
                 logger.warning(
                     "Failed to create doc QA pair index %s: %s",
+                    index["name"],
+                    e,
+                )
+
+    async def _create_knowledge_base_qa_indexes(self):
+        """Create indexes to query knowledge-base QA pairs by workspace."""
+        indexes = [
+            {
+                "table": "lightrag_knowledge_base_qa",
+                "name": "idx_lightrag_knowledge_base_qa_workspace",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_lightrag_knowledge_base_qa_workspace ON LIGHTRAG_KNOWLEDGE_BASE_QA(workspace)",
+            },
+        ]
+
+        for index in indexes:
+            try:
+                existing = await self.query(
+                    """
+                    SELECT indexname
+                    FROM pg_indexes
+                    WHERE tablename = $1
+                    AND indexname = $2
+                    """,
+                    [index["table"], index["name"]],
+                )
+                if not existing:
+                    await self.execute(index["sql"])
+            except Exception as e:
+                logger.warning(
+                    "Failed to create knowledge-base QA index %s: %s",
                     index["name"],
                     e,
                 )
@@ -3257,6 +3295,13 @@ class PGVectorStorage(BaseVectorStorage):
                 await self.db.execute(
                     f"CREATE INDEX IF NOT EXISTS {index_name} ON {self.table_name}(workspace, doc_id)"
                 )
+            if is_namespace(
+                self.namespace, NameSpace.VECTOR_STORE_KNOWLEDGE_BASE_QA
+            ):
+                index_name = _safe_index_name(self.table_name, "workspace_kbqa_id")
+                await self.db.execute(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} ON {self.table_name}(workspace, kbqa_id)"
+                )
 
     async def finalize(self):
         if self.db is not None:
@@ -3379,6 +3424,25 @@ class PGVectorStorage(BaseVectorStorage):
         )
         return upsert_sql, values
 
+    def _upsert_knowledge_base_qa(
+        self, item: dict[str, Any], current_time: datetime.datetime
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Prepare upsert data for knowledge-base QA question vectors."""
+
+        upsert_sql = SQL_TEMPLATES["upsert_knowledge_base_qa"].format(
+            table_name=self.table_name
+        )
+        values: tuple[Any, ...] = (
+            self.workspace,
+            item["__id__"],
+            item.get("kbqa_id") or item["__id__"],
+            item["content"],
+            item["__vector__"],
+            current_time,
+            current_time,
+        )
+        return upsert_sql, values
+
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         logger.debug(f"[{self.workspace}] Inserting {len(data)} to {self.namespace}")
         if not data:
@@ -3417,6 +3481,12 @@ class PGVectorStorage(BaseVectorStorage):
                 upsert_sql, values = self._upsert_entities(item, current_time)
             elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_RELATIONSHIPS):
                 upsert_sql, values = self._upsert_relationships(item, current_time)
+            elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_QA_PAIRS):
+                upsert_sql, values = self._upsert_qa_pairs(item, current_time)
+            elif is_namespace(
+                self.namespace, NameSpace.VECTOR_STORE_KNOWLEDGE_BASE_QA
+            ):
+                upsert_sql, values = self._upsert_knowledge_base_qa(item, current_time)
             else:
                 raise ValueError(f"{self.namespace} is not supported")
 
@@ -3466,6 +3536,10 @@ class PGVectorStorage(BaseVectorStorage):
                 upsert_sql, values = self._upsert_relationships(item, current_time)
             elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_QA_PAIRS):
                 upsert_sql, values = self._upsert_qa_pairs(item, current_time)
+            elif is_namespace(
+                self.namespace, NameSpace.VECTOR_STORE_KNOWLEDGE_BASE_QA
+            ):
+                upsert_sql, values = self._upsert_knowledge_base_qa(item, current_time)
             else:
                 raise ValueError(f"{self.namespace} is not supported")
 
@@ -3540,6 +3614,39 @@ class PGVectorStorage(BaseVectorStorage):
         params = {
             "workspace": self.workspace,
             "doc_id": doc_id,
+            "closer_than_threshold": 1 - self.cosine_better_than_threshold,
+            "top_k": top_k,
+        }
+        return await self.db.query(sql, params=list(params.values()), multirows=True)
+
+    async def query_knowledge_base_qa(
+        self,
+        query: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+    ) -> list[dict[str, Any]]:
+        """Query knowledge-base QA question vectors within a workspace."""
+
+        if not is_namespace(
+            self.namespace, NameSpace.VECTOR_STORE_KNOWLEDGE_BASE_QA
+        ):
+            raise ValueError(
+                "query_knowledge_base_qa is only supported for knowledge-base QA vectors"
+            )
+
+        if query_embedding is not None:
+            embedding = query_embedding
+        else:
+            embeddings = await self.embedding_func([query], _priority=5)
+            embedding = embeddings[0]
+
+        embedding_string = ",".join(map(str, embedding))
+        sql = SQL_TEMPLATES["knowledge_base_qa"].format(
+            embedding_string=embedding_string,
+            table_name=self.table_name,
+        )
+        params = {
+            "workspace": self.workspace,
             "closer_than_threshold": 1 - self.cosine_better_than_threshold,
             "top_k": top_k,
         }
@@ -5915,6 +6022,7 @@ NAMESPACE_TABLE_MAP = {
     NameSpace.VECTOR_STORE_ENTITIES: "LIGHTRAG_VDB_ENTITY",
     NameSpace.VECTOR_STORE_RELATIONSHIPS: "LIGHTRAG_VDB_RELATION",
     NameSpace.VECTOR_STORE_QA_PAIRS: "LIGHTRAG_VDB_QA_PAIRS",
+    NameSpace.VECTOR_STORE_KNOWLEDGE_BASE_QA: "LIGHTRAG_VDB_KNOWLEDGE_BASE_QA",
     NameSpace.DOC_STATUS: "LIGHTRAG_DOC_STATUS",
 }
 
@@ -6021,6 +6129,18 @@ TABLES = {
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     CONSTRAINT LIGHTRAG_VDB_QA_PAIRS_PK PRIMARY KEY (workspace, id)
+                    )"""
+    },
+    "LIGHTRAG_VDB_KNOWLEDGE_BASE_QA": {
+        "ddl": """CREATE TABLE LIGHTRAG_VDB_KNOWLEDGE_BASE_QA (
+                    id VARCHAR(255),
+                    workspace VARCHAR(255),
+                    kbqa_id VARCHAR(255) NOT NULL,
+                    content TEXT,
+                    content_vector VECTOR(dimension),
+                    create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT LIGHTRAG_VDB_KNOWLEDGE_BASE_QA_PK PRIMARY KEY (workspace, id)
                     )"""
     },
     "LIGHTRAG_LLM_CACHE": {
@@ -6135,6 +6255,18 @@ TABLES = {
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     CONSTRAINT LIGHTRAG_DOC_QA_PAIRS_PK PRIMARY KEY (workspace, id)
+                    )"""
+    },
+    "LIGHTRAG_KNOWLEDGE_BASE_QA": {
+        "ddl": """CREATE TABLE LIGHTRAG_KNOWLEDGE_BASE_QA (
+                    workspace VARCHAR(255) NOT NULL,
+                    id VARCHAR(255) NOT NULL,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    metadata JSONB NULL DEFAULT '{}'::jsonb,
+                    create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT LIGHTRAG_KNOWLEDGE_BASE_QA_PK PRIMARY KEY (workspace, id)
                     )"""
     },
 }
@@ -6342,6 +6474,15 @@ SQL_TEMPLATES = {
                       content_vector=EXCLUDED.content_vector,
                       update_time=EXCLUDED.update_time
                      """,
+    "upsert_knowledge_base_qa": """INSERT INTO {table_name} (workspace, id, kbqa_id,
+                      content, content_vector, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7)
+                      ON CONFLICT (workspace,id) DO UPDATE
+                      SET kbqa_id=EXCLUDED.kbqa_id,
+                      content=EXCLUDED.content,
+                      content_vector=EXCLUDED.content_vector,
+                      update_time=EXCLUDED.update_time
+                     """,
     "relationships": """
                      SELECT r.source_id AS src_id,
                             r.target_id AS tgt_id,
@@ -6379,6 +6520,7 @@ SQL_TEMPLATES = {
               SELECT q.qa_id,
                      q.doc_id,
                      q.id,
+                     q.content_vector <=> '[{embedding_string}]'::vector AS distance,
                      EXTRACT(EPOCH FROM q.create_time)::BIGINT AS created_at
               FROM {table_name} q
               WHERE q.workspace = $1
@@ -6390,6 +6532,7 @@ SQL_TEMPLATES = {
               SELECT q.qa_id,
                      q.doc_id,
                      q.id,
+                     q.content_vector <=> '[{embedding_string}]'::vector AS distance,
                      EXTRACT(EPOCH FROM q.create_time)::BIGINT AS created_at
               FROM {table_name} q
               WHERE q.workspace = $1
@@ -6397,6 +6540,17 @@ SQL_TEMPLATES = {
                 AND q.content_vector <=> '[{embedding_string}]'::vector < $3
               ORDER BY q.content_vector <=> '[{embedding_string}]'::vector
               LIMIT $4;
+              """,
+    "knowledge_base_qa": """
+              SELECT q.kbqa_id,
+                     q.id,
+                     q.content_vector <=> '[{embedding_string}]'::vector AS distance,
+                     EXTRACT(EPOCH FROM q.create_time)::BIGINT AS created_at
+              FROM {table_name} q
+              WHERE q.workspace = $1
+                AND q.content_vector <=> '[{embedding_string}]'::vector < $2
+              ORDER BY q.content_vector <=> '[{embedding_string}]'::vector
+              LIMIT $3;
               """,
     # DROP tables
     "drop_specifiy_table_workspace": """

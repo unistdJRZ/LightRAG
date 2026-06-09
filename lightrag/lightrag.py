@@ -102,6 +102,13 @@ from lightrag.qa_extraction import (
     get_doc_qa_pairs_by_ids,
     replace_doc_qa_pairs,
 )
+from lightrag.knowledge_base_qa import (
+    build_knowledge_base_qa_vector_data,
+    ensure_knowledge_base_qa_table,
+    get_knowledge_base_qa_by_ids,
+    query_knowledge_base_qa_by_rule,
+    upsert_knowledge_base_qa_rows,
+)
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.utils import (
     Tokenizer,
@@ -854,6 +861,12 @@ class LightRAG:
             embedding_func=self.embedding_func,
             meta_fields={"doc_id", "qa_id"},
         )
+        self.knowledge_base_qa_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
+            namespace=NameSpace.VECTOR_STORE_KNOWLEDGE_BASE_QA,
+            workspace=self.workspace,
+            embedding_func=self.embedding_func,
+            meta_fields={"kbqa_id"},
+        )
 
         # Initialize document status storage
         self.doc_status: DocStatusStorage = self.doc_status_storage_cls(
@@ -911,6 +924,7 @@ class LightRAG:
                 self.relationships_vdb,
                 self.chunks_vdb,
                 self.qa_pairs_vdb,
+                self.knowledge_base_qa_vdb,
                 self.chunk_entity_relation_graph,
                 self.llm_response_cache,
                 self.doc_status,
@@ -936,6 +950,7 @@ class LightRAG:
                 ("relationships_vdb", self.relationships_vdb),
                 ("chunks_vdb", self.chunks_vdb),
                 ("qa_pairs_vdb", self.qa_pairs_vdb),
+                ("knowledge_base_qa_vdb", self.knowledge_base_qa_vdb),
                 ("chunk_entity_relation_graph", self.chunk_entity_relation_graph),
                 ("llm_response_cache", self.llm_response_cache),
                 ("doc_status", self.doc_status),
@@ -2944,6 +2959,77 @@ class LightRAG:
         )
         distance_by_id = {
             str(result.get("qa_id") or result.get("id")): result.get("distance")
+            for result in vector_results
+        }
+        for row in rows:
+            row["distance"] = distance_by_id.get(str(row.get("id")))
+        return rows
+
+    async def upsert_knowledge_base_qa_pairs(
+        self,
+        qa_rows: list[dict[str, Any]],
+    ) -> int:
+        """Store workspace-level QA rows and index their questions in vector storage."""
+
+        db = getattr(self.full_docs, "db", None)
+        if db is None:
+            raise ValueError("PostgreSQL storage is required for knowledge-base QA")
+
+        normalized_rows = await upsert_knowledge_base_qa_rows(
+            db=db,
+            workspace=self.full_docs.workspace,
+            qa_rows=qa_rows,
+        )
+        vector_data = build_knowledge_base_qa_vector_data(normalized_rows)
+        if self.knowledge_base_qa_vdb and vector_data:
+            await self.knowledge_base_qa_vdb.upsert(vector_data)
+        return len(normalized_rows)
+
+    async def query_knowledge_base_qa(
+        self,
+        *,
+        query: str,
+        top_k: int = 5,
+        mode: Literal["rule", "vector"] = "vector",
+    ) -> list[dict[str, Any]]:
+        """Search workspace-level QA pairs by rule matching or vector retrieval."""
+
+        db = getattr(self.full_docs, "db", None)
+        if db is None:
+            raise ValueError("PostgreSQL storage is required for knowledge-base QA")
+
+        await ensure_knowledge_base_qa_table(db)
+        if mode == "rule":
+            return await query_knowledge_base_qa_by_rule(
+                db=db,
+                workspace=self.full_docs.workspace,
+                query=query,
+                top_k=top_k,
+            )
+
+        if hasattr(self.knowledge_base_qa_vdb, "query_knowledge_base_qa"):
+            vector_results = await self.knowledge_base_qa_vdb.query_knowledge_base_qa(
+                query=query,
+                top_k=top_k,
+            )
+        else:
+            vector_results = await self.knowledge_base_qa_vdb.query(
+                query=query,
+                top_k=top_k,
+            )
+
+        kbqa_ids = [
+            str(result.get("kbqa_id") or result.get("id"))
+            for result in vector_results
+            if result.get("kbqa_id") or result.get("id")
+        ]
+        rows = await get_knowledge_base_qa_by_ids(
+            db=db,
+            workspace=self.full_docs.workspace,
+            kbqa_ids=kbqa_ids,
+        )
+        distance_by_id = {
+            str(result.get("kbqa_id") or result.get("id")): result.get("distance")
             for result in vector_results
         }
         for row in rows:

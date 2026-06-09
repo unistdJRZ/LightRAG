@@ -17,6 +17,7 @@ class NameSpace:
     VECTOR_STORE_RELATIONSHIPS = "relationships"
     VECTOR_STORE_CHUNKS = "chunks"
     VECTOR_STORE_QA_PAIRS = "qa_pairs"
+    VECTOR_STORE_KNOWLEDGE_BASE_QA = "knowledge_base_qa"
 
     GRAPH_STORE_CHUNK_ENTITY_RELATION = "chunk_entity_relation"
 
