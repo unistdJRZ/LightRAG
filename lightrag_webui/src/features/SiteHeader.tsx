@@ -51,6 +51,9 @@ function TabsNavigation() {
         <NavigationTab value="knowledge-graph" currentTab={currentTab}>
           {t('header.knowledgeGraph')}
         </NavigationTab>
+        <NavigationTab value="knowledge-base-qa" currentTab={currentTab}>
+          {t('header.knowledgeBaseQA', 'KB QA')}
+        </NavigationTab>
         <NavigationTab value="retrieval" currentTab={currentTab}>
           {t('header.retrieval')}
         </NavigationTab>

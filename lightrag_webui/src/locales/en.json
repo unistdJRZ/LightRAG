@@ -117,6 +117,7 @@
       "title": "Document Management",
       "scanButton": "Scan/Retry",
       "scanTooltip": "Scan and process documents in input folder, and also reprocess all failed documents",
+      "retryExtractKg": "Extract KG on retry",
       "refreshTooltip": "Reset document list",
       "pipelineStatusButton": "Pipeline",
       "pipelineStatusTooltip": "View document processing pipeline status",

@@ -1,5 +1,6 @@
 import json
 import asyncio
+from io import BytesIO
 
 from lightrag.qa_extraction import (
     _call_json_llm,
@@ -11,6 +12,7 @@ from lightrag.qa_extraction import (
 )
 from lightrag.knowledge_base_qa import (
     build_knowledge_base_qa_vector_data,
+    parse_knowledge_base_qa_excel,
     query_knowledge_base_qa_by_rule,
     upsert_knowledge_base_qa_rows,
 )
@@ -286,6 +288,54 @@ def test_build_knowledge_base_qa_vector_data_uses_question_content():
             "kbqa_id": "kbqa-1",
         }
     }
+
+
+def test_parse_knowledge_base_qa_excel_supports_chinese_headers():
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "knowledge_base_qa"
+    worksheet.append(["问题编号", "预设问题", "预设答案", "元数据"])
+    worksheet.append(
+        [
+            "kbqa-1",
+            "这个知识库有多少文档？",
+            "这个知识库有 3 个文档。",
+            '{"category": "statistics"}',
+        ]
+    )
+    buffer = BytesIO()
+    workbook.save(buffer)
+
+    rows = parse_knowledge_base_qa_excel(buffer.getvalue())
+
+    assert rows == [
+        {
+            "id": "kbqa-1",
+            "question": "这个知识库有多少文档？",
+            "answer": "这个知识库有 3 个文档。",
+            "metadata": {"category": "statistics"},
+        }
+    ]
+
+
+def test_parse_knowledge_base_qa_excel_rejects_missing_required_columns():
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.append(["kbqa_id", "question"])
+    worksheet.append(["kbqa-1", "What is missing?"])
+    buffer = BytesIO()
+    workbook.save(buffer)
+
+    try:
+        parse_knowledge_base_qa_excel(buffer.getvalue())
+    except ValueError as exc:
+        assert "answer" in str(exc)
+    else:
+        raise AssertionError("Expected missing answer column to fail")
 
 
 def test_upsert_knowledge_base_qa_rows_inserts_rows():

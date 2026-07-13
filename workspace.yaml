@@ -4,13 +4,13 @@
 # workspace: "default,team_a,team_b"
 workspaces:
   - id: msre
-    alias: MSRE代表文献
+    alias: 26堆型专题知识库（msre）
   # - id: msr_1
   #   alias: MSR-1
-  - id: minmal_test
-    alias: 最小测试
-  - id: msr_ultra_pro
-    alias: 钍基熔盐堆论文库
+  # - id: minmal_test
+  #   alias: 最小测试
+  # - id: msr_ultra_pro
+  #   alias: 钍基熔盐文献知识库 
 
 # Backend dev server (FastAPI)
 backend_host: "0.0.0.0"

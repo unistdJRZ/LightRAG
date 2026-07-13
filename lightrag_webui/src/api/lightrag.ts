@@ -241,6 +241,10 @@ export type ReprocessFailedResponse = {
   track_id: string
 }
 
+export type RetryProcessingRequest = {
+  extract_kg?: boolean
+}
+
 export type DeleteDocResponse = {
   status: 'deletion_started' | 'busy' | 'not_allowed'
   message: string
@@ -404,6 +408,11 @@ export type WorkspacesResponse = {
     has_description?: boolean
   }>
   count: number
+}
+
+export type KnowledgeBaseQAImportResponse = {
+  workspace: string
+  imported_count: number
 }
 
 export type WorkspaceInfo = {
@@ -711,13 +720,15 @@ export const getDocuments = async (): Promise<DocsStatusesResponse> => {
   return response.data
 }
 
-export const scanNewDocuments = async (): Promise<ScanResponse> => {
-  const response = await axiosInstance.post('/documents/scan')
+export const scanNewDocuments = async (request: RetryProcessingRequest = {}): Promise<ScanResponse> => {
+  const response = await axiosInstance.post('/documents/scan', request)
   return response.data
 }
 
-export const reprocessFailedDocuments = async (): Promise<ReprocessFailedResponse> => {
-  const response = await axiosInstance.post('/documents/reprocess_failed')
+export const reprocessFailedDocuments = async (
+  request: RetryProcessingRequest = {}
+): Promise<ReprocessFailedResponse> => {
+  const response = await axiosInstance.post('/documents/reprocess_failed', request)
   return response.data
 }
 
@@ -992,6 +1003,28 @@ export const uploadDocument = async (
       'Content-Type': 'multipart/form-data'
     },
     // prettier-ignore
+    onUploadProgress:
+      onUploadProgress !== undefined
+        ? (progressEvent) => {
+          const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total!)
+          onUploadProgress(percentCompleted)
+        }
+        : undefined
+  })
+  return response.data
+}
+
+export const importKnowledgeBaseQA = async (
+  file: File,
+  onUploadProgress?: (percentCompleted: number) => void
+): Promise<KnowledgeBaseQAImportResponse> => {
+  const formData = new FormData()
+  formData.append('file', file)
+
+  const response = await axiosInstance.post('/knowledge-base-qa/import', formData, {
+    headers: {
+      'Content-Type': 'multipart/form-data'
+    },
     onUploadProgress:
       onUploadProgress !== undefined
         ? (progressEvent) => {

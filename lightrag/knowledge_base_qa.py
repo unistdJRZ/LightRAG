@@ -1,10 +1,53 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from datetime import datetime, timezone
 from typing import Any
 
 from lightrag.utils import compute_mdhash_id, logger
+
+_EXCEL_HEADER_ALIASES = {
+    "kbqa_id": {
+        "kbqa_id",
+        "kbqa-id",
+        "id",
+        "qa_id",
+        "qa-id",
+        "编号",
+        "问题编号",
+    },
+    "question": {
+        "question",
+        "preset_question",
+        "预设问题",
+        "问题",
+    },
+    "answer": {
+        "answer",
+        "preset_answer",
+        "预设答案",
+        "答案",
+    },
+    "metadata": {
+        "metadata",
+        "meta",
+        "扩展信息",
+        "元数据",
+    },
+}
+
+
+def _normalize_excel_header(value: Any) -> str:
+    return str(value or "").strip().lower().replace(" ", "_")
+
+
+def _canonical_excel_header(value: Any) -> str | None:
+    normalized = _normalize_excel_header(value)
+    for canonical, aliases in _EXCEL_HEADER_ALIASES.items():
+        if normalized in aliases:
+            return canonical
+    return None
 
 
 def build_knowledge_base_qa_vector_data(
@@ -35,6 +78,98 @@ def build_knowledge_base_qa_vector_data(
             "kbqa_id": kbqa_id,
         }
     return vector_data
+
+
+def parse_knowledge_base_qa_excel(file_bytes: bytes) -> list[dict[str, Any]]:
+    """Parse a knowledge-base QA preset workbook.
+
+    The first worksheet named `knowledge_base_qa` is preferred. If it does not
+    exist, the active worksheet is used. Row 1 must contain headers. Required
+    columns are `question` and `answer`; `kbqa_id` and `metadata` are optional.
+    """
+
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:  # pragma: no cover - dependency issue
+        raise ValueError("openpyxl is required to import knowledge-base QA Excel") from exc
+
+    try:
+        workbook = load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
+    except Exception as exc:
+        raise ValueError(f"Invalid Excel workbook: {exc}") from exc
+
+    worksheet = (
+        workbook["knowledge_base_qa"]
+        if "knowledge_base_qa" in workbook.sheetnames
+        else workbook.active
+    )
+    rows_iter = worksheet.iter_rows(values_only=True)
+    try:
+        header_row = next(rows_iter)
+    except StopIteration as exc:
+        raise ValueError("Excel workbook is empty") from exc
+
+    column_by_field: dict[str, int] = {}
+    for index, header in enumerate(header_row):
+        canonical = _canonical_excel_header(header)
+        if canonical and canonical not in column_by_field:
+            column_by_field[canonical] = index
+
+    missing = [field for field in ("question", "answer") if field not in column_by_field]
+    if missing:
+        raise ValueError(
+            "Excel is missing required column(s): " + ", ".join(missing)
+        )
+
+    parsed_rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for row_number, row in enumerate(rows_iter, start=2):
+        values = list(row or [])
+        if not any(value not in (None, "") for value in values):
+            continue
+
+        def cell(field: str) -> Any:
+            index = column_by_field.get(field)
+            if index is None or index >= len(values):
+                return None
+            return values[index]
+
+        question = str(cell("question") or "").strip()
+        answer = str(cell("answer") or "").strip()
+        if not question:
+            errors.append(f"row {row_number}: question is required")
+        if not answer:
+            errors.append(f"row {row_number}: answer is required")
+        if not question or not answer:
+            continue
+
+        metadata: dict[str, Any] = {}
+        metadata_value = cell("metadata")
+        if metadata_value not in (None, ""):
+            try:
+                parsed_metadata = json.loads(str(metadata_value))
+            except json.JSONDecodeError:
+                errors.append(f"row {row_number}: metadata must be valid JSON")
+                continue
+            if not isinstance(parsed_metadata, dict):
+                errors.append(f"row {row_number}: metadata must be a JSON object")
+                continue
+            metadata = parsed_metadata
+
+        parsed_rows.append(
+            {
+                "id": str(cell("kbqa_id") or "").strip(),
+                "question": question,
+                "answer": answer,
+                "metadata": metadata,
+            }
+        )
+
+    if errors:
+        raise ValueError("; ".join(errors))
+    if not parsed_rows:
+        raise ValueError("Excel workbook does not contain any valid QA rows")
+    return parsed_rows
 
 
 async def ensure_knowledge_base_qa_table(db: Any) -> None:

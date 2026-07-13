@@ -6,7 +6,7 @@ import { Message, QueryRequest } from '@/api/lightrag'
 
 type Theme = 'dark' | 'light' | 'system'
 type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' | 'ko'
-type Tab = 'documents' | 'chunks' | 'knowledge-graph' | 'retrieval' | 'api'
+type Tab = 'documents' | 'chunks' | 'knowledge-graph' | 'knowledge-base-qa' | 'retrieval' | 'api'
 type WorkspaceOption = { id: string; alias: string; description?: string; has_description?: boolean }
 
 interface SettingsState {
@@ -201,13 +201,13 @@ const useSettingsStoreBase = create<SettingsState>()(
       },
       setWorkspaceInfo: (workspaces: WorkspaceOption[], defaultWorkspace: string) => {
         const normalizedDefault = defaultWorkspace?.trim() || 'default'
-          const normalizedList = workspaces
-            .map((item) => ({
-              id: item.id?.trim(),
-              alias: item.alias?.trim() || item.id?.trim(),
-              description: item.description?.trim() || '',
-              has_description: Boolean(item.has_description || item.description?.trim())
-            }))
+        const normalizedList = workspaces
+          .map((item) => ({
+            id: item.id?.trim(),
+            alias: item.alias?.trim() || item.id?.trim(),
+            description: item.description?.trim() || '',
+            has_description: Boolean(item.has_description || item.description?.trim())
+          }))
           .filter((item): item is WorkspaceOption => !!item.id && item.id.length > 0)
           .filter((item, index, array) => array.findIndex((candidate) => candidate.id === item.id) === index)
 

@@ -210,6 +210,15 @@ class ReprocessResponse(BaseModel):
         }
 
 
+class RetryProcessingRequest(BaseModel):
+    """Request model for scan/retry processing options."""
+
+    extract_kg: bool = Field(
+        default=False,
+        description="Whether retry processing should extract and merge KG. This overrides queued document metadata.",
+    )
+
+
 class CancelPipelineResponse(BaseModel):
     """Response model for pipeline cancellation operation
 
@@ -250,7 +259,7 @@ class InsertTextRequest(BaseModel):
     )
     file_source: str = Field(default=None, min_length=0, description="File Source")
     extract_kg: bool = Field(
-        default=True,
+        default=False,
         description="Whether to extract and merge KG during import. Set false to import chunks and embeddings only.",
     )
 
@@ -293,7 +302,7 @@ class InsertTextsRequest(BaseModel):
         default=None, min_length=0, description="Sources of the texts"
     )
     extract_kg: bool = Field(
-        default=True,
+        default=False,
         description="Whether to extract and merge KG during import. Set false to import chunks and embeddings only.",
     )
 
@@ -346,7 +355,7 @@ class RegisterDocumentRequest(BaseModel):
         description="Use OCR server content_router endpoint instead of content endpoint.",
     )
     extract_kg: bool = Field(
-        default=True,
+        default=False,
         description="Whether to extract and merge KG during import. Set false to import chunks and embeddings only.",
     )
 
@@ -1987,6 +1996,7 @@ async def pipeline_enqueue_file(
     ocr_router: bool = False,
     move_to_enqueued: bool = True,
     meta_info: Optional[dict[str, Any]] = None,
+    extract_kg: bool = False,
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -1999,6 +2009,7 @@ async def pipeline_enqueue_file(
         ocr_router: Whether to fetch OCR result from content_router endpoint
         move_to_enqueued: Whether to move the source file into __enqueued__ directory
         meta_info: Optional metadata passed through enqueue pipeline into doc_status.metadata.meta_info
+        extract_kg: Whether downstream processing should run KG extraction for this document
     Returns:
         tuple: (success: bool, track_id: str)
     """
@@ -2017,6 +2028,7 @@ async def pipeline_enqueue_file(
         if ocr_id:
             retryable_ocr_metadata["ocr_id"] = ocr_id
             retryable_ocr_metadata["ocr_router"] = ocr_router
+            retryable_ocr_metadata["extract_kg"] = extract_kg
             if meta_info:
                 retryable_ocr_metadata["meta_info"] = dict(meta_info)
             if file_source:
@@ -2456,11 +2468,13 @@ async def pipeline_enqueue_file(
                 return False, track_id
 
             try:
+                enqueue_meta_info = dict(meta_info or {})
+                enqueue_meta_info["extract_kg"] = extract_kg
                 await rag.apipeline_enqueue_documents(
                     input=content,
                     file_paths=effective_file_source,
                     track_id=track_id,
-                    meta_info=meta_info,
+                    meta_info=enqueue_meta_info,
                 )
 
                 logger.info(
@@ -2575,7 +2589,7 @@ async def pipeline_index_registered_file(
     ocr_id: Optional[str] = None,
     ocr_router: bool = False,
     meta_info: Optional[dict[str, Any]] = None,
-    extract_kg: bool = True,
+    extract_kg: bool = False,
 ):
     """Index a file registered by external framework without uploading/moving it."""
     try:
@@ -2588,6 +2602,7 @@ async def pipeline_index_registered_file(
             ocr_router=ocr_router,
             move_to_enqueued=False,
             meta_info=meta_info,
+            extract_kg=extract_kg,
         )
         if success:
             await rag.apipeline_process_enqueue_documents(extract_kg=extract_kg)
@@ -2598,7 +2613,9 @@ async def pipeline_index_registered_file(
         logger.error(traceback.format_exc())
 
 
-async def retry_failed_registered_ocr_documents(rag: LightRAG) -> int:
+async def retry_failed_registered_ocr_documents(
+    rag: LightRAG, extract_kg_override: Optional[bool] = None
+) -> int:
     """Retry failed /documents/register OCR fetches that never reached enqueue."""
     failed_docs = await rag.doc_status.get_docs_by_status(DocStatus.FAILED)
     retried_count = 0
@@ -2621,6 +2638,11 @@ async def retry_failed_registered_ocr_documents(rag: LightRAG) -> int:
         meta_info = metadata.get("meta_info")
         if not isinstance(meta_info, dict):
             meta_info = None
+        extract_kg = (
+            extract_kg_override
+            if extract_kg_override is not None
+            else bool(metadata.get("extract_kg") is True)
+        )
 
         resolved_file_path = Path(file_path_raw).expanduser().resolve(strict=False)
         success, _ = await pipeline_enqueue_file(
@@ -2632,6 +2654,7 @@ async def retry_failed_registered_ocr_documents(rag: LightRAG) -> int:
             ocr_router=ocr_router,
             move_to_enqueued=False,
             meta_info=meta_info,
+            extract_kg=extract_kg,
         )
         if success:
             await rag.doc_status.delete([error_doc_id])
@@ -2640,19 +2663,28 @@ async def retry_failed_registered_ocr_documents(rag: LightRAG) -> int:
     return retried_count
 
 
-async def reprocess_failed_documents_with_ocr_retry(rag: LightRAG) -> None:
+async def reprocess_failed_documents_with_ocr_retry(
+    rag: LightRAG, extract_kg: bool = False
+) -> None:
     """Retry failed documents without KG extraction by default."""
-    retried_count = await retry_failed_registered_ocr_documents(rag)
+    retried_count = await retry_failed_registered_ocr_documents(
+        rag, extract_kg_override=extract_kg
+    )
     if retried_count:
         logger.info(
             "Retried OCR content fetch for %d failed registered document(s)",
             retried_count,
         )
-    await rag.apipeline_process_enqueue_documents(extract_kg=False)
+    await rag.apipeline_process_enqueue_documents(
+        extract_kg=extract_kg, force_extract_kg=extract_kg
+    )
 
 
 async def pipeline_index_files(
-    rag: LightRAG, file_paths: List[Path], track_id: str = None
+    rag: LightRAG,
+    file_paths: List[Path],
+    track_id: str = None,
+    extract_kg: bool = False,
 ):
     """Index multiple files sequentially to avoid high CPU load
 
@@ -2673,13 +2705,17 @@ async def pipeline_index_files(
 
         # Process files sequentially with track_id
         for file_path in sorted_file_paths:
-            success, _ = await pipeline_enqueue_file(rag, file_path, track_id)
+            success, _ = await pipeline_enqueue_file(
+                rag, file_path, track_id, extract_kg=extract_kg
+            )
             if success:
                 enqueued = True
 
         # Process the queue only if at least one file was successfully enqueued
         if enqueued:
-            await rag.apipeline_process_enqueue_documents()
+            await rag.apipeline_process_enqueue_documents(
+                extract_kg=extract_kg, force_extract_kg=extract_kg
+            )
     except Exception as e:
         logger.error(f"Error indexing files: {str(e)}")
         logger.error(traceback.format_exc())
@@ -2690,7 +2726,7 @@ async def pipeline_index_texts(
     texts: List[str],
     file_sources: List[str] = None,
     track_id: str = None,
-    extract_kg: bool = True,
+    extract_kg: bool = False,
 ):
     """Index a list of texts with track_id
 
@@ -2709,7 +2745,10 @@ async def pipeline_index_texts(
                 for _ in range(len(file_sources), len(texts))
             ]
     await rag.apipeline_enqueue_documents(
-        input=texts, file_paths=file_sources, track_id=track_id
+        input=texts,
+        file_paths=file_sources,
+        track_id=track_id,
+        meta_info={"extract_kg": extract_kg},
     )
     await rag.apipeline_process_enqueue_documents(extract_kg=extract_kg)
 
@@ -2724,7 +2763,10 @@ async def pipeline_extract_pending_kg(rag: LightRAG, limit: int = 1000):
 
 
 async def run_scanning_process(
-    rag: LightRAG, doc_manager: DocumentManager, track_id: str = None
+    rag: LightRAG,
+    doc_manager: DocumentManager,
+    track_id: str = None,
+    extract_kg: bool = False,
 ):
     """Background task to scan and index documents
 
@@ -2738,14 +2780,16 @@ async def run_scanning_process(
         total_files = len(new_files)
         logger.info(f"Found {total_files} files to index.")
         retried_failed_registered_docs = await retry_failed_registered_ocr_documents(
-            rag
+            rag, extract_kg_override=extract_kg
         )
         if retried_failed_registered_docs:
             logger.info(
                 "Re-enqueued %d failed registered OCR document(s) before scanning",
                 retried_failed_registered_docs,
             )
-            await rag.apipeline_process_enqueue_documents(extract_kg=False)
+            await rag.apipeline_process_enqueue_documents(
+                extract_kg=extract_kg, force_extract_kg=extract_kg
+            )
 
         if new_files:
             # Check for files with PROCESSED status and filter them out
@@ -2766,7 +2810,9 @@ async def run_scanning_process(
 
             # Process valid files (new files + non-PROCESSED status files)
             if valid_files:
-                await pipeline_index_files(rag, valid_files, track_id)
+                await pipeline_index_files(
+                    rag, valid_files, track_id, extract_kg=extract_kg
+                )
                 if processed_files:
                     logger.info(
                         f"Scanning process completed: {len(valid_files)} files Processed {len(processed_files)} skipped."
@@ -2785,7 +2831,9 @@ async def run_scanning_process(
                 logger.info(
                     "No upload file found, check if there are any documents in the queue..."
                 )
-                await rag.apipeline_process_enqueue_documents()
+                await rag.apipeline_process_enqueue_documents(
+                    extract_kg=extract_kg, force_extract_kg=extract_kg
+                )
 
     except Exception as e:
         logger.error(f"Error during scanning process: {str(e)}")
@@ -3105,7 +3153,10 @@ def create_document_routes(
     @router.post(
         "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
     )
-    async def scan_for_new_documents(background_tasks: BackgroundTasks):
+    async def scan_for_new_documents(
+        background_tasks: BackgroundTasks,
+        request: Optional[RetryProcessingRequest] = None,
+    ):
         """
         Trigger the scanning process for new documents.
 
@@ -3121,7 +3172,11 @@ def create_document_routes(
 
         # Start the scanning process in the background with track_id
         background_tasks.add_task(
-            run_scanning_process, _active_rag(), _active_doc_manager(), track_id
+            run_scanning_process,
+            _active_rag(),
+            _active_doc_manager(),
+            track_id,
+            request.extract_kg if request else False,
         )
         return ScanResponse(
             status="scanning_started",
@@ -4380,7 +4435,10 @@ def create_document_routes(
         response_model=ReprocessResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def reprocess_failed_documents(background_tasks: BackgroundTasks):
+    async def reprocess_failed_documents(
+        background_tasks: BackgroundTasks,
+        request: Optional[RetryProcessingRequest] = None,
+    ):
         """
         Reprocess failed and pending documents.
 
@@ -4409,7 +4467,9 @@ def create_document_routes(
             # Start the reprocessing in the background
             # Note: Reprocessed documents retain their original track_id from initial upload
             background_tasks.add_task(
-                reprocess_failed_documents_with_ocr_retry, _active_rag()
+                reprocess_failed_documents_with_ocr_retry,
+                _active_rag(),
+                request.extract_kg if request else False,
             )
             logger.info("Reprocessing of failed documents initiated")
 

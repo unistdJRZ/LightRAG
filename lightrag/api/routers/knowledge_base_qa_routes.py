@@ -6,7 +6,7 @@ from contextvars import ContextVar
 from typing import Any, Literal, Mapping, Optional
 import traceback
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field, field_validator
 
 from lightrag.api.utils_api import (
@@ -14,6 +14,7 @@ from lightrag.api.utils_api import (
     create_workspace_scope_dependency,
     get_combined_auth_dependency,
 )
+from lightrag.knowledge_base_qa import parse_knowledge_base_qa_excel
 from lightrag.utils import logger
 
 
@@ -68,6 +69,11 @@ class KnowledgeBaseQASearchResponse(BaseModel):
     workspace: str = Field(description="Resolved workspace")
     mode: Literal["rule", "vector"]
     results: list[KnowledgeBaseQAItem]
+
+
+class KnowledgeBaseQAImportResponse(BaseModel):
+    workspace: str = Field(description="Resolved workspace")
+    imported_count: int = Field(description="Number of QA rows imported")
 
 
 def create_knowledge_base_qa_routes(
@@ -131,6 +137,39 @@ def create_knowledge_base_qa_routes(
             raise HTTPException(
                 status_code=500,
                 detail=f"Error searching knowledge-base QA: {str(e)}",
+            )
+
+    @router.post(
+        "/knowledge-base-qa/import",
+        response_model=KnowledgeBaseQAImportResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def import_knowledge_base_qa(file: UploadFile = File(...)):
+        try:
+            filename = file.filename or ""
+            if not filename.lower().endswith(".xlsx"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Only .xlsx files are supported for knowledge-base QA import",
+                )
+            file_bytes = await file.read()
+            qa_rows = parse_knowledge_base_qa_excel(file_bytes)
+            imported_count = await rag.upsert_knowledge_base_qa_pairs(qa_rows)
+            resolved_workspace = getattr(rag, "workspace", default_workspace)
+            return {
+                "workspace": resolved_workspace,
+                "imported_count": imported_count,
+            }
+        except HTTPException:
+            raise
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error(f"Error importing knowledge-base QA Excel: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error importing knowledge-base QA Excel: {str(e)}",
             )
 
     return router

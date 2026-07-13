@@ -314,6 +314,7 @@ def test_pipeline_enqueue_file_preserves_register_ocr_retry_metadata(monkeypatch
                 ocr_id="ocr-xyz",
                 move_to_enqueued=False,
                 meta_info={"file_id": "file-123"},
+                extract_kg=False,
             )
         )
     finally:
@@ -335,6 +336,7 @@ def test_pipeline_enqueue_file_preserves_register_ocr_retry_metadata(monkeypatch
             "metadata": {
                 "ocr_id": "ocr-xyz",
                 "ocr_router": False,
+                "extract_kg": False,
                 "meta_info": {"file_id": "file-123"},
                 "retry_source": "register_external_file",
                 "retry_stage": "ocr_content_fetch",
@@ -386,6 +388,7 @@ def test_retry_failed_registered_ocr_documents_reenqueues_missing_content(monkey
                     "retry_stage": "ocr_content_fetch",
                     "ocr_id": "ocr-456",
                     "ocr_router": True,
+                    "extract_kg": False,
                     "meta_info": {"file_id": "file-456"},
                 },
             )
@@ -402,6 +405,7 @@ def test_retry_failed_registered_ocr_documents_reenqueues_missing_content(monkey
         ocr_router=False,
         move_to_enqueued=True,
         meta_info=None,
+        extract_kg=False,
     ):
         captured["rag"] = rag_obj
         captured["resolved_file_path"] = resolved_file_path
@@ -411,6 +415,7 @@ def test_retry_failed_registered_ocr_documents_reenqueues_missing_content(monkey
         captured["ocr_router"] = ocr_router
         captured["move_to_enqueued"] = move_to_enqueued
         captured["meta_info"] = meta_info
+        captured["extract_kg"] = extract_kg
         return True, track_id
 
     monkeypatch.setattr(routes, "pipeline_enqueue_file", _fake_pipeline_enqueue_file)
@@ -427,6 +432,7 @@ def test_retry_failed_registered_ocr_documents_reenqueues_missing_content(monkey
         "ocr_router": True,
         "move_to_enqueued": False,
         "meta_info": {"file_id": "file-456"},
+        "extract_kg": False,
     }
     assert rag.doc_status.deleted == ["error-doc-1"]
 
@@ -440,17 +446,22 @@ class _FakeRAGForScan:
     def __init__(self):
         self.process_calls = []
 
-    async def apipeline_process_enqueue_documents(self, extract_kg=True):
-        self.process_calls.append(extract_kg)
+    async def apipeline_process_enqueue_documents(
+        self, extract_kg=True, force_extract_kg=None
+    ):
+        self.process_calls.append((extract_kg, force_extract_kg))
 
 
-def test_run_scanning_process_retries_registered_ocr_failures_when_no_new_files(
+def test_run_scanning_process_applies_retry_extract_kg_override(
     monkeypatch,
 ):
     rag = _FakeRAGForScan()
     doc_manager = _FakeDocManagerForScan()
 
-    async def _fake_retry_failed_registered_ocr_documents(_rag):
+    async def _fake_retry_failed_registered_ocr_documents(
+        _rag, extract_kg_override=None
+    ):
+        assert extract_kg_override is True
         return 2
 
     monkeypatch.setattr(
@@ -459,9 +470,13 @@ def test_run_scanning_process_retries_registered_ocr_failures_when_no_new_files(
         _fake_retry_failed_registered_ocr_documents,
     )
 
-    asyncio.run(routes.run_scanning_process(rag, doc_manager, track_id="scan-1"))
+    asyncio.run(
+        routes.run_scanning_process(
+            rag, doc_manager, track_id="scan-1", extract_kg=True
+        )
+    )
 
-    assert rag.process_calls == [False]
+    assert rag.process_calls == [(True, True)]
 
 
 def test_reprocess_failed_documents_with_ocr_retry_disables_kg_by_default(
@@ -469,7 +484,10 @@ def test_reprocess_failed_documents_with_ocr_retry_disables_kg_by_default(
 ):
     rag = _FakeRAGForScan()
 
-    async def _fake_retry_failed_registered_ocr_documents(_rag):
+    async def _fake_retry_failed_registered_ocr_documents(
+        _rag, extract_kg_override=None
+    ):
+        assert extract_kg_override is False
         return 0
 
     monkeypatch.setattr(
@@ -480,7 +498,7 @@ def test_reprocess_failed_documents_with_ocr_retry_disables_kg_by_default(
 
     asyncio.run(routes.reprocess_failed_documents_with_ocr_retry(rag))
 
-    assert rag.process_calls == [False]
+    assert rag.process_calls == [(False, False)]
 
 
 def test_extract_structured_segments_from_ocr_chunks():

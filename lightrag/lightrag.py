@@ -1352,7 +1352,7 @@ class LightRAG:
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
         meta_info: dict[str, Any] | None = None,
-        extract_kg: bool = True,
+        extract_kg: bool = False,
     ) -> str:
         """Sync Insert documents with checkpoint support
 
@@ -1393,7 +1393,7 @@ class LightRAG:
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
         meta_info: dict[str, Any] | None = None,
-        extract_kg: bool = True,
+        extract_kg: bool = False,
     ) -> str:
         """Async Insert documents with checkpoint support
 
@@ -1415,12 +1415,14 @@ class LightRAG:
         if track_id is None:
             track_id = generate_track_id("insert")
 
+        enqueue_meta_info = dict(meta_info or {})
+        enqueue_meta_info["extract_kg"] = extract_kg
         await self.apipeline_enqueue_documents(
             input=input,
             ids=ids,
             file_paths=file_paths,
             track_id=track_id,
-            meta_info=meta_info,
+            meta_info=enqueue_meta_info,
         )
         await self.apipeline_process_enqueue_documents(
             split_by_character, split_by_character_only, extract_kg=extract_kg
@@ -2057,7 +2059,8 @@ class LightRAG:
         self,
         split_by_character: str | None = None,
         split_by_character_only: bool = False,
-        extract_kg: bool = True,
+        extract_kg: bool = False,
+        force_extract_kg: bool | None = None,
     ) -> None:
         """
         Process pending documents by splitting them into chunks, processing
@@ -2208,6 +2211,13 @@ class LightRAG:
                     file_extraction_stage_ok = False
                     processing_start_time = int(time.time())
                     existing_metadata = dict(getattr(status_doc, "metadata", {}) or {})
+                    meta_info = existing_metadata.get("meta_info")
+                    if force_extract_kg is not None:
+                        doc_extract_kg = force_extract_kg
+                    elif isinstance(meta_info, dict):
+                        doc_extract_kg = meta_info.get("extract_kg") is True
+                    else:
+                        doc_extract_kg = extract_kg
                     first_stage_tasks = []
                     entity_relation_task = None
                     chunks: dict[str, Any] = {}
@@ -2355,7 +2365,8 @@ class LightRAG:
                                             "track_id": status_doc.track_id,  # Preserve existing track_id
                                             "metadata": {
                                                 **existing_metadata,
-                                                "processing_start_time": processing_start_time
+                                                "extract_kg": doc_extract_kg,
+                                                "processing_start_time": processing_start_time,
                                             },
                                         }
                                     }
@@ -2376,14 +2387,14 @@ class LightRAG:
                             ]
                             entity_relation_task = None
                             kg_extraction_status = (
-                                "completed" if extract_kg else "pending"
+                                "completed" if doc_extract_kg else "pending"
                             )
 
                             # Execute first stage tasks
                             await asyncio.gather(*first_stage_tasks)
 
                             # Stage 2: Process entity relation graph (after text_chunks are saved)
-                            if extract_kg and entity_extractable_chunks:
+                            if doc_extract_kg and entity_extractable_chunks:
                                 entity_relation_task = asyncio.create_task(
                                     self._process_extract_entities(
                                         entity_extractable_chunks,
@@ -2393,7 +2404,7 @@ class LightRAG:
                                 )
                                 chunk_results = await entity_relation_task
                             else:
-                                if not extract_kg and entity_extractable_chunks:
+                                if not doc_extract_kg and entity_extractable_chunks:
                                     logger.info(
                                         "Skipping KG extraction for %d chunks in %s",
                                         len(entity_extractable_chunks),
@@ -2475,6 +2486,7 @@ class LightRAG:
                                         "track_id": status_doc.track_id,  # Preserve existing track_id
                                         "metadata": {
                                             **existing_metadata,
+                                            "extract_kg": doc_extract_kg,
                                             "processing_start_time": processing_start_time,
                                             "processing_end_time": processing_end_time,
                                         },
@@ -2494,7 +2506,7 @@ class LightRAG:
                                             "User cancelled"
                                         )
 
-                                if extract_kg:
+                                if doc_extract_kg:
                                     # Use chunk_results from entity_relation_task
                                     await merge_nodes_and_edges(
                                         chunk_results=chunk_results,  # result collected from entity_relation_task
@@ -2543,6 +2555,7 @@ class LightRAG:
                                             "track_id": status_doc.track_id,  # Preserve existing track_id
                                             "metadata": {
                                                 **existing_metadata,
+                                                "extract_kg": doc_extract_kg,
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
                                                 "kg_extraction_status": kg_extraction_status,
@@ -2627,6 +2640,7 @@ class LightRAG:
                                             "track_id": status_doc.track_id,  # Preserve existing track_id
                                             "metadata": {
                                                 **existing_metadata,
+                                                "extract_kg": doc_extract_kg,
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
                                             },

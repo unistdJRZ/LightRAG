@@ -251,6 +251,7 @@ export default function DocumentManager() {
 
   // State for document status filter
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  const [retryExtractKg, setRetryExtractKg] = useState(false)
 
   // State to store page number for each status filter
   const [pageByStatus, setPageByStatus] = useState<Record<StatusFilter, number>>({
@@ -837,7 +838,7 @@ export default function DocumentManager() {
       // Check if component is still mounted before starting the request
       if (!isMountedRef.current) return;
 
-      const { status, message, track_id: _track_id } = await scanNewDocuments(); // eslint-disable-line @typescript-eslint/no-unused-vars
+      const { status, message, track_id: _track_id } = await scanNewDocuments({ extract_kg: retryExtractKg }); // eslint-disable-line @typescript-eslint/no-unused-vars
 
       // Check again if component is still mounted after the request completes
       if (!isMountedRef.current) return;
@@ -869,7 +870,7 @@ export default function DocumentManager() {
         toast.error(t('documentPanel.documentManager.errors.scanFailed', { error: errorMessage(err) }));
       }
     }
-  }, [t, startPollingInterval, currentTab, health, statusCounts, handleIntelligentRefresh])
+  }, [t, startPollingInterval, currentTab, health, statusCounts, handleIntelligentRefresh, retryExtractKg])
 
   // Handle page size change - update state and save to store
   const handlePageSizeChange = useCallback((newPageSize: number) => {
@@ -1133,6 +1134,13 @@ export default function DocumentManager() {
             >
               <RefreshCwIcon /> {t('documentPanel.documentManager.scanButton')}
             </Button>
+            <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+              <Checkbox
+                checked={retryExtractKg}
+                onCheckedChange={(checked) => setRetryExtractKg(checked === true)}
+              />
+              {t('documentPanel.documentManager.retryExtractKg')}
+            </label>
             <Button
               variant="outline"
               onClick={() => setShowPipelineStatus(true)}

@@ -1443,7 +1443,7 @@ def test_apipeline_process_enqueue_documents_preserves_chunk_metadata_on_failed_
     rag._chunk_document_content = _fake_chunk_document_content
     rag._process_extract_entities = _fake_process_extract_entities
 
-    asyncio.run(rag.apipeline_process_enqueue_documents())
+    asyncio.run(rag.apipeline_process_enqueue_documents(extract_kg=True))
 
     final_status = rag.doc_status.records[doc_id]
     stored_chunk_ids = list(rag.text_chunks.records.keys())
@@ -1520,6 +1520,72 @@ def test_apipeline_process_enqueue_documents_can_skip_kg_and_qa_extraction():
 
     final_status = rag.doc_status.records[doc_id]
     assert final_status["status"] == DocStatus.PROCESSED
+    assert final_status["metadata"]["kg_extraction_status"] == "pending"
+    assert rag.text_chunks.marked == []
+
+
+@pytest.mark.offline
+def test_apipeline_process_enqueue_documents_does_not_inherit_stale_extract_kg_state():
+    workspace = f"test-doc-skip-kg-{uuid.uuid4().hex}"
+    initialize_share_data()
+    asyncio.run(initialize_pipeline_status(workspace))
+
+    doc_id = "doc-test"
+    created_at = "2025-01-01T00:00:00+00:00"
+
+    rag = LightRAG.__new__(LightRAG)
+    rag.workspace = workspace
+    rag.max_parallel_insert = 1
+    rag.doc_status = _FakeDocStatusStorage(
+        {
+            doc_id: {
+                "status": DocStatus.PENDING,
+                "content_summary": "summary",
+                "content_length": 11,
+                "created_at": created_at,
+                "updated_at": created_at,
+                "file_path": "doc.txt",
+                "track_id": "track-1",
+                "metadata": {"extract_kg": True},
+            }
+        }
+    )
+    rag.full_docs = _FakeFullDocsStorage(
+        {
+            doc_id: {
+                "content": "hello world",
+                "file_path": "doc.txt",
+            }
+        }
+    )
+    rag.text_chunks = _FakeTextChunksStorage()
+    rag.chunks_vdb = _FakeVectorStorage()
+    rag._embedding_vlm_enabled = lambda: False
+
+    async def _fake_chunk_document_content(*args, **kwargs):
+        return [
+            {
+                "content": "hello world",
+                "tokens": 2,
+                "chunk_order_index": 0,
+            }
+        ]
+
+    async def _unexpected_extract(*args, **kwargs):
+        raise AssertionError("KG extraction should not inherit stale status metadata")
+
+    async def _fake_insert_done(*args, **kwargs):
+        return None
+
+    rag._chunk_document_content = _fake_chunk_document_content
+    rag._process_extract_entities = _unexpected_extract
+    rag._insert_done = _fake_insert_done
+
+    asyncio.run(rag.apipeline_process_enqueue_documents())
+
+    final_status = rag.doc_status.records[doc_id]
+    assert final_status["status"] == DocStatus.PROCESSED
+    assert final_status["metadata"]["extract_kg"] is False
     assert final_status["metadata"]["kg_extraction_status"] == "pending"
     assert rag.text_chunks.marked == []
 

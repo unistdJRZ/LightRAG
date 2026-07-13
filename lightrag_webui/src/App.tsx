@@ -14,6 +14,7 @@ import { ZapIcon } from 'lucide-react'
 import GraphViewer from '@/features/GraphViewer'
 import DocumentManager from '@/features/DocumentManager'
 import ChunksExplorer from '@/features/ChunksExplorer'
+import KnowledgeBaseQAImport from '@/features/KnowledgeBaseQAImport'
 import RetrievalTesting from '@/features/RetrievalTesting'
 import ApiSite from '@/features/ApiSite'
 
@@ -214,6 +215,9 @@ function App() {
                 </TabsContent>
                 <TabsContent value="knowledge-graph" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <GraphViewer />
+                </TabsContent>
+                <TabsContent value="knowledge-base-qa" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
+                  <KnowledgeBaseQAImport />
                 </TabsContent>
                 <TabsContent value="retrieval" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <RetrievalTesting />
