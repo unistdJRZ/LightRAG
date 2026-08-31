@@ -1,0 +1,79 @@
+{
+  "base_url": "http://127.0.0.1:9621",
+  "endpoints": [
+    "/api/query/data",
+    "/api/query"
+  ],
+  "headers": {
+    "Accept": "application/json"
+  },
+  "random_seed": 20260715,
+  "fixed_parameters": {
+    "mode": "mix",
+    "only_need_context": true,
+    "only_need_prompt": true,
+    "response_type": "string",
+    "top_k": 10,
+    "chunk_top_k": 10,
+    "max_entity_tokens": 1000,
+    "max_relation_tokens": 1000,
+    "max_total_tokens": 10000,
+    "hl_keywords": [
+      "string"
+    ],
+    "ll_keywords": [
+      "string"
+    ],
+    "conversation_history": [],
+    "user_prompt": "string",
+    "enable_rerank": true,
+    "include_references": true,
+    "query_ref": [
+      "string"
+    ],
+    "stream": false,
+    "agent_search": false,
+    "stream_agent_status": false
+  },
+  "dynamic_parameters": {
+    "workspace": [
+      "msre",
+      "msr_ultra_pro"
+    ]
+  },
+  "query_generation": {
+    "csv": {
+      "path": "scripts/questions.csv",
+      "column": "question",
+      "variable": "question"
+    },
+    "templates": [
+      "请回答问题：{question}\\n\\n供 agent_search 使用的检索上下文：{agent_context}",
+      "基于知识库检索 {topic}。问题：{question}\\n检索线索：{agent_context}"
+    ],
+    "variables": {
+      "topic": [
+        "系统架构",
+        "实体关系",
+        "部署与运维"
+      ],
+      "agent_context": [
+        "重点检索架构设计、数据流和模块职责。",
+        "优先查找实体、关系、文本块及重排序相关内容。",
+        "关注并发、超时、缓存和存储后端配置。"
+      ]
+    }
+  },
+  "load": {
+    "total_requests": 100,
+    "concurrency": 10,
+    "request_timeout_seconds": 120,
+    "requests_per_second": null,
+    "progress_interval": 10,
+    "fail_on_error": true
+  },
+  "output": {
+    "directory": "output/query_stress_test",
+    "save_response_body": false
+  }
+}

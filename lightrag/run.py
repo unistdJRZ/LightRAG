@@ -119,7 +119,10 @@ def main():
     frontend_url = f"http://{frontend_host}:{frontend_port}/webui/"
 
     frontend_env = os.environ.copy()
-    frontend_env["VITE_BACKEND_URL"] = backend_url
+    # Keep browser requests on the Vite origin so remote clients do not resolve
+    # localhost to their own machine. Vite proxies these requests to the backend.
+    frontend_env["VITE_BACKEND_URL"] = ""
+    frontend_env["VITE_BACKEND_PROXY_TARGET"] = backend_url
     frontend_env.setdefault("VITE_API_PROXY", "true")
     backend_env = os.environ.copy()
     backend_env["LIGHTRAG_WORKSPACE_CONFIG"] = str(config_path)

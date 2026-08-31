@@ -9,13 +9,13 @@ workspaces:
   #   alias: MSR-1
   # - id: minmal_test
   #   alias: 最小测试
-  # - id: msr_ultra_pro
-  #   alias: 钍基熔盐文献知识库 
+  - id: msr_ultra_pro
+    alias: 钍基熔盐文献知识库 
 
 # Backend dev server (FastAPI)
 backend_host: "0.0.0.0"
 backend_port: 9621
 
 # Frontend dev server (Vite)
-frontend_host: "127.0.0.1"
+frontend_host: "0.0.0.0"
 frontend_port: 5173

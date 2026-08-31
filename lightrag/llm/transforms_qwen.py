@@ -14,6 +14,7 @@ import numpy as np
 import pipmaster as pm
 import torch
 import torch.nn.functional as F
+from huggingface_hub import snapshot_download
 
 if not pm.is_installed("transformers"):
     pm.install("transformers>=4.57.0")
@@ -53,6 +54,28 @@ _DATA_IMAGE_URI_PATTERN = re.compile(
 _RAW_BASE64_PATTERN = re.compile(r"^[A-Za-z0-9+/=\s]+$")
 _EMBED_LOCK = asyncio.Lock()
 _RERANK_LOCK = asyncio.Lock()
+
+
+def _resolve_cached_model_path(model_name_or_path: str) -> str:
+    """Prefer a complete local Hugging Face snapshot when one is available."""
+    local_path = Path(model_name_or_path).expanduser()
+    if local_path.exists():
+        return str(local_path)
+
+    try:
+        cached_path = snapshot_download(
+            repo_id=model_name_or_path,
+            local_files_only=True,
+        )
+    except Exception:
+        return model_name_or_path
+
+    logger.info(
+        "Using cached local model snapshot for '%s': %s",
+        model_name_or_path,
+        cached_path,
+    )
+    return cached_path
 
 
 def _parse_max_image_size(
@@ -514,17 +537,18 @@ def _load_qwen_embedder(
     attn_implementation: str | None,
     device_map: str | None,
 ):
+    resolved_model_path = _resolve_cached_model_path(model_name_or_path)
     runtime_kwargs = _resolve_model_runtime_kwargs(
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
         device_map=device_map,
     )
     processor = AutoProcessor.from_pretrained(
-        model_name_or_path,
+        resolved_model_path,
         trust_remote_code=True,
     )
     model = Qwen3VLForEmbedding.from_pretrained(
-        model_name_or_path,
+        resolved_model_path,
         **runtime_kwargs,
     )
     model.eval()
@@ -537,17 +561,18 @@ def _load_qwen_reranker(
     attn_implementation: str | None,
     device_map: str | None,
 ):
+    resolved_model_path = _resolve_cached_model_path(model_name_or_path)
     runtime_kwargs = _resolve_model_runtime_kwargs(
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
         device_map=device_map,
     )
     processor = AutoProcessor.from_pretrained(
-        model_name_or_path,
+        resolved_model_path,
         trust_remote_code=True,
     )
     model = Qwen3VLForConditionalGeneration.from_pretrained(
-        model_name_or_path,
+        resolved_model_path,
         **runtime_kwargs,
     )
     model.eval()
